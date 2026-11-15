@@ -1,0 +1,3 @@
+timestamp_ms,mint,pool_id,side,amount,order_id
+1794114000030,EqmfJhKumCvtaAFwW1CziPR4dACPDyofcr76zzyGpump,AYkjvk7tVRFUGrs1aRPbYvmuvvcq3TN8ms7BoQvqGdB5,buy,0.01,smoke-buy-001
+1794114001028,EqmfJhKumCvtaAFwW1CziPR4dACPDyofcr76zzyGpump,AYkjvk7tVRFUGrs1aRPbYvmuvvcq3TN8ms7BoQvqGdB5,sell,10000,smoke-sell-001

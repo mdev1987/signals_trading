@@ -216,6 +216,39 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(dropped.empty)
         return cleaned, stats
 
+    def test_selected_pool_metadata_is_preserved_for_downstream_routing(self):
+        rows = [
+            {
+                "timestamp_ms": 1_000, "pool_id": "POOL-A", "pool": "pump",
+                "quote_mint": pipeline.WSOL, "price_sol": 1.0,
+                "token_amount": 100.0, "quote_amount": 100.0,
+            },
+            {
+                "timestamp_ms": 2_000, "pool_id": "POOL-B", "pool": "pump-amm",
+                "quote_mint": "QUOTE-B", "quote_price_sol": 1.0,
+                "price_sol": 2.0, "token_amount": 100.0, "quote_amount": 200.0,
+            },
+            {
+                "timestamp_ms": 3_000, "pool_id": "POOL-B", "pool": "pump-amm",
+                "quote_mint": "QUOTE-B", "quote_price_sol": 1.0,
+                "price_sol": 2.1, "token_amount": 100.0, "quote_amount": 210.0,
+            },
+        ]
+        cleaned, _ = self.clean(rows)
+        bars = pipeline.build_bars(cleaned, 60_000, False)
+
+        # POOL-B wins on valid SOL quote volume. The metadata must come from
+        # the selected pool, not from the first event or a discarded pool.
+        self.assertEqual(bars.loc[0, "pool_id"], "POOL-B")
+        self.assertEqual(bars.loc[0, "pool"], "pump-amm")
+        self.assertEqual(bars.loc[0, "quote_mint"], "QUOTE-B")
+
+        filled = pipeline.fill_gaps(
+            pipeline.build_bars(cleaned, 1_000, False), 1_000
+        )
+        self.assertIn("pool", filled.columns)
+        self.assertIn("quote_mint", filled.columns)
+
     def test_pool_prices_are_not_mixed_inside_a_candle(self):
         rows = [
             {"timestamp_ms": 1_000, "pool_id": "POOL-A", "price_sol": 1.0, "quote_amount": 100.0},
@@ -556,6 +589,10 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("stale_bars", bars.columns)
             self.assertIn("age_bars", bars.columns)
             self.assertIn("candle_range_anomaly_flag", bars.columns)
+            self.assertIn("pool", bars.columns)
+            self.assertIn("quote_mint", bars.columns)
+            self.assertEqual(bars.iloc[0]["pool"], "pump")
+            self.assertEqual(bars.iloc[0]["quote_mint"], pipeline.WSOL)
 
             vbt_path = os.path.join(os.path.dirname(__file__), "build_vbt_dataset.py")
             vbt_spec = importlib.util.spec_from_file_location("build_vbt_dataset", vbt_path)

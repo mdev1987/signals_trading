@@ -11,3 +11,11 @@ wheels/
 .vscode
 messages
 output
+
+# Agent state
+.opencode/
+
+# Generated audit artifacts (not source)
+pool_compatibility_candidates_*.csv
+tools/execution_audit/
+*_fills*.csv

@@ -121,7 +121,7 @@ class BuildVbtDatasetTests(unittest.TestCase):
                 "execution_ohlc_complete": 1, "execution_coverage": 1.0,
                 "candle_range_ratio": spot_high / spot_low,
                 "candle_range_anomaly_flag": int(spot_high / spot_low >= 2.0),
-                "pool_id": "POOL-CLI",
+                "pool_id": "POOL-CLI", "pool": "pump", "quote_mint": "WSOL",
             })
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,6 +152,12 @@ class BuildVbtDatasetTests(unittest.TestCase):
             self.assertTrue((outdir / "wide" / "universe_eligible.csv").exists())
             self.assertTrue((outdir / "universe_timeline.csv").exists())
             self.assertTrue((outdir / "universe_transitions.csv").exists())
+            self.assertTrue((outdir / "pool_selection_timeline.csv").exists())
+            pool_timeline = pd.read_csv(outdir / "pool_selection_timeline.csv")
+            self.assertEqual(len(pool_timeline), len(rows))
+            self.assertEqual(pool_timeline["available_at_timestamp_ms"].tolist(), [60_000, 180_000, 300_000])
+            self.assertEqual(report["pool_selection_timeline"]["rows"], len(rows))
+            self.assertTrue(report["pool_selection_timeline"]["validation"]["passed"])
             universe_summary = pd.read_csv(outdir / "universe.csv")
             self.assertIn("ever_eligible", universe_summary.columns)
             self.assertIn("eligible_at_window_end", universe_summary.columns)
@@ -159,6 +165,69 @@ class BuildVbtDatasetTests(unittest.TestCase):
             long_output = pd.read_csv(outdir / "ohlcv_clean_1m.csv")
             self.assertIn("universe_eligible", long_output.columns)
             self.assertEqual(int(long_output["universe_eligible"].sum()), report["universe_eligible_rows"])
+
+    def test_pool_selection_timeline_is_only_available_after_bar_close(self):
+        source = pd.DataFrame([
+            {
+                "mint": "MINT-POOL", "timestamp_ms": 0, "is_filled": 0,
+                "pool_id": "POOL-A", "pool_key": "POOL-A", "pool": "pump",
+                "quote_mint": "WSOL", "pool_changed": 0, "pool_count": 2,
+                "selected_pool_trade_share": 0.75,
+            },
+            {
+                "mint": "MINT-POOL", "timestamp_ms": 60_000, "is_filled": 1,
+                "pool_id": "POOL-A", "pool_key": "POOL-A", "pool": "pump",
+                "quote_mint": "WSOL", "pool_changed": 0,
+            },
+            {
+                "mint": "MINT-POOL", "timestamp_ms": 120_000, "is_filled": 0,
+                "pool_id": "POOL-B", "pool_key": "POOL-B", "pool": "pump-amm",
+                "quote_mint": "WSOL", "pool_changed": 1, "pool_count": 1,
+                "selected_pool_trade_share": 1.0,
+            },
+        ])
+        timeline = builder.build_pool_selection_timeline(source, 60_000)
+
+        self.assertEqual(len(timeline), 2)
+        self.assertEqual(timeline["pool_id"].tolist(), ["POOL-A", "POOL-B"])
+        self.assertEqual(timeline["pool"].tolist(), ["pump", "pump-amm"])
+        self.assertEqual(timeline["pool_changed"].tolist(), [0, 1])
+        self.assertEqual(timeline["bar_end_timestamp_ms"].tolist(), [60_000, 180_000])
+        self.assertEqual(timeline["available_at_timestamp_ms"].tolist(), [60_000, 180_000])
+        self.assertEqual(timeline["quote_mint"].tolist(), ["WSOL", "WSOL"])
+        self.assertTrue(timeline["pool_id_valid"].eq(1).all())
+        audit = builder.validate_pool_selection_timeline(timeline, source, 60_000)
+        self.assertTrue(audit["passed"], audit)
+        self.assertEqual(audit["filled_rows_included"], 0)
+
+    def test_pool_timeline_rejects_missing_pool_type_for_execution_routing(self):
+        source = pd.DataFrame([{
+            "mint": "MINT-NO-POOL-TYPE", "timestamp_ms": 0, "is_filled": 0,
+            "pool_id": "POOL-NO-TYPE", "pool_key": "POOL-NO-TYPE",
+            "quote_mint": "WSOL", "pool_changed": 0,
+        }])
+        timeline = builder.build_pool_selection_timeline(source, 60_000)
+        self.assertEqual(timeline.loc[0, "pool_selection_status"], "missing_pool_type")
+        audit = builder.validate_pool_selection_timeline(timeline, source, 60_000)
+        self.assertEqual(audit["missing_pool_type_rows"], 1)
+        self.assertFalse(audit["passed"])
+
+    def test_pool_timeline_falls_back_to_close_quote_mint_and_flags_conflicts(self):
+        source = pd.DataFrame([
+            {
+                "mint": "MINT-QUOTE", "timestamp_ms": 0, "is_filled": 0,
+                "pool_id": "POOL-Q", "pool_key": "POOL-Q", "pool_type": "pump-amm",
+                "open_quote_mint": "QUOTE-A", "close_quote_mint": "QUOTE-B",
+                "pool_changed": 0,
+            }
+        ])
+        timeline = builder.build_pool_selection_timeline(source, 60_000)
+        self.assertEqual(timeline.loc[0, "pool"], "pump-amm")
+        self.assertEqual(timeline.loc[0, "quote_mint"], "QUOTE-B")
+        self.assertEqual(int(timeline.loc[0, "quote_mint_conflict_flag"]), 1)
+        audit = builder.validate_pool_selection_timeline(timeline, source, 60_000)
+        self.assertFalse(audit["passed"])
+        self.assertEqual(audit["quote_mint_conflict_rows"], 1)
 
     def test_require_execution_ohlc_rejects_source_without_complete_execution_bars(self):
         rows = []

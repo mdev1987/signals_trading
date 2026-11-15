@@ -1,6 +1,6 @@
-# Point-in-Time Universe Dataset Builder v7.0
+# Point-in-Time Universe Dataset Builder v7.1.1
 
-This package keeps the raw JSONL-to-OHLCV pipeline from v6.2 unchanged and upgrades the VectorBT dataset builder to use a point-in-time (PIT) universe.
+This package extends the v7.0 Point-in-Time VectorBT dataset with a separate, auditable Pool Selection Timeline. The raw JSONL-to-OHLCV pipeline remains numerically unchanged; it also passes the selected pool protocol (`pool`) and quote mint (`quote_mint`) through each real candle for downstream routing. This patch release makes missing pool protocol metadata a validation failure.
 
 ## What changed
 
@@ -15,6 +15,8 @@ The new builder:
 - Writes a time-aligned `universe_eligible` mask for Wide and Long datasets.
 - Writes full decision history and entry/exit transition audit files.
 - Keeps full-window metrics only as descriptive summary fields.
+- Writes `pool_selection_timeline.csv`, preserving the selected `pool_id`, `pool_key`, pool protocol, quote mint, and pool-switch flag for each real candle.
+- Marks the pool selection as available only at the candle close (`bar_start_timestamp_ms + bar_ms`); filled candles are excluded.
 
 ## Point-in-time eligibility rules
 
@@ -78,6 +80,7 @@ output_directory/
 |-- universe.csv
 |-- universe_timeline.csv
 |-- universe_transitions.csv
+|-- pool_selection_timeline.csv
 |-- ohlcv_clean_1m.csv
 |-- dataset_report.json
 `-- wide/
@@ -119,6 +122,25 @@ One row per mint and visible bar, beginning at the mint's first observed bar. It
 
 A sparse audit of each `entered` and `exited` transition, including the metrics available at the transition decision time.
 
+### `pool_selection_timeline.csv`
+
+One row per mint and real candle. It preserves the selected-pool metadata from the raw OHLCV pipeline:
+
+- `pool_id`: executable pool identifier; blank IDs remain blank and are never fabricated.
+- `pool_key`: grouping identity used by the raw pipeline, including its missing-ID fallback.
+- `pool`: pool protocol/type (for example, `pump` or `pump-amm`).
+- `quote_mint`: quote asset used by that selected pool.
+- `pool_changed`: whether the selected pool differs from the previous observed candle for the mint.
+- `pool_selection_status`: `ready`, `missing_pool_id`, `missing_quote_mint`, `missing_pool_type`, or a metadata-conflict status.
+
+The pool protocol/type is mandatory for execution routing because the simulator dispatches different reserve models for `pump` and `pump-amm`. A missing pool type now causes Pool Timeline validation to fail; it can no longer silently pass as `ready`. If you are using a legacy OHLCV CSV without the selected `pool` field, regenerate the raw-to-OHLCV output with the `raw_to_clean_ohlcv.py` included in this package before running the builder.
+
+**Timing rule:** `timestamp_ms` and `bar_start_timestamp_ms` identify the start of the candle. The selected pool is based on all events inside that candle, so it becomes known only at `available_at_timestamp_ms`, which equals `bar_end_timestamp_ms = bar_start_timestamp_ms + bar_ms`. For a 1-minute bar starting at 05:05:00 UTC, the selected pool is available at 05:06:00 UTC, not at 05:05:00.
+
+When creating an order, select the latest timeline row for the mint where `available_at_timestamp_ms <= order_timestamp_ms`. Never join by candle start and assume the selected pool was known at that time. The execution simulator must still validate the pool snapshot, age, reserves, and quote mint at order time.
+
+Filled candles are excluded from this timeline: a carried-forward `pool_id` is not a new observed pool selection.
+
 ## Install
 
 Extract the package in the project root and copy the files into place:
@@ -132,7 +154,7 @@ cp ohlcv_point_in_time_v7_package/test_raw_to_clean_ohlcv.py ./test_raw_to_clean
 cp ohlcv_point_in_time_v7_package/test_build_vbt_dataset.py ./test_build_vbt_dataset.py
 ```
 
-The raw pipeline is copied from v6.2 without modification. Only the VectorBT builder adds PIT universe behavior.
+The raw pipeline is based on v6.2; the only raw-stage change in this package is passthrough of the selected pool protocol and quote mint. OHLCV, VWAP, execution-price, and PIT calculations are not changed by that metadata addition. The builder adds the pool timeline independently from the numerical Wide/Long frames.
 
 ## Run tests
 
@@ -189,4 +211,4 @@ The report records the builder version, configured thresholds, PIT delay, eligib
 
 ## Important limitation
 
-PIT universe selection removes the full-window universe-filter leak. It does not by itself remove every possible source of look-ahead or guarantee executable PnL. Pool selection is still based on the completed current bucket, and historical fills are not hypothetical fills. Signal timing, next-bar order submission, pool choice, order size, reserve state, fees, and slippage must be modeled separately in the execution/backtest engine.
+PIT universe selection removes the full-window universe-filter leak. It does not by itself remove every possible source of look-ahead or guarantee executable PnL. The pool timeline makes the selected pool available only after the candle closes, but an adapter must still select it as-of order time and reject stale or unsupported metadata. Historical fills are not hypothetical fills. Signal timing, next-bar order submission, order size, reserve state, fees, and slippage must be modeled separately in the execution/backtest engine.

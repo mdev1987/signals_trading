@@ -42,7 +42,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-DATASET_BUILDER_VERSION = "v7.0"
+DATASET_BUILDER_VERSION = "v7.1.1"
 REQUIRED = ["mint", "timestamp_ms", "open", "high", "low", "close", "trades", "is_filled"]
 OPTIONAL_NUM = [
     "vwap_sol", "volume_token", "volume_sol", "jump_flag", "pool_changed",
@@ -325,6 +325,203 @@ def universe_audit_tables(universe, alive, grid, delay_bars, bar_ms):
     else:
         transitions = transitions.sort_values(["timestamp_ms", "mint"], kind="stable").reset_index(drop=True)
     return timeline, transitions
+
+
+# ----------------------------------------------------------------------------- pool selection timeline
+def _first_available_text(frame, candidates, default=""):
+    """Return the first existing metadata column as normalized text."""
+    out = pd.Series(default, index=frame.index, dtype="object")
+    for name in candidates:
+        if name not in frame.columns:
+            continue
+        values = frame[name].fillna("").astype(str).str.strip()
+        out = out.where(out.ne(""), values)
+    return out.replace({"nan": default, "None": default, "<NA>": default})
+
+
+def build_pool_selection_timeline(source, bar_ms):
+    """Expose the selected pool for each real candle only after that candle closes.
+
+    Input timestamps identify candle starts. The pool decision is based on all
+    events in that completed bucket, so the returned selection is not available
+    until timestamp_ms + bar_ms. Filled rows are excluded by construction.
+    """
+    if bar_ms <= 0:
+        raise ValueError("bar_ms must be > 0")
+    required = {"mint", "timestamp_ms"}
+    missing = sorted(required - set(source.columns))
+    if missing:
+        raise ValueError(f"Pool timeline source is missing columns: {missing}")
+
+    data = source.copy()
+    if "is_filled" in data.columns:
+        filled = pd.to_numeric(data["is_filled"], errors="coerce").fillna(1).ne(0)
+        data = data.loc[~filled].copy()
+    if data.empty:
+        return pd.DataFrame(columns=[
+            "mint", "timestamp_ms", "bar_start_timestamp_ms", "bar_end_timestamp_ms",
+            "available_at_timestamp_ms", "bar_start_utc", "bar_end_utc", "available_at_utc",
+            "pool_id", "pool_key", "pool", "quote_mint", "pool_changed",
+            "pool_id_valid", "quote_mint_conflict_flag", "pool_type_conflict_flag",
+            "pool_selection_status", "pool_count", "pool_excluded_trades",
+            "selected_pool_trade_share", "selected_pool_volume_share",
+            "pool_switch_discontinuity_flag",
+        ])
+
+    data["timestamp_ms"] = pd.to_numeric(data["timestamp_ms"], errors="coerce")
+    data = data.loc[data["timestamp_ms"].notna()].copy()
+    data["timestamp_ms"] = data["timestamp_ms"].astype("int64")
+    data = data.sort_values(["mint", "timestamp_ms"], kind="stable").reset_index(drop=True)
+    if data.duplicated(["mint", "timestamp_ms"]).any():
+        raise ValueError("Pool timeline source contains duplicate mint/timestamp rows")
+
+    def norm_text(name):
+        if name not in data.columns:
+            return pd.Series("", index=data.index, dtype="object")
+        return data[name].fillna("").astype(str).str.strip().replace({"nan": "", "None": "", "<NA>": ""})
+
+    pool_id = norm_text("pool_id")
+    pool_key = norm_text("pool_key")
+    pool_type = _first_available_text(data, ("pool", "pool_type", "close_pool", "open_pool"))
+    quote_mint = _first_available_text(data, ("quote_mint", "close_quote_mint", "open_quote_mint"))
+    open_quote = _first_available_text(data, ("open_quote_mint",))
+    close_quote = _first_available_text(data, ("close_quote_mint",))
+    open_pool = _first_available_text(data, ("open_pool",))
+    close_pool = _first_available_text(data, ("close_pool",))
+
+    # pool_key is the identity used by raw_to_clean_ohlcv to separate pools
+    # when pool_id is absent. Keep it distinct from the executable pool_id.
+    fallback_key = pool_id.where(pool_id.ne(""), "__missing_pool_id__:" + pool_type.where(pool_type.ne(""), "unknown"))
+    pool_key = pool_key.where(pool_key.ne(""), fallback_key)
+
+    grouped_key = pool_key.groupby(data["mint"], sort=False)
+    previous_key = grouped_key.shift(1)
+    computed_changed = (previous_key.notna() & pool_key.ne(previous_key)).astype("int8")
+    if "pool_changed" in data.columns:
+        source_changed = pd.to_numeric(data["pool_changed"], errors="coerce")
+        pool_changed = source_changed.where(source_changed.notna(), computed_changed).fillna(0).astype("int8")
+    else:
+        pool_changed = computed_changed
+
+    quote_conflict = (open_quote.ne("") & close_quote.ne("") & open_quote.ne(close_quote)).astype("int8")
+    pool_conflict = (open_pool.ne("") & close_pool.ne("") & open_pool.ne(close_pool)).astype("int8")
+    pool_id_valid = pool_id.ne("").astype("int8")
+
+    status = np.select(
+        [
+            pool_id_valid.eq(0), quote_conflict.eq(1), pool_conflict.eq(1),
+            quote_mint.eq(""), pool_type.eq(""),
+        ],
+        [
+            "missing_pool_id", "quote_mint_conflict", "pool_type_conflict",
+            "missing_quote_mint", "missing_pool_type",
+        ],
+        default="ready",
+    )
+
+    start = data["timestamp_ms"].to_numpy(dtype="int64")
+    end = start + int(bar_ms)
+    timeline = pd.DataFrame({
+        "mint": data["mint"].astype(str).to_numpy(),
+        "timestamp_ms": start,
+        "bar_start_timestamp_ms": start,
+        "bar_end_timestamp_ms": end,
+        "available_at_timestamp_ms": end,
+        "bar_start_utc": pd.to_datetime(start, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S"),
+        "bar_end_utc": pd.to_datetime(end, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S"),
+        "available_at_utc": pd.to_datetime(end, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S"),
+        "pool_id": pool_id.to_numpy(),
+        "pool_key": pool_key.to_numpy(),
+        "pool": pool_type.to_numpy(),
+        "quote_mint": quote_mint.to_numpy(),
+        "pool_changed": pool_changed.to_numpy(dtype="int8"),
+        "pool_id_valid": pool_id_valid.to_numpy(dtype="int8"),
+        "quote_mint_conflict_flag": quote_conflict.to_numpy(dtype="int8"),
+        "pool_type_conflict_flag": pool_conflict.to_numpy(dtype="int8"),
+        "pool_selection_status": status,
+    })
+
+    for column in (
+        "pool_count", "pool_excluded_trades", "selected_pool_trade_share",
+        "selected_pool_volume_share", "pool_switch_discontinuity_flag",
+    ):
+        if column in data.columns:
+            timeline[column] = pd.to_numeric(data[column], errors="coerce").to_numpy()
+        else:
+            timeline[column] = np.nan
+
+    return timeline.sort_values(["mint", "timestamp_ms"], kind="stable").reset_index(drop=True)
+
+
+def validate_pool_selection_timeline(timeline, source, bar_ms):
+    """Validate uniqueness, timing, and metadata consistency of the pool timeline."""
+    source_real = source.copy()
+    if "is_filled" in source_real.columns:
+        source_real = source_real.loc[
+            pd.to_numeric(source_real["is_filled"], errors="coerce").fillna(1).eq(0)
+        ]
+    if "timestamp_ms" in source_real.columns:
+        source_real = source_real.loc[pd.to_numeric(source_real["timestamp_ms"], errors="coerce").notna()]
+
+    duplicate_keys = int(timeline.duplicated(["mint", "timestamp_ms"]).sum()) if len(timeline) else 0
+    expected_rows = int(len(source_real))
+    row_count_mismatch = abs(int(len(timeline)) - expected_rows)
+    bar_end_expected = pd.to_numeric(timeline.get("timestamp_ms", pd.Series(dtype=float)), errors="coerce") + bar_ms
+    bar_end_observed = pd.to_numeric(timeline.get("bar_end_timestamp_ms", pd.Series(dtype=float)), errors="coerce")
+    available_observed = pd.to_numeric(timeline.get("available_at_timestamp_ms", pd.Series(dtype=float)), errors="coerce")
+    timestamp_alignment_errors = int((pd.to_numeric(timeline.get("timestamp_ms", pd.Series(dtype=float)), errors="coerce") % bar_ms != 0).sum()) if len(timeline) else 0
+    bar_end_mismatch = int((~np.isclose(bar_end_expected, bar_end_observed, rtol=0, atol=0, equal_nan=False)).sum()) if len(timeline) else 0
+    available_before_bar_end = int((available_observed < bar_end_observed).sum()) if len(timeline) else 0
+    filled_rows = 0
+    source_changed_mismatch = 0
+    if "pool_changed" in source_real.columns and len(timeline):
+        ordered_source = source_real.sort_values(["mint", "timestamp_ms"], kind="stable").copy()
+        source_pool_id = _first_available_text(ordered_source, ("pool_id",))
+        source_pool_key = _first_available_text(ordered_source, ("pool_key",))
+        source_pool_type = _first_available_text(ordered_source, ("pool", "pool_type"))
+        fallback_key = source_pool_id.where(
+            source_pool_id.ne(""),
+            "__missing_pool_id__:" + source_pool_type.where(source_pool_type.ne(""), "unknown"),
+        )
+        source_pool_key = source_pool_key.where(source_pool_key.ne(""), fallback_key)
+        prior_key = source_pool_key.groupby(ordered_source["mint"], sort=False).shift(1)
+        expected_changed = (prior_key.notna() & source_pool_key.ne(prior_key)).astype("int8").reset_index(drop=True)
+        source_changed = pd.to_numeric(ordered_source["pool_changed"], errors="coerce").reset_index(drop=True)
+        comparable = source_changed.notna()
+        source_changed_mismatch = int(
+            (source_changed[comparable].astype("int64") != expected_changed[comparable]).sum()
+        )
+    quote_conflict_rows = int(pd.to_numeric(timeline.get("quote_mint_conflict_flag", 0), errors="coerce").fillna(0).sum()) if len(timeline) else 0
+    pool_type_conflict_rows = int(pd.to_numeric(timeline.get("pool_type_conflict_flag", 0), errors="coerce").fillna(0).sum()) if len(timeline) else 0
+    missing_pool_id_rows = int(pd.to_numeric(timeline.get("pool_id_valid", 0), errors="coerce").fillna(0).eq(0).sum()) if len(timeline) else 0
+    missing_quote_mint_rows = int(timeline.get("quote_mint", pd.Series(dtype=str)).fillna("").astype(str).str.strip().eq("").sum()) if len(timeline) else 0
+    missing_pool_type_rows = int(timeline.get("pool", pd.Series(dtype=str)).fillna("").astype(str).str.strip().eq("").sum()) if len(timeline) else 0
+
+    checks = {
+        "duplicate_mint_timestamp": duplicate_keys,
+        "row_count_mismatch": row_count_mismatch,
+        "timestamp_alignment_errors": timestamp_alignment_errors,
+        "bar_end_mismatch": bar_end_mismatch,
+        "available_before_bar_end": available_before_bar_end,
+        "pool_changed_source_mismatch": source_changed_mismatch,
+        "quote_mint_conflict_rows": quote_conflict_rows,
+        "pool_type_conflict_rows": pool_type_conflict_rows,
+        "filled_rows_included": filled_rows,
+        "missing_pool_id_rows": missing_pool_id_rows,
+        "missing_quote_mint_rows": missing_quote_mint_rows,
+        "missing_pool_type_rows": missing_pool_type_rows,
+    }
+    # Pool type is mandatory for simulator model dispatch (pump vs pump-amm).
+    # Missing IDs/quote metadata remain visible coverage metrics, while a missing
+    # protocol/type blocks the timeline from being marked execution-ready.
+    structural = (
+        "duplicate_mint_timestamp", "row_count_mismatch", "timestamp_alignment_errors",
+        "bar_end_mismatch", "available_before_bar_end", "pool_changed_source_mismatch",
+        "quote_mint_conflict_rows", "pool_type_conflict_rows", "filled_rows_included",
+        "missing_pool_type_rows",
+    )
+    checks["passed"] = all(checks[name] == 0 for name in structural)
+    return checks
 
 
 # ----------------------------------------------------------------------------- wide frames
@@ -639,6 +836,15 @@ def main():
         os.path.join(a.outdir, "universe_transitions.csv"), index=False, float_format="%.12g"
     )
 
+    # Pool selection is bucket-close information. Keep it in a separate timeline
+    # so it cannot be mistaken for metadata available at the candle open.
+    pool_timeline = build_pool_selection_timeline(real_all, bar_ms)
+    pool_timeline.to_csv(
+        os.path.join(a.outdir, "pool_selection_timeline.csv"),
+        index=False, float_format="%.12g",
+    )
+    pool_timeline_validation = validate_pool_selection_timeline(pool_timeline, real_all, bar_ms)
+
     report = {
         "builder_version": DATASET_BUILDER_VERSION,
         "input": a.input, "bar_ms": bar_ms, "grid_bars": int(len(grid)),
@@ -654,6 +860,19 @@ def main():
             "universe_csv_scope": "window-wide summary fields are descriptive only and are not used to filter historical rows",
             "mint_columns": "all mints found in the input are retained; future mints have no observations and remain ineligible before their first trade and qualification",
             "timeline_files": ["universe_timeline.csv", "universe_transitions.csv"],
+        },
+        "pool_selection_timeline": {
+            "file": "pool_selection_timeline.csv",
+            "rows": int(len(pool_timeline)),
+            "mints": int(pool_timeline["mint"].nunique()) if len(pool_timeline) else 0,
+            "pool_ids_missing_rows": int(pool_timeline_validation["missing_pool_id_rows"]),
+            "quote_mint_missing_rows": int(pool_timeline_validation["missing_quote_mint_rows"]),
+            "pool_type_missing_rows": int(pool_timeline_validation["missing_pool_type_rows"]),
+            "distinct_pool_ids": int(pool_timeline.loc[pool_timeline["pool_id"].astype(str).ne(""), "pool_id"].nunique()) if len(pool_timeline) else 0,
+            "pool_switch_rows": int(pd.to_numeric(pool_timeline.get("pool_changed", 0), errors="coerce").fillna(0).sum()) if len(pool_timeline) else 0,
+            "availability_policy": "pool selection uses completed events within the candle bucket; available_at_timestamp_ms equals bar_start_timestamp_ms + bar_ms; never use this selection before available_at_timestamp_ms",
+            "filled_rows_policy": "filled bars are excluded; carried pool identifiers are not treated as fresh pool selections",
+            "validation": pool_timeline_validation,
         },
         "price_model": {
             "spot_ohlc": "pool spot-price OHLC; legacy open/high/low/close frames remain for compatibility",
@@ -687,13 +906,18 @@ def main():
     }
     with open(os.path.join(a.outdir, "dataset_report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
-    print(json.dumps({k: report[k] for k in ("mints_total", "mints_included", "mints_eligible_at_window_end",
-                                              "universe_eligible_rows", "eligible_buy_execution_rows",
-                                              "eligible_sell_execution_rows", "real_bars_included",
-                                              "filled_bars_included", "validation")},
-                     ensure_ascii=False, indent=1), file=sys.stderr)
+    summary = {k: report[k] for k in (
+        "mints_total", "mints_included", "mints_eligible_at_window_end",
+        "universe_eligible_rows", "eligible_buy_execution_rows",
+        "eligible_sell_execution_rows", "real_bars_included",
+        "filled_bars_included", "validation",
+    )}
+    summary["pool_selection_validation"] = pool_timeline_validation
+    print(json.dumps(summary, ensure_ascii=False, indent=1), file=sys.stderr)
     if not chk["passed"]:
         sys.exit("Dataset validation failed; inspect dataset_report.json.")
+    if not pool_timeline_validation["passed"]:
+        sys.exit("Pool selection timeline validation failed; inspect pool_selection_timeline.csv and dataset_report.json.")
 
 
 if __name__ == "__main__":

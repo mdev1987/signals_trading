@@ -1,2 +1,3 @@
-VectorBT dataset builder: v7.0 (Point-in-Time Universe)
-Raw JSONL-to-OHLCV pipeline: v6.2 (unchanged)
+VectorBT dataset builder: v7.1.1 (Point-in-Time Universe + Pool Selection Timeline + mandatory pool-type validation)
+Raw JSONL-to-OHLCV pipeline: v6.2.1 (selected pool protocol/quote mint metadata passthrough; numeric calculations unchanged)
+Execution Simulator: v1.0 (unchanged)

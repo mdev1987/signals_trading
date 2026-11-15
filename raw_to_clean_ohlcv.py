@@ -184,6 +184,7 @@ FINAL_COLS = (
     + VOL_COLS
     + [
         "trades", "buys", "sells", "open_ts_ms", "close_ts_ms", "pool_id", "pool_key",
+        "pool", "quote_mint",
         "all_pool_trades", "pool_count", "pool_excluded_trades", "selected_pool_missing_id_trades",
         "selected_pool_trade_share", "selected_pool_volume_share", "pool_volume_share_roundoff_clipped",
         "valid_quote_trades", "invalid_quote_trades", "valid_quote_components",
@@ -1040,6 +1041,11 @@ def build_bars(
             "close_ts_ms": ("timestamp_ms", "last"),
             "pool_id": ("pool_id", "last"),
             "pool_key": ("pool_key", "last"),
+            # The selected pool's protocol and quote mint are stable metadata
+            # needed by downstream execution routing. These are aggregated
+            # only after selecting one pool_key for this mint/bucket.
+            "pool": ("pool", "last"),
+            "quote_mint": ("quote_mint", "last"),
             "selected_pool_missing_id_trades": ("pool_id_missing", "sum"),
             "valid_quote_trades": ("quote_valid", "sum"),
             "invalid_quote_trades": ("invalid_quote", "sum"),
@@ -1232,6 +1238,11 @@ def fill_gaps(bars, tf_ms, candle_range_ratio=10.0):
         full[c] = full[c].fillna(0.0)
     full["pool_id"] = full.groupby("mint")["pool_id"].ffill()
     full["pool_key"] = full.groupby("mint")["pool_key"].ffill()
+    # These values are informational on filled rows only. Downstream Pool
+    # Selection Timeline must be built from real bars (is_filled == 0).
+    for column in ("pool", "quote_mint"):
+        if column in full.columns:
+            full[column] = full.groupby("mint")[column].ffill()
     full["open_ts_ms"] = full["open_ts_ms"].astype("Int64")
     full["close_ts_ms"] = full["close_ts_ms"].astype("Int64")
     full["is_filled"] = filled.astype("int8")
