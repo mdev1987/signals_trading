@@ -1,3 +1,35 @@
+# v7.2.0 — Executable Pool Routing
+
+## Added
+
+- `reserve_model` in `pool_selection_timeline.csv`: `bonding_curve` for `pump`, `amm_virtual_quote` or `amm_virtual_tokens` for `pump-amm`, `ambiguous` when both virtual components are non-zero, `unknown` when neither is present, and empty for unmodeled protocols.
+- `execution_supported` in `pool_selection_timeline.csv`: `1` only for WSOL-quoted rows with a pool id, a modeled reserve identity, and positive reserves.
+- Dataset report fields `execution_supported_rows` and `reserve_model_counts`.
+- Raw OHLCV passthrough of `virtual_quote_in_pool` (open/close/prev-close) so the builder can identify the PumpSwap reserve style.
+- Execution Simulator support for `pump-amm` pools that use `virtualTokensInPool` instead of `virtualQuoteInPool`.
+
+## Fixed
+
+- Execution Simulator now prices both PumpSwap reserve styles. `virtual token` pools previously failed as `missing_amm_reserves`, which silently excluded about a quarter of pump-amm signal rows.
+- Buy and sell fees now share one convention: the quote-asset fee is deducted from the gross amount (`curve_quote = amount * (1 - fee_rate)`).
+- Out-of-order `execute()` calls are rejected instead of advancing to a future pool state (look-ahead guard).
+- `filled_rows_included` is computed from the source instead of being hardcoded to zero.
+- `row_count_mismatch` compares mint/timestamp key sets, so a replaced row cannot cancel against an added row.
+- Missing `pool_id` and missing `quote_mint` are now structural Pool Timeline failures, matching mandatory pool-type validation.
+- Raw pipeline report version is `v6.2.2` instead of the stale `v6`.
+
+## Compatibility
+
+- The raw change is additive: all 282 pre-existing 1m columns were verified bit-identical against the v7.1.1 output. Only `open_virtual_quote_in_pool`, `close_virtual_quote_in_pool`, and `prev_close_virtual_quote_in_pool` are new.
+- `pool_selection_status = ready` still means "metadata internally consistent". Use `execution_supported == 1` to gate order creation.
+
+## Validation
+
+- Full unit test suite: 76/76 passed.
+- Real full-hour rebuild: `05.jsonl.zst` (1,907,859 events) regenerated to 112,388 one-minute rows, 44,837 real bars, and a 44,837-row pool timeline with every validation check at zero.
+- Real candidate integration: 8,525 candidate rows. Of these, 1,183 bars are `amm_virtual_tokens` and now fill in the simulator; 1,223 buy and 886 sell orders still reject with `missing_amm_reserves`, and every one of them is `execution_supported == 0`.
+- Routing invariant verified on real orders: no `execution_supported == 0` row fills, and no `execution_supported == 1` row fails with a reserve-model error.
+
 # v7.1.1 — Mandatory Pool Type Validation
 
 ## Fixed
@@ -22,18 +54,10 @@ The v7.1.1 raw-to-OHLCV script passes selected `pool` and `quote_mint` into real
 
 ## Raw OHLCV metadata passthrough
 
-The raw pipeline now emits `pool` and `quote_mint` on selected-pool candle rows and forward-carries them only for compatibility on filled rows. The pool timeline filters filled rows, so carried metadata is never treated as a new selection. Numeric OHLCV, VWAP, volume, and directional execution calculations are unchanged.
+The raw pipeline emits `pool` and `quote_mint` on selected-pool candle rows and forward-carries them only for compatibility on filled rows. The pool timeline filters filled rows, so carried metadata is never treated as a new selection. Numeric OHLCV, VWAP, volume, and directional execution calculations are unchanged.
 
 ## Unchanged
 
 - Point-in-Time Universe qualification and delay logic.
 - Spot and directional Execution OHLC calculations.
-- Execution Simulator pricing, reserve, and fee logic.
 - Strategy/Backtester behavior; integration remains a later step.
-
-## Validation
-
-- Full unit test suite: 65/65 passed.
-- Python compilation: passed.
-- Pool timeline unit tests: real-bar-only behavior and post-close availability passed.
-- Actual full-hour dataset rebuild: not run in this environment because the source raw `.jsonl.zst` and original `ohlcv_1m.csv` were not included in the uploaded archives.

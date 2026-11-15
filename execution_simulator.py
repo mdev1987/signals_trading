@@ -83,6 +83,7 @@ class PoolSnapshot:
     fee_rate: float | None
     signature: str | None
     action: str
+    reserve_model: str | None = None
     unsupported_reason: str | None = None
 
     @property
@@ -108,6 +109,7 @@ def snapshot_from_event(event: dict[str, Any]) -> PoolSnapshot | None:
     timestamp_ms = int(timestamp)
     token_reserve: float | None = None
     quote_reserve: float | None = None
+    reserve_model: str | None = None
     fee_rate = _to_float(event.get("poolFeeRate"))
     reason: str | None = None
 
@@ -116,18 +118,34 @@ def snapshot_from_event(event: dict[str, Any]) -> PoolSnapshot | None:
     elif pool == "pump":
         token_reserve = _to_float(event.get("vTokensInBondingCurve"))
         quote_reserve = _to_float(event.get("vQuoteInBondingCurve"))
+        reserve_model = "bonding_curve"
         if token_reserve is None or quote_reserve is None:
             reason = "missing_bonding_curve_reserves"
     elif pool == "pump-amm":
-        token_reserve = _to_float(event.get("tokensInPool"))
-        quote_vault_reserve = _to_float(event.get("quoteInPool"))
-        virtual_quote_reserve = _to_float(event.get("virtualQuoteInPool"))
-        quote_reserve = (
-            quote_vault_reserve + virtual_quote_reserve
-            if quote_vault_reserve is not None and virtual_quote_reserve is not None
-            else None
-        )
-        if token_reserve is None or quote_reserve is None:
+        tokens_in_pool = _to_float(event.get("tokensInPool"))
+        quote_in_pool = _to_float(event.get("quoteInPool"))
+        virtual_tokens = _to_float(event.get("virtualTokensInPool"))
+        virtual_quote = _to_float(event.get("virtualQuoteInPool"))
+        virtual_tokens_active = virtual_tokens is not None and virtual_tokens != 0.0
+        virtual_quote_active = virtual_quote is not None and virtual_quote != 0.0
+
+        if tokens_in_pool is None or quote_in_pool is None:
+            reason = "missing_amm_reserves"
+        elif virtual_tokens_active and virtual_quote_active:
+            # The feed uses exactly one virtual reserve style per pool. Seeing both
+            # non-zero makes the price identity ambiguous, so refuse to guess.
+            reason = "ambiguous_virtual_reserves"
+        elif virtual_tokens_active:
+            # Price identity: quoteInPool / (tokensInPool + virtualTokensInPool)
+            token_reserve = tokens_in_pool + virtual_tokens
+            quote_reserve = quote_in_pool
+            reserve_model = "amm_virtual_tokens"
+        elif virtual_quote is not None:
+            # Price identity: (quoteInPool + virtualQuoteInPool) / tokensInPool
+            token_reserve = tokens_in_pool
+            quote_reserve = quote_in_pool + virtual_quote
+            reserve_model = "amm_virtual_quote"
+        else:
             reason = "missing_amm_reserves"
     else:
         reason = "unsupported_pool_model"
@@ -154,6 +172,7 @@ def snapshot_from_event(event: dict[str, Any]) -> PoolSnapshot | None:
         fee_rate=fee_rate,
         signature=str(event.get("signature") or "") or None,
         action=action,
+        reserve_model=reserve_model,
         unsupported_reason=reason,
     )
 
@@ -171,6 +190,7 @@ class PoolState:
     fee_rate: float
     last_snapshot_ms: int
     last_signature: str | None
+    reserve_model: str | None = None
 
     @property
     def spot_price(self) -> float:
@@ -187,6 +207,7 @@ class FillResult:
     amount: float
     status: str
     pool: str | None = None
+    reserve_model: str | None = None
     state_timestamp_ms: int | None = None
     state_age_ms: int | None = None
     reference_spot_price: float | None = None
@@ -226,6 +247,7 @@ class ExecutionSimulator:
         self._events = iter_jsonl_events(self.events_path)
         self._next_snapshot: PoolSnapshot | None = None
         self._last_event_timestamp_ms = -1
+        self._last_order_timestamp_ms = -1
         self._line_index = 0
         self._states: dict[tuple[str, str], PoolState] = {}
         self._metadata: dict[tuple[str, str], PoolSnapshot] = {}
@@ -289,6 +311,7 @@ class ExecutionSimulator:
                 fee_rate=snapshot.fee_rate,
                 last_snapshot_ms=snapshot.timestamp_ms,
                 last_signature=snapshot.signature,
+                reserve_model=snapshot.reserve_model,
             )
             self.stats["pool_states_initialized"] += 1
             self.stats["valid_snapshots_applied"] += 1
@@ -313,6 +336,7 @@ class ExecutionSimulator:
         state.last_signature = snapshot.signature
         state.pool = snapshot.pool
         state.quote_mint = snapshot.quote_mint
+        state.reserve_model = snapshot.reserve_model
         self.stats["pool_state_updates"] += 1
         self.stats["valid_snapshots_applied"] += 1
 
@@ -359,6 +383,11 @@ class ExecutionSimulator:
             result.status = "invalid_order"
             result.reason = "amount_must_be_finite_and_positive"
             return result
+        if int(timestamp_ms) < self._last_order_timestamp_ms:
+            result.status = "invalid_order"
+            result.reason = "orders_must_be_non_decreasing_in_time"
+            return result
+        self._last_order_timestamp_ms = int(timestamp_ms)
 
         self.advance_before(int(timestamp_ms))
         key = (mint, pool_id)
@@ -383,6 +412,7 @@ class ExecutionSimulator:
 
         state_age = int(timestamp_ms) - state.last_snapshot_ms
         result.pool = state.pool
+        result.reserve_model = state.reserve_model
         result.state_timestamp_ms = state.last_snapshot_ms
         result.state_age_ms = state_age
         result.signature = state.last_signature
@@ -403,9 +433,11 @@ class ExecutionSimulator:
         result.reserve_quote_before = quote_before
 
         if normalized_side == "buy":
+            # Fees are always charged in the quote asset, on the gross amount:
+            # the user pays `amount` SOL and the fee is deducted before the swap.
             quote_gross = amount
-            quote_net = quote_gross / (1.0 + fee_rate)
-            quote_fee = quote_gross - quote_net
+            quote_fee = quote_gross * fee_rate
+            quote_net = quote_gross - quote_fee
             token_out = token_before * quote_net / (quote_before + quote_net)
             if token_out <= 0 or token_out >= token_before:
                 result.status = "invalid_fill"

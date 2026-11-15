@@ -73,6 +73,30 @@ class SnapshotParsingTests(unittest.TestCase):
         snapshot = snapshot_from_event(raw)
         self.assertEqual(snapshot.unsupported_reason, "missing_amm_reserves")
 
+    def test_pump_amm_uses_virtual_tokens_reserve(self) -> None:
+        raw = event(100, pool="pump-amm")
+        raw["virtualQuoteInPool"] = None
+        raw["virtualTokensInPool"] = 40.0
+        snapshot = snapshot_from_event(raw)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.token_reserve, 1_040.0)
+        self.assertEqual(snapshot.quote_reserve, 100.0)
+        self.assertEqual(snapshot.reserve_model, "amm_virtual_tokens")
+        self.assertIsNone(snapshot.unsupported_reason)
+
+    def test_pump_amm_virtual_quote_reserve_model(self) -> None:
+        raw = event(100, pool="pump-amm")
+        raw["virtualQuoteInPool"] = 5.0
+        snapshot = snapshot_from_event(raw)
+        self.assertEqual(snapshot.reserve_model, "amm_virtual_quote")
+
+    def test_pump_amm_rejects_ambiguous_virtual_reserves(self) -> None:
+        raw = event(100, pool="pump-amm")
+        raw["virtualQuoteInPool"] = 5.0
+        raw["virtualTokensInPool"] = 40.0
+        snapshot = snapshot_from_event(raw)
+        self.assertEqual(snapshot.unsupported_reason, "ambiguous_virtual_reserves")
+
     def test_other_pool_is_explicitly_unsupported(self) -> None:
         snapshot = snapshot_from_event(event(100, pool="raydium-cpmm"))
         self.assertEqual(snapshot.unsupported_reason, "unsupported_pool_model")
@@ -103,7 +127,8 @@ class ExecutionTests(unittest.TestCase):
             side="buy", amount=1.0,
         )
         self.assertEqual(result.status, "filled")
-        expected_net = 1.0 / 1.01
+        self.assertEqual(result.reserve_model, "bonding_curve")
+        expected_net = 1.0 * 0.99
         self.assertAlmostEqual(result.quote_fee, 1.0 - expected_net)
         self.assertAlmostEqual(result.quote_net, expected_net)
         self.assertAlmostEqual(result.token_amount, 1_000 * expected_net / (100.0 + expected_net))
@@ -235,6 +260,21 @@ class ExecutionTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         with self.assertRaises(ValueError):
             simulator.advance_before(300)
+
+    def test_out_of_order_orders_are_rejected_without_look_ahead(self) -> None:
+        simulator, temp = self.make_simulator([event(100), event(200, token_reserve=2_000)])
+        self.addCleanup(temp.cleanup)
+        first = simulator.execute(
+            order_id="late", timestamp_ms=201, mint="mint-1", pool_id="pool-1",
+            side="buy", amount=0.001,
+        )
+        self.assertEqual(first.status, "filled")
+        earlier = simulator.execute(
+            order_id="early", timestamp_ms=150, mint="mint-1", pool_id="pool-1",
+            side="buy", amount=0.001,
+        )
+        self.assertEqual(earlier.status, "invalid_order")
+        self.assertEqual(earlier.reason, "orders_must_be_non_decreasing_in_time")
 
 
 if __name__ == "__main__":

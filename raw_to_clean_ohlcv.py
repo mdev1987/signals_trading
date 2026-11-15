@@ -62,7 +62,7 @@ ROW_COLS = [
     "event_index", "signature", "action", "mint", "pool_id", "pool", "quote_mint",
     "timestamp_ms", "token_amount", "quote_amount", "price_sol", "quote_price_sol",
     "n_breakdown", "block", "breakdown_json", "tokens_in_pool", "quote_in_pool",
-    "virtual_tokens_in_pool", "burned_liquidity", "pool_created_by", "decimals", "supply",
+    "virtual_tokens_in_pool", "virtual_quote_in_pool", "burned_liquidity", "pool_created_by", "decimals", "supply",
     "participant_quote_balance_delta_sol", "participant_balance_available",
     "participant_balance_checked",
 ]
@@ -152,6 +152,7 @@ EVENT_AUDIT_FIELDS = {
     "tokens_in_pool": "tokens_in_pool",
     "quote_in_pool": "quote_in_pool",
     "virtual_tokens_in_pool": "virtual_tokens_in_pool",
+    "virtual_quote_in_pool": "virtual_quote_in_pool",
     "burned_liquidity": "burned_liquidity",
     "pool_created_by": "pool_created_by",
     "participant_quote_balance_delta_sol": "participant_quote_balance_delta_sol",
@@ -338,7 +339,8 @@ def read_file(path, start_idx, stats):
                 e.get("pool"), e.get("quoteMint"), e.get("timestamp"), e.get("tokenAmount"),
                 e.get("quoteAmount"), e.get("priceSol"), e.get("quotePriceSol"),
                 len(bd), e.get("block"), bd_json, e.get("tokensInPool"), e.get("quoteInPool"),
-                e.get("virtualTokensInPool"), e.get("burnedLiquidity"), e.get("poolCreatedBy"),
+                e.get("virtualTokensInPool"), e.get("virtualQuoteInPool"),
+                e.get("burnedLiquidity"), e.get("poolCreatedBy"),
                 e.get("decimals"), e.get("supply"), balance_delta_sol,
                 balance_available, balance_checked,
             ))
@@ -446,7 +448,8 @@ def clean_trades(df, args, st):
     df = df.copy()
     for c in (
         "timestamp_ms", "token_amount", "quote_amount", "price_sol", "quote_price_sol",
-        "tokens_in_pool", "quote_in_pool", "virtual_tokens_in_pool", "decimals", "supply",
+        "tokens_in_pool", "quote_in_pool", "virtual_tokens_in_pool", "virtual_quote_in_pool",
+        "decimals", "supply",
         "participant_quote_balance_delta_sol", "participant_balance_checked",
     ):
         if c not in df:
@@ -1635,7 +1638,7 @@ def main():
     )
 
     report = {
-        "version": "v6",
+        "version": "v6.2.2",
         "inputs": paths,
         "cleaning": stats,
         "execution_ohlc_policy": {
@@ -1659,6 +1662,7 @@ def main():
             "policy": "highest_valid_gross_sol_quote_volume_per_mint_bucket",
             "scope": "completed current bucket only; no later buckets are used",
             "execution_note": "The selected pool is known only after the bucket closes; do not use it as if it were known at the bucket open.",
+            "reserve_metadata": "open/close/prev-close tokens_in_pool, quote_in_pool, virtual_tokens_in_pool and virtual_quote_in_pool are emitted so downstream code can identify the pool reserve model; they do not change OHLCV, VWAP, or execution-price math",
         },
         "volume_policy": {
             "multi_breakdown": "use gross sums of valid BUY and SELL components; never use top-level net amounts as gross volume",

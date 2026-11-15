@@ -1,6 +1,6 @@
-# Point-in-Time Universe Dataset Builder v7.1.1
+# Point-in-Time Universe Dataset Builder v7.2.0
 
-This package extends the v7.0 Point-in-Time VectorBT dataset with a separate, auditable Pool Selection Timeline. The raw JSONL-to-OHLCV pipeline remains numerically unchanged; it also passes the selected pool protocol (`pool`) and quote mint (`quote_mint`) through each real candle for downstream routing. This patch release makes missing pool protocol metadata a validation failure.
+This package extends the v7.0 Point-in-Time VectorBT dataset with a separate, auditable Pool Selection Timeline. The raw JSONL-to-OHLCV pipeline remains numerically unchanged; it also passes the selected pool protocol (`pool`), quote mint (`quote_mint`), and virtual reserve components (`virtual_tokens_in_pool`, `virtual_quote_in_pool`) through each real candle for downstream routing. Pool metadata is mandatory for validation, and the timeline now records the reserve model and whether the execution simulator can route each row.
 
 ## What changed
 
@@ -16,6 +16,7 @@ The new builder:
 - Writes full decision history and entry/exit transition audit files.
 - Keeps full-window metrics only as descriptive summary fields.
 - Writes `pool_selection_timeline.csv`, preserving the selected `pool_id`, `pool_key`, pool protocol, quote mint, and pool-switch flag for each real candle.
+- Records each selected pool's `reserve_model` and an `execution_supported` routing flag so the dataset and the execution simulator agree.
 - Marks the pool selection as available only at the candle close (`bar_start_timestamp_ms + bar_ms`); filled candles are excluded.
 
 ## Point-in-time eligibility rules
@@ -131,9 +132,11 @@ One row per mint and real candle. It preserves the selected-pool metadata from t
 - `pool`: pool protocol/type (for example, `pump` or `pump-amm`).
 - `quote_mint`: quote asset used by that selected pool.
 - `pool_changed`: whether the selected pool differs from the previous observed candle for the mint.
+- `reserve_model`: the reserve identity the execution simulator uses: `bonding_curve` for `pump`, `amm_virtual_quote` or `amm_virtual_tokens` for `pump-amm`, `ambiguous` when both virtual reserves are non-zero, `unknown` when neither is present, and empty for protocols the simulator does not model.
+- `execution_supported`: `1` only when the row is WSOL-quoted, has a pool id, and uses a reserve model the simulator implements (and, for PumpSwap, positive effective reserves). This is the flag to gate order creation; `pool_selection_status = ready` only means the metadata is internally consistent, not that the simulator can route it.
 - `pool_selection_status`: `ready`, `missing_pool_id`, `missing_quote_mint`, `missing_pool_type`, or a metadata-conflict status.
 
-The pool protocol/type is mandatory for execution routing because the simulator dispatches different reserve models for `pump` and `pump-amm`. A missing pool type now causes Pool Timeline validation to fail; it can no longer silently pass as `ready`. If you are using a legacy OHLCV CSV without the selected `pool` field, regenerate the raw-to-OHLCV output with the `raw_to_clean_ohlcv.py` included in this package before running the builder.
+Selected-pool metadata is mandatory for execution routing: the simulator needs a pool identifier, a protocol (to dispatch `pump` vs `pump-amm` reserve models), and a quote mint. A missing `pool_id`, `quote_mint`, or pool type now causes Pool Timeline validation to fail; it can no longer silently pass as `ready`. If you are using a legacy OHLCV CSV without the selected `pool` field, regenerate the raw-to-OHLCV output with the `raw_to_clean_ohlcv.py` included in this package before running the builder.
 
 **Timing rule:** `timestamp_ms` and `bar_start_timestamp_ms` identify the start of the candle. The selected pool is based on all events inside that candle, so it becomes known only at `available_at_timestamp_ms`, which equals `bar_end_timestamp_ms = bar_start_timestamp_ms + bar_ms`. For a 1-minute bar starting at 05:05:00 UTC, the selected pool is available at 05:06:00 UTC, not at 05:05:00.
 
@@ -154,21 +157,30 @@ cp ohlcv_point_in_time_v7_package/test_raw_to_clean_ohlcv.py ./test_raw_to_clean
 cp ohlcv_point_in_time_v7_package/test_build_vbt_dataset.py ./test_build_vbt_dataset.py
 ```
 
-The raw pipeline is based on v6.2; the only raw-stage change in this package is passthrough of the selected pool protocol and quote mint. OHLCV, VWAP, execution-price, and PIT calculations are not changed by that metadata addition. The builder adds the pool timeline independently from the numerical Wide/Long frames.
+The raw pipeline is based on v6.2; the only raw-stage changes in this package are passthrough of the selected pool protocol, quote mint, and virtual reserve components. OHLCV, VWAP, execution-price, and PIT calculations are not changed by those metadata additions. The builder adds the pool timeline independently from the numerical Wide/Long frames.
 
 ## Run tests
 
 ```bash
-uv run python -m unittest -v test_raw_to_clean_ohlcv.py test_build_vbt_dataset.py
+uv run python -m unittest -v test_raw_to_clean_ohlcv.py test_build_vbt_dataset.py test_execution_simulator.py
 ```
 
 ## Build the point-in-time VectorBT dataset
 
-Use the v6.2 one-minute OHLCV output as input:
+Regenerate the one-minute OHLCV input with the packaged raw script (it adds the pool metadata columns):
 
 ```bash
-uv run python build_vbt_dataset.py output/ohlcv_clean_v6_2/ohlcv_1m.csv \
-    -o output/vbt_dataset_pit_v7_1m \
+uv run python raw_to_clean_ohlcv.py 05.jsonl.zst \
+    -o output/ohlcv_clean_v7_2_0 \
+    -t 5s,15s,1m \
+    --fill
+```
+
+Then build the dataset:
+
+```bash
+uv run python build_vbt_dataset.py output/ohlcv_clean_v7_2_0/ohlcv_1m.csv \
+    -o output/vbt_dataset_pit_v7_2_0m \
     --max-stale-bars 0 \
     --candle-range-ratio 10.0 \
     --universe-delay-bars 1 \
@@ -206,6 +218,7 @@ The builder validates:
 - Binary universe masks.
 - No universe eligibility before at least one prior completed real bar.
 - Regular time-grid spacing.
+- Pool timeline key-set equality with the real-bar source (not just row counts), real-timestamp alignment, post-close availability, fill exclusion, source pool-change parity, and mandatory `pool_id` / `quote_mint` / pool-type metadata.
 
 The report records the builder version, configured thresholds, PIT delay, eligibility counts, transition counts, and validation results.
 

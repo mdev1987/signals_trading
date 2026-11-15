@@ -42,7 +42,8 @@ import sys
 import numpy as np
 import pandas as pd
 
-DATASET_BUILDER_VERSION = "v7.1.1"
+DATASET_BUILDER_VERSION = "v7.2.0"
+WSOL_MINT = "So11111111111111111111111111111111111111112"
 REQUIRED = ["mint", "timestamp_ms", "open", "high", "low", "close", "trades", "is_filled"]
 OPTIONAL_NUM = [
     "vwap_sol", "volume_token", "volume_sol", "jump_flag", "pool_changed",
@@ -93,6 +94,7 @@ def load(path):
     )
     df.attrs["has_directional_execution_ohlc"] = has_execution
 
+    synthetic_zero = set()
     for c in OPTIONAL_NUM:
         if c in df.columns:
             continue
@@ -102,9 +104,22 @@ def load(path):
             df[c] = np.nan
         else:
             df[c] = 0
+            synthetic_zero.add(c)
 
     if "pool_id" not in df.columns:
         df["pool_id"] = ""
+
+    if "pool_changed" in synthetic_zero:
+        # A missing source flag must not be reported as "no pool changes".
+        # Rebuild it per mint from the selected pool identity so the pool
+        # timeline and its validation agree with a legacy input.
+        key_column = "pool_key" if "pool_key" in original_columns else "pool_id"
+        ordered = df.sort_values(["mint", "timestamp_ms"], kind="stable")
+        keys = ordered[key_column].fillna("").astype(str).str.strip()
+        previous = keys.groupby(ordered["mint"].astype(str), sort=False).shift(1)
+        changed = (previous.notna() & keys.ne(previous)).astype("int8")
+        df["pool_changed"] = changed.reindex(df.index).astype("int8")
+
     return df
 
 
@@ -339,6 +354,48 @@ def _first_available_text(frame, candidates, default=""):
     return out.replace({"nan": default, "None": default, "<NA>": default})
 
 
+def _first_available_numeric(frame, candidates):
+    """Return the first existing numeric column, falling back to NaN."""
+    out = pd.Series(np.nan, index=frame.index, dtype="float64")
+    for name in candidates:
+        if name not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[name], errors="coerce")
+        out = out.where(out.notna(), values)
+    return out
+
+
+def _derive_reserve_model(pool_type, virtual_tokens, virtual_quote):
+    """Map a selected pool to the reserve model the execution simulator uses.
+
+    Pump bonding-curve events carry effective virtual reserves directly. Pump AMM
+    pools use exactly one virtual reserve style, so the two styles are mutually
+    exclusive and can be identified from the per-bar reserve snapshot.
+
+    Returns ``(reserve_model, unambiguous)`` where ``unambiguous`` is False when
+    both virtual components are non-zero and the price identity cannot be chosen.
+    """
+    model = pd.Series("", index=pool_type.index, dtype="object")
+    unambiguous = pd.Series(True, index=pool_type.index, dtype="bool")
+
+    pump = pool_type.eq("pump")
+    amm = pool_type.eq("pump-amm")
+
+    vt_active = virtual_tokens.notna() & virtual_tokens.ne(0.0)
+    vq_present = virtual_quote.notna()
+    vq_active = vq_present & virtual_quote.ne(0.0)
+
+    ambiguous = amm & vt_active & vq_active
+    model = model.mask(ambiguous, "ambiguous")
+    unambiguous = unambiguous & ~ambiguous
+
+    model = model.mask(amm & ~ambiguous & vt_active, "amm_virtual_tokens")
+    model = model.mask(amm & ~ambiguous & ~vt_active & vq_present, "amm_virtual_quote")
+    model = model.mask(amm & ~ambiguous & ~vt_active & ~vq_present, "unknown")
+    model = model.mask(pump, "bonding_curve")
+    return model, unambiguous
+
+
 def build_pool_selection_timeline(source, bar_ms):
     """Expose the selected pool for each real candle only after that candle closes.
 
@@ -363,7 +420,8 @@ def build_pool_selection_timeline(source, bar_ms):
             "available_at_timestamp_ms", "bar_start_utc", "bar_end_utc", "available_at_utc",
             "pool_id", "pool_key", "pool", "quote_mint", "pool_changed",
             "pool_id_valid", "quote_mint_conflict_flag", "pool_type_conflict_flag",
-            "pool_selection_status", "pool_count", "pool_excluded_trades",
+            "pool_selection_status", "reserve_model", "execution_supported",
+            "pool_count", "pool_excluded_trades",
             "selected_pool_trade_share", "selected_pool_volume_share",
             "pool_switch_discontinuity_flag",
         ])
@@ -419,6 +477,35 @@ def build_pool_selection_timeline(source, bar_ms):
         default="ready",
     )
 
+    virtual_tokens = _first_available_numeric(
+        data, ("close_virtual_tokens_in_pool", "open_virtual_tokens_in_pool", "virtual_tokens_in_pool")
+    )
+    virtual_quote = _first_available_numeric(
+        data, ("close_virtual_quote_in_pool", "open_virtual_quote_in_pool", "virtual_quote_in_pool")
+    )
+    reserve_model, unambiguous = _derive_reserve_model(pool_type, virtual_tokens, virtual_quote)
+
+    tokens_in_pool = _first_available_numeric(
+        data, ("close_tokens_in_pool", "open_tokens_in_pool", "tokens_in_pool")
+    )
+    quote_in_pool = _first_available_numeric(
+        data, ("close_quote_in_pool", "open_quote_in_pool", "quote_in_pool")
+    )
+    effective_quote = quote_in_pool.where(reserve_model.ne("amm_virtual_quote"), quote_in_pool + virtual_quote.fillna(0.0))
+    amm_reserves_ok = (
+        tokens_in_pool.gt(0)
+        & effective_quote.gt(0)
+    )
+    execution_supported = (
+        pool_id_valid.eq(1)
+        & quote_mint.eq(WSOL_MINT)
+        & unambiguous
+        & (
+            (reserve_model.eq("bonding_curve"))
+            | (reserve_model.isin(["amm_virtual_tokens", "amm_virtual_quote"]) & amm_reserves_ok)
+        )
+    ).astype("int8")
+
     start = data["timestamp_ms"].to_numpy(dtype="int64")
     end = start + int(bar_ms)
     timeline = pd.DataFrame({
@@ -439,6 +526,8 @@ def build_pool_selection_timeline(source, bar_ms):
         "quote_mint_conflict_flag": quote_conflict.to_numpy(dtype="int8"),
         "pool_type_conflict_flag": pool_conflict.to_numpy(dtype="int8"),
         "pool_selection_status": status,
+        "reserve_model": reserve_model.to_numpy(),
+        "execution_supported": execution_supported.to_numpy(dtype="int8"),
     })
 
     for column in (
@@ -464,15 +553,31 @@ def validate_pool_selection_timeline(timeline, source, bar_ms):
         source_real = source_real.loc[pd.to_numeric(source_real["timestamp_ms"], errors="coerce").notna()]
 
     duplicate_keys = int(timeline.duplicated(["mint", "timestamp_ms"]).sum()) if len(timeline) else 0
-    expected_rows = int(len(source_real))
-    row_count_mismatch = abs(int(len(timeline)) - expected_rows)
+    expected_keys = set(zip(source_real["mint"].astype(str), source_real["timestamp_ms"].astype("int64")))
+    actual_keys = (
+        set(zip(timeline["mint"].astype(str), timeline["timestamp_ms"].astype("int64")))
+        if len(timeline)
+        else set()
+    )
+    # Symmetric difference keeps an added candle and a dropped candle from
+    # cancelling out, which an absolute row-count delta would hide.
+    row_count_mismatch = len(expected_keys.symmetric_difference(actual_keys))
+
+    filled_rows = 0
+    if "is_filled" in source.columns and len(timeline):
+        filled_source = source.loc[
+            pd.to_numeric(source["is_filled"], errors="coerce").fillna(1).ne(0)
+        ]
+        filled_keys = set(
+            zip(filled_source["mint"].astype(str), filled_source["timestamp_ms"].astype("int64"))
+        )
+        filled_rows = len(filled_keys.intersection(actual_keys))
     bar_end_expected = pd.to_numeric(timeline.get("timestamp_ms", pd.Series(dtype=float)), errors="coerce") + bar_ms
     bar_end_observed = pd.to_numeric(timeline.get("bar_end_timestamp_ms", pd.Series(dtype=float)), errors="coerce")
     available_observed = pd.to_numeric(timeline.get("available_at_timestamp_ms", pd.Series(dtype=float)), errors="coerce")
     timestamp_alignment_errors = int((pd.to_numeric(timeline.get("timestamp_ms", pd.Series(dtype=float)), errors="coerce") % bar_ms != 0).sum()) if len(timeline) else 0
     bar_end_mismatch = int((~np.isclose(bar_end_expected, bar_end_observed, rtol=0, atol=0, equal_nan=False)).sum()) if len(timeline) else 0
     available_before_bar_end = int((available_observed < bar_end_observed).sum()) if len(timeline) else 0
-    filled_rows = 0
     source_changed_mismatch = 0
     if "pool_changed" in source_real.columns and len(timeline):
         ordered_source = source_real.sort_values(["mint", "timestamp_ms"], kind="stable").copy()
@@ -511,14 +616,13 @@ def validate_pool_selection_timeline(timeline, source, bar_ms):
         "missing_quote_mint_rows": missing_quote_mint_rows,
         "missing_pool_type_rows": missing_pool_type_rows,
     }
-    # Pool type is mandatory for simulator model dispatch (pump vs pump-amm).
-    # Missing IDs/quote metadata remain visible coverage metrics, while a missing
-    # protocol/type blocks the timeline from being marked execution-ready.
+    # Selected pool metadata is required for execution routing: the simulator
+    # needs a pool identifier, a protocol (pump vs pump-amm), and a quote mint.
     structural = (
         "duplicate_mint_timestamp", "row_count_mismatch", "timestamp_alignment_errors",
         "bar_end_mismatch", "available_before_bar_end", "pool_changed_source_mismatch",
         "quote_mint_conflict_rows", "pool_type_conflict_rows", "filled_rows_included",
-        "missing_pool_type_rows",
+        "missing_pool_id_rows", "missing_quote_mint_rows", "missing_pool_type_rows",
     )
     checks["passed"] = all(checks[name] == 0 for name in structural)
     return checks
@@ -638,7 +742,7 @@ def build_wide(real, grid, last_ts, tail_fill, keep_first_open,
 
 def validate(fr, alive, max_stale_bars=0, candle_range_ratio=10.0):
     """Validate spot marks, freshness masks, directional execution OHLC, and anomaly flags."""
-    o, h, l, c = fr["open"], fr["high"], fr["low"], fr["close"]
+    o, h, lo, c = fr["open"], fr["high"], fr["low"], fr["close"]
     real = fr["real_bar"] == 1
     a = alive.values
     spot_o, spot_h, spot_l, spot_c = (
@@ -670,10 +774,10 @@ def validate(fr, alive, max_stale_bars=0, candle_range_ratio=10.0):
     chk = {
         "universe_mask_non_binary": int((~universe_mask.isin([0, 1])).values.sum()),
         "universe_eligible_before_prior_real_bar": int((universe_mask.astype(bool) & ~prior_real_seen).values.sum()),
-        "nan_ohlc_in_alive": int(np.isnan(np.stack([o.values, h.values, l.values, c.values]))[:, a].sum()),
-        "non_positive_price": int(((np.stack([o.values, h.values, l.values, c.values]) <= 0) & a).sum()),
+        "nan_ohlc_in_alive": int(np.isnan(np.stack([o.values, h.values, lo.values, c.values]))[:, a].sum()),
+        "non_positive_price": int(((np.stack([o.values, h.values, lo.values, c.values]) <= 0) & a).sum()),
         "high_lt_open_close": int(((h.values < np.maximum(o.values, c.values)) & a).sum()),
-        "low_gt_open_close": int(((l.values > np.minimum(o.values, c.values)) & a).sum()),
+        "low_gt_open_close": int(((lo.values > np.minimum(o.values, c.values)) & a).sum()),
         "negative_volume": int(((fr["volume_token"].values < 0) | (fr["volume_sol"].values < 0)).sum()),
         "filled_spot_bar_not_flat": int((((spot_o != spot_c) | (spot_h != spot_c) | (spot_l != spot_c)) & alive & ~real).values.sum()),
         "real_bar_stale_not_zero": int(((fr["stale_bars"] != 0) & real).values.sum()),
@@ -870,6 +974,12 @@ def main():
             "pool_type_missing_rows": int(pool_timeline_validation["missing_pool_type_rows"]),
             "distinct_pool_ids": int(pool_timeline.loc[pool_timeline["pool_id"].astype(str).ne(""), "pool_id"].nunique()) if len(pool_timeline) else 0,
             "pool_switch_rows": int(pd.to_numeric(pool_timeline.get("pool_changed", 0), errors="coerce").fillna(0).sum()) if len(pool_timeline) else 0,
+            "execution_supported_rows": int(pd.to_numeric(pool_timeline.get("execution_supported", 0), errors="coerce").fillna(0).sum()) if len(pool_timeline) else 0,
+            "reserve_model_counts": (
+                {str(k): int(v) for k, v in pool_timeline.get("reserve_model", pd.Series(dtype=str)).fillna("").astype(str).value_counts().items()}
+                if len(pool_timeline) else {}
+            ),
+            "execution_support_policy": "execution_supported means the selected pool uses a WSOL quote and a reserve model the execution simulator implements (pump bonding curve, or pump-amm with one unambiguous virtual reserve style)",
             "availability_policy": "pool selection uses completed events within the candle bucket; available_at_timestamp_ms equals bar_start_timestamp_ms + bar_ms; never use this selection before available_at_timestamp_ms",
             "filled_rows_policy": "filled bars are excluded; carried pool identifiers are not treated as fresh pool selections",
             "validation": pool_timeline_validation,

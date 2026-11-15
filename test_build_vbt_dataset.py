@@ -229,6 +229,147 @@ class BuildVbtDatasetTests(unittest.TestCase):
         self.assertFalse(audit["passed"])
         self.assertEqual(audit["quote_mint_conflict_rows"], 1)
 
+    def test_pool_timeline_records_reserve_model_and_execution_support(self):
+        source = pd.DataFrame([
+            {
+                "mint": "MINT-RM", "timestamp_ms": 0, "is_filled": 0,
+                "pool_id": "POOL-PUMP", "pool_key": "POOL-PUMP", "pool": "pump",
+                "quote_mint": builder.WSOL_MINT, "pool_changed": 0,
+            },
+            {
+                "mint": "MINT-RM", "timestamp_ms": 60_000, "is_filled": 0,
+                "pool_id": "POOL-VT", "pool_key": "POOL-VT", "pool": "pump-amm",
+                "quote_mint": builder.WSOL_MINT, "pool_changed": 1,
+                "close_tokens_in_pool": 1_000.0, "close_quote_in_pool": 100.0,
+                "close_virtual_tokens_in_pool": 40.0,
+            },
+            {
+                "mint": "MINT-RM", "timestamp_ms": 120_000, "is_filled": 0,
+                "pool_id": "POOL-VQ", "pool_key": "POOL-VQ", "pool": "pump-amm",
+                "quote_mint": builder.WSOL_MINT, "pool_changed": 1,
+                "close_tokens_in_pool": 1_000.0, "close_quote_in_pool": 100.0,
+                "close_virtual_quote_in_pool": 10.0,
+            },
+        ])
+        timeline = builder.build_pool_selection_timeline(source, 60_000)
+
+        self.assertEqual(
+            timeline["reserve_model"].tolist(),
+            ["bonding_curve", "amm_virtual_tokens", "amm_virtual_quote"],
+        )
+        self.assertEqual(timeline["execution_supported"].tolist(), [1, 1, 1])
+
+    def test_pool_timeline_marks_unsupported_routing(self):
+        source = pd.DataFrame([
+            {
+                "mint": "MINT-UNSUP", "timestamp_ms": 0, "is_filled": 0,
+                "pool_id": "POOL-RAY", "pool_key": "POOL-RAY", "pool": "raydium-cpmm",
+                "quote_mint": builder.WSOL_MINT, "pool_changed": 0,
+            },
+            {
+                "mint": "MINT-UNSUP", "timestamp_ms": 60_000, "is_filled": 0,
+                "pool_id": "POOL-AMB", "pool_key": "POOL-AMB", "pool": "pump-amm",
+                "quote_mint": builder.WSOL_MINT, "pool_changed": 1,
+                "close_tokens_in_pool": 1_000.0, "close_quote_in_pool": 100.0,
+                "close_virtual_tokens_in_pool": 40.0, "close_virtual_quote_in_pool": 10.0,
+            },
+            {
+                "mint": "MINT-UNSUP", "timestamp_ms": 120_000, "is_filled": 0,
+                "pool_id": "POOL-USDC", "pool_key": "POOL-USDC", "pool": "pump-amm",
+                "quote_mint": "USDC", "pool_changed": 1,
+                "close_tokens_in_pool": 1_000.0, "close_quote_in_pool": 100.0,
+                "close_virtual_tokens_in_pool": 40.0,
+            },
+        ])
+        timeline = builder.build_pool_selection_timeline(source, 60_000)
+
+        self.assertEqual(
+            timeline["reserve_model"].tolist(),
+            ["", "ambiguous", "amm_virtual_tokens"],
+        )
+        self.assertEqual(timeline["execution_supported"].tolist(), [0, 0, 0])
+
+    def test_pool_timeline_missing_pool_id_is_structural(self):
+        source = pd.DataFrame([{
+            "mint": "MINT-NO-ID", "timestamp_ms": 0, "is_filled": 0,
+            "pool_id": "", "pool_key": "__missing_pool_id__:pump", "pool": "pump",
+            "quote_mint": builder.WSOL_MINT, "pool_changed": 0,
+        }])
+        timeline = builder.build_pool_selection_timeline(source, 60_000)
+        self.assertEqual(timeline.loc[0, "pool_selection_status"], "missing_pool_id")
+        audit = builder.validate_pool_selection_timeline(timeline, source, 60_000)
+        self.assertEqual(audit["missing_pool_id_rows"], 1)
+        self.assertFalse(audit["passed"])
+
+    def test_pool_timeline_validation_detects_included_filled_rows(self):
+        source = pd.DataFrame([
+            {
+                "mint": "MINT-FILL", "timestamp_ms": 0, "is_filled": 0,
+                "pool_id": "POOL-A", "pool_key": "POOL-A", "pool": "pump",
+                "quote_mint": builder.WSOL_MINT, "pool_changed": 0,
+            },
+            {
+                "mint": "MINT-FILL", "timestamp_ms": 60_000, "is_filled": 1,
+                "pool_id": "POOL-A", "pool_key": "POOL-A", "pool": "pump",
+                "quote_mint": builder.WSOL_MINT, "pool_changed": 0,
+            },
+        ])
+        timeline = builder.build_pool_selection_timeline(source, 60_000)
+        filled = timeline.iloc[[0]].copy()
+        filled["timestamp_ms"] = 60_000
+        filled["bar_start_timestamp_ms"] = 60_000
+        filled["bar_end_timestamp_ms"] = 120_000
+        filled["available_at_timestamp_ms"] = 120_000
+        tampered = pd.concat([timeline, filled], ignore_index=True)
+
+        audit = builder.validate_pool_selection_timeline(tampered, source, 60_000)
+        self.assertEqual(audit["filled_rows_included"], 1)
+        self.assertFalse(audit["passed"])
+
+    def test_pool_timeline_row_count_does_not_cancel_replaced_rows(self):
+        source = pd.DataFrame([
+            {
+                "mint": "MINT-KEYS", "timestamp_ms": 0, "is_filled": 0,
+                "pool_id": "POOL-A", "pool_key": "POOL-A", "pool": "pump",
+                "quote_mint": builder.WSOL_MINT, "pool_changed": 0,
+            },
+            {
+                "mint": "MINT-KEYS", "timestamp_ms": 60_000, "is_filled": 1,
+                "pool_id": "POOL-A", "pool_key": "POOL-A", "pool": "pump",
+                "quote_mint": builder.WSOL_MINT, "pool_changed": 0,
+            },
+        ])
+        timeline = builder.build_pool_selection_timeline(source, 60_000).copy()
+        # Replace the real key with the filled key: same row count, wrong rows.
+        timeline["timestamp_ms"] = 60_000
+        timeline["bar_start_timestamp_ms"] = 60_000
+        timeline["bar_end_timestamp_ms"] = 120_000
+        timeline["available_at_timestamp_ms"] = 120_000
+
+        audit = builder.validate_pool_selection_timeline(timeline, source, 60_000)
+        self.assertEqual(len(timeline), 1)
+        self.assertEqual(audit["row_count_mismatch"], 2)
+        self.assertFalse(audit["passed"])
+
+    def test_load_derives_pool_changed_when_source_column_is_missing(self):
+        rows = [
+            {"mint": "MINT-LOAD", "timestamp_ms": 0, "open": 1.0, "high": 1.0,
+             "low": 1.0, "close": 1.0, "trades": 1, "is_filled": 0, "pool_id": "POOL-A"},
+            {"mint": "MINT-LOAD", "timestamp_ms": 60_000, "open": 1.0, "high": 1.0,
+             "low": 1.0, "close": 1.0, "trades": 1, "is_filled": 0, "pool_id": "POOL-B"},
+            {"mint": "MINT-LOAD", "timestamp_ms": 120_000, "open": 1.0, "high": 1.0,
+             "low": 1.0, "close": 1.0, "trades": 1, "is_filled": 0, "pool_id": "POOL-B"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ohlcv_1m.csv"
+            pd.DataFrame(rows).to_csv(path, index=False)
+            loaded = builder.load(path)
+
+        self.assertEqual(
+            loaded.sort_values("timestamp_ms")["pool_changed"].astype(int).tolist(),
+            [0, 1, 0],
+        )
+
     def test_require_execution_ohlc_rejects_source_without_complete_execution_bars(self):
         rows = []
         for timestamp_ms, close in ((0, 0.001), (60_000, 0.0012), (120_000, 0.0014)):

@@ -50,6 +50,7 @@ def make_rows(rows):
                 "tokens_in_pool": row.get("tokens_in_pool", np.nan),
                 "quote_in_pool": row.get("quote_in_pool", np.nan),
                 "virtual_tokens_in_pool": row.get("virtual_tokens_in_pool", np.nan),
+                "virtual_quote_in_pool": row.get("virtual_quote_in_pool", np.nan),
                 "burned_liquidity": row.get("burned_liquidity", ""),
                 "pool_created_by": row.get("pool_created_by", ""),
                 "decimals": row.get("decimals", np.nan),
@@ -248,6 +249,23 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertIn("pool", filled.columns)
         self.assertIn("quote_mint", filled.columns)
+
+    def test_virtual_quote_reserve_is_preserved_for_reserve_model_detection(self):
+        rows = [
+            {
+                "timestamp_ms": 1_000, "pool_id": "POOL-A", "pool": "pump-amm",
+                "quote_mint": pipeline.WSOL, "price_sol": 1.0,
+                "token_amount": 100.0, "quote_amount": 100.0,
+                "tokens_in_pool": 1_000.0, "quote_in_pool": 90.0,
+                "virtual_quote_in_pool": 10.0,
+            },
+        ]
+        cleaned, _ = self.clean(rows)
+        bars = pipeline.build_bars(cleaned, 60_000, False)
+
+        self.assertIn("close_virtual_quote_in_pool", bars.columns)
+        self.assertAlmostEqual(bars.iloc[0]["close_virtual_quote_in_pool"], 10.0)
+        self.assertTrue(np.isnan(bars.iloc[0]["close_virtual_tokens_in_pool"]))
 
     def test_pool_prices_are_not_mixed_inside_a_candle(self):
         rows = [
