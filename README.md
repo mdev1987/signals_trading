@@ -1,4 +1,4 @@
-# Point-in-Time Universe Dataset Builder v7.2.0
+# Point-in-Time Universe Dataset Builder v7.2.1
 
 This package extends the v7.0 Point-in-Time VectorBT dataset with a separate, auditable Pool Selection Timeline. The raw JSONL-to-OHLCV pipeline remains numerically unchanged; it also passes the selected pool protocol (`pool`), quote mint (`quote_mint`), and virtual reserve components (`virtual_tokens_in_pool`, `virtual_quote_in_pool`) through each real candle for downstream routing. Pool metadata is mandatory for validation, and the timeline now records the reserve model and whether the execution simulator can route each row.
 
@@ -133,7 +133,7 @@ One row per mint and real candle. It preserves the selected-pool metadata from t
 - `quote_mint`: quote asset used by that selected pool.
 - `pool_changed`: whether the selected pool differs from the previous observed candle for the mint.
 - `reserve_model`: the reserve identity the execution simulator uses: `bonding_curve` for `pump`, `amm_virtual_quote` or `amm_virtual_tokens` for `pump-amm`, `ambiguous` when both virtual reserves are non-zero, `unknown` when neither is present, and empty for protocols the simulator does not model.
-- `execution_supported`: `1` only when the row is WSOL-quoted, has a pool id, and uses a reserve model the simulator implements (and, for PumpSwap, positive effective reserves). This is the flag to gate order creation; `pool_selection_status = ready` only means the metadata is internally consistent, not that the simulator can route it.
+- `execution_supported`: `1` only when `pool_selection_status == ready`, the row is WSOL-quoted, has a pool id, and uses a reserve model the simulator implements (plus positive effective reserves for PumpSwap). This is the flag to gate order creation; `pool_selection_status = ready` alone is not a routing guarantee, and the simulator remains the final authority for reserve and fee validation at order time.
 - `pool_selection_status`: `ready`, `missing_pool_id`, `missing_quote_mint`, `missing_pool_type`, or a metadata-conflict status.
 
 Selected-pool metadata is mandatory for execution routing: the simulator needs a pool identifier, a protocol (to dispatch `pump` vs `pump-amm` reserve models), and a quote mint. A missing `pool_id`, `quote_mint`, or pool type now causes Pool Timeline validation to fail; it can no longer silently pass as `ready`. If you are using a legacy OHLCV CSV without the selected `pool` field, regenerate the raw-to-OHLCV output with the `raw_to_clean_ohlcv.py` included in this package before running the builder.

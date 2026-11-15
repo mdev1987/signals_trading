@@ -324,6 +324,9 @@ class ExecutionSimulator:
 
         if shadow_token <= 0 or shadow_quote <= 0:
             self.stats["invalid_snapshots_seen"] += 1
+            # Keep a concrete reason on the latest metadata so a later order
+            # reports why the pool state is unusable instead of reason=None.
+            snapshot.unsupported_reason = "shadow_reserve_became_non_positive"
             self._states.pop(key, None)
             return
 
@@ -404,8 +407,11 @@ class ExecutionSimulator:
         if (
             metadata is not None
             and metadata.unsupported_reason is not None
-            and metadata.timestamp_ms > state.last_snapshot_ms
+            and metadata.timestamp_ms >= state.last_snapshot_ms
         ):
+            # A snapshot at the same millisecond was processed after the last
+            # valid state. It may be a later event for the same post-event slot,
+            # so refuse the order rather than trusting an older state.
             result.status = "unsupported_pool"
             result.reason = metadata.unsupported_reason
             return result

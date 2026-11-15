@@ -42,7 +42,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-DATASET_BUILDER_VERSION = "v7.2.0"
+DATASET_BUILDER_VERSION = "v7.2.1"
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 REQUIRED = ["mint", "timestamp_ms", "open", "high", "low", "close", "trades", "is_filled"]
 OPTIONAL_NUM = [
@@ -491,13 +491,19 @@ def build_pool_selection_timeline(source, bar_ms):
     quote_in_pool = _first_available_numeric(
         data, ("close_quote_in_pool", "open_quote_in_pool", "quote_in_pool")
     )
-    effective_quote = quote_in_pool.where(reserve_model.ne("amm_virtual_quote"), quote_in_pool + virtual_quote.fillna(0.0))
-    amm_reserves_ok = (
-        tokens_in_pool.gt(0)
-        & effective_quote.gt(0)
+    effective_tokens = tokens_in_pool.where(
+        reserve_model.ne("amm_virtual_tokens"),
+        tokens_in_pool + virtual_tokens.fillna(0.0),
     )
+    effective_quote = quote_in_pool.where(
+        reserve_model.ne("amm_virtual_quote"),
+        quote_in_pool + virtual_quote.fillna(0.0),
+    )
+    amm_reserves_ok = effective_tokens.gt(0) & effective_quote.gt(0)
+    ready = pd.Series(status == "ready", index=data.index)
     execution_supported = (
-        pool_id_valid.eq(1)
+        ready
+        & pool_id_valid.eq(1)
         & quote_mint.eq(WSOL_MINT)
         & unambiguous
         & (
@@ -979,7 +985,7 @@ def main():
                 {str(k): int(v) for k, v in pool_timeline.get("reserve_model", pd.Series(dtype=str)).fillna("").astype(str).value_counts().items()}
                 if len(pool_timeline) else {}
             ),
-            "execution_support_policy": "execution_supported means the selected pool uses a WSOL quote and a reserve model the execution simulator implements (pump bonding curve, or pump-amm with one unambiguous virtual reserve style)",
+            "execution_support_policy": "execution_supported means ready metadata, a WSOL quote, and a reserve model the execution simulator implements. Pump AMM rows also require positive effective token and quote reserves. Pump rows are checked only by pool type; bonding-curve reserves are not carried into OHLCV, so the simulator remains the final authority for reserve and fee validation at order time.",
             "availability_policy": "pool selection uses completed events within the candle bucket; available_at_timestamp_ms equals bar_start_timestamp_ms + bar_ms; never use this selection before available_at_timestamp_ms",
             "filled_rows_policy": "filled bars are excluded; carried pool identifiers are not treated as fresh pool selections",
             "validation": pool_timeline_validation,

@@ -191,6 +191,54 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result.status, "unsupported_pool")
         self.assertEqual(result.reason, "missing_or_invalid_pool_fee_rate")
 
+    def test_invalid_snapshot_after_valid_at_same_timestamp_blocks_order(self) -> None:
+        invalid = event(100)
+        invalid["action"] = "add"
+        invalid.pop("vQuoteInBondingCurve")
+        simulator, temp = self.make_simulator([event(100), invalid])
+        self.addCleanup(temp.cleanup)
+        result = simulator.execute(
+            order_id="same-ts-valid-then-invalid", timestamp_ms=101,
+            mint="mint-1", pool_id="pool-1", side="buy", amount=0.001,
+        )
+        self.assertEqual(result.status, "unsupported_pool")
+        self.assertEqual(result.reason, "missing_bonding_curve_reserves")
+
+    def test_valid_snapshot_after_invalid_at_same_timestamp_allows_order(self) -> None:
+        invalid = event(100)
+        invalid["action"] = "add"
+        invalid.pop("vQuoteInBondingCurve")
+        valid = event(100)
+        valid["signature"] = "sig-valid-later"
+        simulator, temp = self.make_simulator([invalid, valid])
+        self.addCleanup(temp.cleanup)
+        result = simulator.execute(
+            order_id="same-ts-invalid-then-valid", timestamp_ms=101,
+            mint="mint-1", pool_id="pool-1", side="buy", amount=0.001,
+        )
+        self.assertEqual(result.status, "filled")
+        self.assertEqual(result.signature, "sig-valid-later")
+
+    def test_shadow_reserve_becoming_non_positive_reports_reason(self) -> None:
+        simulator, temp = self.make_simulator([
+            event(100),
+            event(200, token_reserve=500.0, quote_reserve=100.0),
+        ])
+        self.addCleanup(temp.cleanup)
+        # Drain almost all shadow tokens, then apply an observed reserve drop
+        # that would push the shadow token reserve below zero.
+        filled = simulator.execute(
+            order_id="drain", timestamp_ms=101, mint="mint-1", pool_id="pool-1",
+            side="buy", amount=1_000_000.0,
+        )
+        self.assertEqual(filled.status, "filled")
+        result = simulator.execute(
+            order_id="after-shadow-break", timestamp_ms=201, mint="mint-1",
+            pool_id="pool-1", side="buy", amount=0.001,
+        )
+        self.assertEqual(result.status, "unsupported_pool")
+        self.assertEqual(result.reason, "shadow_reserve_became_non_positive")
+
     def test_stale_pool_state_is_rejected(self) -> None:
         simulator, temp = self.make_simulator([event(100)], max_state_age_ms=10)
         self.addCleanup(temp.cleanup)

@@ -1,3 +1,3 @@
-VectorBT dataset builder: v7.2.0 (Point-in-Time Universe + Pool Selection Timeline + reserve-model / execution-support validation)
+VectorBT dataset builder: v7.2.1 (Point-in-Time Universe + Pool Selection Timeline + reserve-model / execution-support validation)
 Raw JSONL-to-OHLCV pipeline: v6.2.2 (selected pool protocol, quote mint, and virtual reserve metadata passthrough; numeric calculations unchanged)
-Execution Simulator: v1.1 (PumpSwap virtual-token reserves, symmetric quote-fee convention, reserve-model reporting, out-of-order order guard)
+Execution Simulator: v1.1.1 (PumpSwap virtual-token reserves, symmetric quote-fee convention, reserve-model reporting, out-of-order order guard, same-millisecond invalid-snapshot guard)

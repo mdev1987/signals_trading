@@ -289,6 +289,32 @@ class BuildVbtDatasetTests(unittest.TestCase):
         )
         self.assertEqual(timeline["execution_supported"].tolist(), [0, 0, 0])
 
+    def test_pool_timeline_rejects_non_positive_virtual_token_reserve(self):
+        source = pd.DataFrame([{
+            "mint": "MINT-VT-NEG", "timestamp_ms": 0, "is_filled": 0,
+            "pool_id": "POOL-VT-NEG", "pool_key": "POOL-VT-NEG", "pool": "pump-amm",
+            "quote_mint": builder.WSOL_MINT, "pool_changed": 0,
+            "close_tokens_in_pool": 1_000.0, "close_quote_in_pool": 100.0,
+            "close_virtual_tokens_in_pool": -1_200.0,
+        }])
+        timeline = builder.build_pool_selection_timeline(source, 60_000)
+
+        self.assertEqual(timeline.loc[0, "reserve_model"], "amm_virtual_tokens")
+        self.assertEqual(int(timeline.loc[0, "execution_supported"]), 0)
+
+    def test_pool_timeline_requires_ready_metadata_for_execution_support(self):
+        source = pd.DataFrame([{
+            "mint": "MINT-QUOTE-CONFLICT", "timestamp_ms": 0, "is_filled": 0,
+            "pool_id": "POOL-CONFLICT", "pool_key": "POOL-CONFLICT", "pool": "pump",
+            "open_quote_mint": "OTHER", "close_quote_mint": builder.WSOL_MINT,
+            "pool_changed": 0,
+        }])
+        timeline = builder.build_pool_selection_timeline(source, 60_000)
+
+        self.assertEqual(timeline.loc[0, "pool_selection_status"], "quote_mint_conflict")
+        self.assertEqual(timeline.loc[0, "quote_mint"], builder.WSOL_MINT)
+        self.assertEqual(int(timeline.loc[0, "execution_supported"]), 0)
+
     def test_pool_timeline_missing_pool_id_is_structural(self):
         source = pd.DataFrame([{
             "mint": "MINT-NO-ID", "timestamp_ms": 0, "is_filled": 0,

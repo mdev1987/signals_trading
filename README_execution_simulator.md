@@ -39,7 +39,7 @@ timestamp_ms,mint,pool_id,side,amount
 - `side=sell`: `amount` is the number of tokens offered for sale.
 - `pool_id` must be selected using information available at the decision time. Do not select a pool using a future candle.
 - When using `pool_selection_timeline.csv`, join by mint and choose the latest row with `available_at_timestamp_ms <= timestamp_ms` (the order execution time). The timeline selection for a candle is only known at that candle's close, not at its start.
-- Prefer rows where `execution_supported == 1`. That flag means the pool is WSOL-quoted and uses a reserve model this simulator implements. Rows with `pool_selection_status != ready`, a non-WSOL `quote_mint`, or `execution_supported == 0` will be rejected or misrouted; the simulator does not convert non-WSOL quote reserves into SOL.
+- Prefer rows where `execution_supported == 1`. That flag means the row has ready pool metadata, is WSOL-quoted, and uses a reserve model this simulator implements. Rows with `pool_selection_status != ready`, a non-WSOL `quote_mint`, or `execution_supported == 0` will be rejected or misrouted; the simulator does not convert non-WSOL quote reserves into SOL.
 - Amounts use the human-readable units used by PumpAPI events: SOL for WSOL quote amounts and token units for token amounts.
 
 ## Run

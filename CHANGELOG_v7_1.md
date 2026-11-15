@@ -1,3 +1,22 @@
+# v7.2.1 — Same-Millisecond and Routing Guard Fixes
+
+## Fixed
+
+- Execution Simulator rejects an order when the latest processed snapshot at the same millisecond is invalid. The previous `>` comparison treated a valid state and a later invalid event in the same millisecond as interchangeable.
+- `execution_supported` now checks the Effective Token Reserve for `amm_virtual_tokens` pools (`tokens_in_pool + virtual_tokens_in_pool`). A negative virtual-token value could previously mark an unroutable pool as supported.
+- `execution_supported` now also requires `pool_selection_status == ready`. A pool with conflicting quote-mint metadata could previously be marked supported when the resolved quote mint was WSOL.
+- A Shadow Reserve that becomes non-positive now records `shadow_reserve_became_non_positive` instead of leaving `reason` empty.
+- Regression tests cover both same-millisecond event orders, negative virtual-token reserves, conflicting metadata, and the Shadow Reserve reason.
+
+## Clarification
+
+- For `pump` rows, `execution_supported` means "this pool type is modeled", not "reserves were validated". Bonding-curve reserves are not carried into OHLCV, so the simulator remains the final authority for reserve and fee validation at order time.
+
+## Validation
+
+- Full unit test suite: 82/82 passed.
+- Real full-hour rebuild and candidate integration re-run: routing invariant holds (no unsupported row fills; no supported row fails with a reserve-model error). The 34 order-time `unsupported_pool` rejects on supported rows now report `shadow_reserve_became_non_positive` instead of an empty reason.
+
 # v7.2.0 — Executable Pool Routing
 
 ## Added
@@ -25,7 +44,7 @@
 
 ## Validation
 
-- Full unit test suite: 76/76 passed.
+- Full unit test suite: 77/77 passed.
 - Real full-hour rebuild: `05.jsonl.zst` (1,907,859 events) regenerated to 112,388 one-minute rows, 44,837 real bars, and a 44,837-row pool timeline with every validation check at zero.
 - Real candidate integration: 8,525 candidate rows. Of these, 1,183 bars are `amm_virtual_tokens` and now fill in the simulator; 1,223 buy and 886 sell orders still reject with `missing_amm_reserves`, and every one of them is `execution_supported == 0`.
 - Routing invariant verified on real orders: no `execution_supported == 0` row fills, and no `execution_supported == 1` row fails with a reserve-model error.
