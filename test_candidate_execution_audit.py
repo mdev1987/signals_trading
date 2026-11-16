@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import pandas as pd
 
-from candidate_execution_audit import AUDIT_COLUMNS, build_audit
+from candidate_execution_audit import AUDIT_COLUMNS, build_audit, main
 from execution_simulator import WSOL_MINT
 
 
@@ -172,6 +174,60 @@ class CandidateExecutionAuditTests(unittest.TestCase):
             short = pd.read_csv(summary["sell_insufficient_liquidity_csv"])
             self.assertEqual(len(short), 1)
             self.assertEqual(short.iloc[0]["mint"], "mint-c")
+
+    def test_main_returns_zero_when_checks_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events_path, candidates_path, timeline_path = self.make_fixture(root)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "--candidates",
+                        str(candidates_path),
+                        "--timeline",
+                        str(timeline_path),
+                        "--events",
+                        str(events_path),
+                        "--output-dir",
+                        str(root / "audit"),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertTrue(summary["checks_passed"])
+
+    def test_main_returns_nonzero_when_routing_invariant_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events_path, candidates_path, timeline_path = self.make_fixture(root)
+            timeline = pd.read_csv(timeline_path)
+            timeline.loc[
+                timeline["mint"] == "mint-b", "execution_supported"
+            ] = 1
+            timeline.to_csv(timeline_path, index=False)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "--candidates",
+                        str(candidates_path),
+                        "--timeline",
+                        str(timeline_path),
+                        "--events",
+                        str(events_path),
+                        "--output-dir",
+                        str(root / "audit"),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            summary = json.loads(stdout.getvalue())
+            self.assertTrue(summary["buy"]["reconciliation"]["reconciled"])
+            self.assertFalse(summary["buy"]["routing_invariant"])
+            self.assertFalse(summary["checks_passed"])
 
     def test_candidate_timeline_metadata_mismatch_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

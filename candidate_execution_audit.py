@@ -361,6 +361,11 @@ def build_audit(
 
     buy_summary = summarize_side(audit, "buy")
     sell_summary = summarize_side(audit, "sell")
+    checks_passed = all(
+        side_summary["reconciliation"]["reconciled"]
+        and side_summary["routing_invariant"]
+        for side_summary in (buy_summary, sell_summary)
+    )
     summary = {
         "candidates_csv": str(candidates_path),
         "pool_timeline_csv": str(timeline_path),
@@ -376,6 +381,7 @@ def build_audit(
             "runs, matching the original candidate integration. A production "
             "backtest should replay both sides together in order-time order."
         ),
+        "checks_passed": checks_passed,
         "buy": buy_summary,
         "sell": sell_summary,
         "audit_csv": str(audit_path),
@@ -469,11 +475,7 @@ def main(argv: list[str] | None = None) -> int:
         max_price_impact_bps=args.max_price_impact_bps,
     )
     print(json.dumps(summary, indent=2))
-    reconciled = (
-        summary["buy"]["reconciliation"]["reconciled"]
-        and summary["sell"]["reconciliation"]["reconciled"]
-    )
-    return 0 if reconciled else 1
+    return 0 if summary["checks_passed"] else 1
 
 
 if __name__ == "__main__":

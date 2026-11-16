@@ -24,6 +24,7 @@
 - SELL accounting: 6,197 filled + 886 `execution_supported == 0` + 34 supported-and-rejected (15 `shadow_reserve_became_non_positive` + 19 `insufficient_liquidity`) = 7,117 candidates.
 - The 19 previously unexplained SELL orders are explicit `insufficient_liquidity` / `sell_size_is_not_smaller_than_token_reserve` rejects on `amm_virtual_tokens` pools whose effective token reserve at order time was below the fixed 100-token test sell size. They were executed and rejected by the simulator; they were not skipped or lost.
 - Reconcile candidates with all non-fill statuses. Counting only `unsupported_pool` as an order-time reject understates the SELL non-fill total by the 19 `insufficient_liquidity` rows.
+- The CLI now exits non-zero unless both sides reconcile and both routing invariants pass. The combined result is recorded as `checks_passed` in the summary JSON. Regression tests cover both the passing path and a supported-row `missing_amm_reserves` failure.
 
 # v7.2.0 — Executable Pool Routing
 

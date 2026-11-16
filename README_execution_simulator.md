@@ -86,6 +86,8 @@ filled + execution_unsupported + supported_not_filled = total candidates
 
 `execution_unsupported` is the count with `execution_supported == 0`. `supported_not_filled` is every non-`filled` status among `execution_supported == 1`, including `insufficient_liquidity`, `stale_pool_state`, and `unsupported_pool` with `shadow_reserve_became_non_positive`. Counting only `unsupported_pool` as an order-time reject understates the non-fill total.
 
+The command exits `0` only when both sides reconcile and both routing invariants pass. The summary JSON records the combined result as `checks_passed`. A supported row rejected for a reserve-model reason, or an unsupported row that fills, produces a non-zero exit code even if the row-count reconciliation itself is balanced.
+
 Real-data audit result with the smoke-test order sizes above:
 
 | Side | Filled | Execution unsupported | Supported but not filled | Total |
