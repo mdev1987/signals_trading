@@ -17,6 +17,14 @@
 - Full unit test suite: 82/82 passed.
 - Real full-hour rebuild and candidate integration re-run: routing invariant holds (no unsupported row fills; no supported row fails with a reserve-model error). The 34 order-time `unsupported_pool` rejects on supported rows now report `shadow_reserve_became_non_positive` instead of an empty reason.
 
+## Real-Data Candidate Audit Reconciliation
+
+- Added `candidate_execution_audit.py` and `test_candidate_execution_audit.py`. The tool writes a per-order CSV with `order_id`, `side`, `execution_supported`, `status`, `reason`, routing metadata, and order timestamps, plus a summary JSON.
+- BUY accounting: 5,860 filled + 1,223 `execution_supported == 0` + 19 supported-and-rejected (`shadow_reserve_became_non_positive`) = 7,102 candidates.
+- SELL accounting: 6,197 filled + 886 `execution_supported == 0` + 34 supported-and-rejected (15 `shadow_reserve_became_non_positive` + 19 `insufficient_liquidity`) = 7,117 candidates.
+- The 19 previously unexplained SELL orders are explicit `insufficient_liquidity` / `sell_size_is_not_smaller_than_token_reserve` rejects on `amm_virtual_tokens` pools whose effective token reserve at order time was below the fixed 100-token test sell size. They were executed and rejected by the simulator; they were not skipped or lost.
+- Reconcile candidates with all non-fill statuses. Counting only `unsupported_pool` as an order-time reject understates the SELL non-fill total by the 19 `insufficient_liquidity` rows.
+
 # v7.2.0 — Executable Pool Routing
 
 ## Added

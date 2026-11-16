@@ -162,7 +162,7 @@ The raw pipeline is based on v6.2; the only raw-stage changes in this package ar
 ## Run tests
 
 ```bash
-uv run python -m unittest -v test_raw_to_clean_ohlcv.py test_build_vbt_dataset.py test_execution_simulator.py
+uv run python -m unittest -v test_raw_to_clean_ohlcv.py test_build_vbt_dataset.py test_execution_simulator.py test_candidate_execution_audit.py
 ```
 
 ## Build the point-in-time VectorBT dataset
@@ -171,7 +171,7 @@ Regenerate the one-minute OHLCV input with the packaged raw script (it adds the 
 
 ```bash
 uv run python raw_to_clean_ohlcv.py 05.jsonl.zst \
-    -o output/ohlcv_clean_v7_2_0 \
+    -o output/ohlcv_clean_v7_2 \
     -t 5s,15s,1m \
     --fill
 ```
@@ -179,8 +179,8 @@ uv run python raw_to_clean_ohlcv.py 05.jsonl.zst \
 Then build the dataset:
 
 ```bash
-uv run python build_vbt_dataset.py output/ohlcv_clean_v7_2_0/ohlcv_1m.csv \
-    -o output/vbt_dataset_pit_v7_2_0m \
+uv run python build_vbt_dataset.py output/ohlcv_clean_v7_2/ohlcv_1m.csv \
+    -o output/vbt_dataset_pit_v7_2_1m \
     --max-stale-bars 0 \
     --candle-range-ratio 10.0 \
     --universe-delay-bars 1 \

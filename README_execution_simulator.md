@@ -55,6 +55,46 @@ For an uncompressed `.jsonl` file, `zstandard` is not required. `orjson` is opti
 
 Set `--max-state-age-ms 0` to disable snapshot-age rejection. An optional `--max-price-impact-bps` guard rejects orders whose estimated curve impact exceeds the configured cap.
 
+## Candidate integration audit
+
+`candidate_execution_audit.py` joins the candidate CSV to the Pool Selection Timeline, creates one BUY and/or SELL order per flagged candidate, runs the simulator, and writes an order-level audit:
+
+```bash
+uv run python candidate_execution_audit.py \
+    --candidates pool_compatibility_candidates_v7_1_1.csv \
+    --timeline output/vbt_dataset_pit_v7_2_1m/pool_selection_timeline.csv \
+    --events 05.jsonl.zst \
+    --output-dir output/execution_audit \
+    --buy-amount-sol 0.0001 \
+    --sell-amount-tokens 100
+```
+
+The outputs are:
+
+- `candidate_execution_audit.csv`: one row per candidate order.
+- `candidate_execution_audit_summary.json`: per-side status accounting and reconciliation.
+- `sell_insufficient_liquidity.csv`: the SELL orders rejected for order-size liquidity.
+- `candidate_orders_{buy,sell}.csv` and `candidate_fills_{buy,sell}.csv`: the exact simulator inputs and outputs.
+
+The audit CSV contains `order_id`, `side`, `timestamp_ms`, `mint`, `pool_id`, `pool`, `quote_mint`, `reserve_model`, `execution_supported`, `pool_selection_status`, `amount`, `status`, `reason`, and the bar-start/bar-end/availability timestamps.
+
+Reconcile every candidate with all non-fill statuses:
+
+```text
+filled + execution_unsupported + supported_not_filled = total candidates
+```
+
+`execution_unsupported` is the count with `execution_supported == 0`. `supported_not_filled` is every non-`filled` status among `execution_supported == 1`, including `insufficient_liquidity`, `stale_pool_state`, and `unsupported_pool` with `shadow_reserve_became_non_positive`. Counting only `unsupported_pool` as an order-time reject understates the non-fill total.
+
+Real-data audit result with the smoke-test order sizes above:
+
+| Side | Filled | Execution unsupported | Supported but not filled | Total |
+|---|---:|---:|---:|---:|
+| BUY | 5,860 | 1,223 | 19 `shadow_reserve_became_non_positive` | 7,102 |
+| SELL | 6,197 | 886 | 15 `shadow_reserve_became_non_positive` + 19 `insufficient_liquidity` | 7,117 |
+
+The 19 SELL orders previously missing from the reject total are explicit `insufficient_liquidity` / `sell_size_is_not_smaller_than_token_reserve` rejects on `amm_virtual_tokens` pools whose effective token reserve at order time was below the fixed 100-token test size. They were executed and rejected by the simulator; they were not skipped or lost. The fixed order sizes are audit inputs, not strategy sizing. A production strategy must size sells against available liquidity or treat this status as an explicit no-fill.
+
 ## Execution rules
 
 1. The simulator streams source events in timestamp order.
@@ -82,7 +122,7 @@ Set `--max-state-age-ms 0` to disable snapshot-age rejection. An optional `--max
 ## Tests
 
 ```bash
-uv run python -m unittest -v test_execution_simulator.py
+uv run python -m unittest -v test_execution_simulator.py test_candidate_execution_audit.py
 ```
 
-The tests cover reserve-field selection for both PumpSwap virtual-reserve styles, ambiguous virtual reserves, unsupported markets, fee calculations, buy/sell calculations, strict timestamp cutoff, shadow reserve deltas, stale snapshots, price-impact rejection, liquidity limits, out-of-order source events, and out-of-order order rejection.
+The tests cover reserve-field selection for both PumpSwap virtual-reserve styles, ambiguous virtual reserves, unsupported markets, fee calculations, buy/sell calculations, strict timestamp cutoff, shadow reserve deltas, stale snapshots, price-impact rejection, liquidity limits, out-of-order source events, out-of-order order rejection, and candidate/timeline audit reconciliation.
