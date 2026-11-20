@@ -180,8 +180,11 @@ def verify_dataset(
     timeframe_ms: int,
     reference_path: Path | None = None,
     reference_window: tuple[pd.Timestamp, pd.Timestamp] | None = None,
+    exclude_mints: set[str] | None = None,
 ) -> dict:
-    targets = set(signals["mint"].astype(str))
+    all_targets = set(signals["mint"].astype(str))
+    excluded = set(exclude_mints or ())
+    targets = all_targets - excluded
     mints = set(ohlcv["mint"].astype(str))
 
     duplicate_keys = int(ohlcv.duplicated(["mint", "timestamp_ms"]).sum())
@@ -196,6 +199,8 @@ def verify_dataset(
 
     coverage = []
     for row in signals.itertuples(index=False):
+        if row.mint in excluded:
+            continue
         signal_time = pd.Timestamp(row.signal_timestamp_utc)
         mint_bars = ohlcv.loc[ohlcv["mint"] == row.mint]
         after = mint_bars.loc[
@@ -217,8 +222,9 @@ def verify_dataset(
         "rows": int(len(ohlcv)),
         "mints": int(ohlcv["mint"].nunique()),
         "signaled_mints": len(targets),
+        "excluded_mints": sorted(excluded & all_targets),
         "missing_signaled_mints": sorted(targets - mints),
-        "untracked_mints": sorted(mints - targets),
+        "untracked_mints": sorted(mints - all_targets),
         "duplicate_mint_timestamp_keys": duplicate_keys,
         "misaligned_timestamps": unaligned,
         "invalid_price_rows": negative_or_zero,
@@ -236,7 +242,7 @@ def verify_dataset(
             "min": int(coverage_frame["bars_after_signal"].min()),
             "median": float(coverage_frame["bars_after_signal"].median()),
             "max": int(coverage_frame["bars_after_signal"].max()),
-        },
+        } if len(coverage_frame) else {"min": 0, "median": 0.0, "max": 0},
         "signals_with_less_than_30m": int(
             (coverage_frame["bars_after_signal"] < 30).sum()
         ),
@@ -289,6 +295,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="UTC window as 2026-11-08T05:00/2026-11-08T06:00.",
     )
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--exclude-mints-file",
+        type=Path,
+        default=None,
+        help=(
+            "Newline-separated mints whose signals cannot be served by this "
+            "dataset (for example, no WSOL-quoted events). They are reported "
+            "but not required to have bars."
+        ),
+    )
     return parser
 
 
@@ -316,6 +332,15 @@ def main(argv: list[str] | None = None) -> int:
         timeframe_ms,
         reference_path=args.reference,
         reference_window=reference_window,
+        exclude_mints=(
+            {
+                line.strip()
+                for line in args.exclude_mints_file.read_text().splitlines()
+                if line.strip()
+            }
+            if args.exclude_mints_file is not None
+            else None
+        ),
     )
 
     if args.output is not None:

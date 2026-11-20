@@ -14,6 +14,37 @@ from typing import Any, Iterator
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 RELEVANT_ACTIONS = {"buy", "sell", "create", "createPool", "migrate", "add", "remove"}
 
+# Pool models the simulator can price. Each entry names the reserve identity that
+# the feed's own ``priceSol`` field agrees with on the replay corpus:
+#
+# * bonding curve   - ``vTokensInBondingCurve`` / ``vQuoteInBondingCurve``
+#                     (pump and raydium-launchpad; price == vQuote / vTokens)
+# * pump-amm        - ``tokensInPool`` plus a non-zero virtual reserve on one
+#                     side only (price == (quoteInPool + virtualQuoteInPool) /
+#                     tokensInPool or quoteInPool / (tokensInPool + virtualTokensInPool))
+# * vault AMM       - ``tokensInPool`` / ``quoteInPool`` (raydium-cpmm and
+#                     meteora-damm-v2; price == quoteInPool / tokensInPool)
+# * launchpad curve - meteora-launchpad: price is linear in the quote raised,
+#                     not ``quoteInPool / tokensInPool``, so the fill is priced
+#                     against the reported price and a locally estimated slope.
+#
+# Concentrated-liquidity venues (CLMM, DLMM, Whirlpool) report a vault balance
+# that is unrelated to the tradable depth inside the active tick range, so they
+# stay explicitly unsupported instead of being silently approximated.
+BONDING_CURVE_POOLS = frozenset({"pump", "raydium-launchpad"})
+VAULT_CP_POOLS = frozenset({"raydium-cpmm", "meteora-damm-v2"})
+LAUNCHPAD_CURVE_POOLS = frozenset({"meteora-launchpad"})
+CONCENTRATED_LIQUIDITY_POOLS = frozenset(
+    {"raydium-clmm", "meteora-dlmm", "orca-whirlpool"}
+)
+PUMP_AMM_POOL = "pump-amm"
+
+# A pool that has been drained or closed reports dust reserves (the corpus has
+# ``remove`` events leaving ``quoteInPool = tokensInPool = 1e-9``). Such a state
+# has a "price" of 1.0 SOL/token and would otherwise poison marks and fills.
+MIN_QUOTE_RESERVE_SOL = 1e-4
+MIN_TOKEN_RESERVE = 1e-3
+
 
 def _to_float(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
@@ -85,6 +116,19 @@ class PoolSnapshot:
     action: str
     reserve_model: str | None = None
     unsupported_reason: str | None = None
+    # SOL per one unit of the pool's quote asset. 1.0 for WSOL-quoted pools;
+    # for other quotes this is the feed's ``quotePriceSol`` oracle value.
+    quote_price_sol: float | None = None
+    # Pool fee in quote-asset units. ``fee_rate`` above is the all-in SOL fee
+    # (the feed's ``solRouteFeeRate``), which composes the pool fee with the
+    # SOL route fee for non-WSOL quotes.
+    pool_fee_rate: float | None = None
+    # SOL per token at the reported post-event state; required for the
+    # launchpad price-curve model.
+    price_sol: float | None = None
+    # d(price_sol)/d(quote_in_pool) in 1/token, estimated from consecutive
+    # observations for launchpad curve pools.
+    curve_slope: float | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -110,45 +154,81 @@ def snapshot_from_event(event: dict[str, Any]) -> PoolSnapshot | None:
     token_reserve: float | None = None
     quote_reserve: float | None = None
     reserve_model: str | None = None
-    fee_rate = _to_float(event.get("poolFeeRate"))
+    route_fee_rate = _to_float(event.get("solRouteFeeRate"))
+    pool_fee_rate = _to_float(event.get("poolFeeRate"))
+    if route_fee_rate is None:
+        # Pre-2026-11 archives only carry poolFeeRate. For WSOL-quoted pools the
+        # two agree, so the fallback is exact there and never applied elsewhere.
+        route_fee_rate = pool_fee_rate
+    price_sol = _to_float(event.get("priceSol"))
+    quote_price_sol = (
+        1.0
+        if quote_mint == WSOL_MINT
+        else _to_float(event.get("quotePriceSol"))
+    )
     reason: str | None = None
 
-    if quote_mint != WSOL_MINT:
-        reason = "non_wsol_quote"
-    elif pool == "pump":
-        token_reserve = _to_float(event.get("vTokensInBondingCurve"))
-        quote_reserve = _to_float(event.get("vQuoteInBondingCurve"))
-        reserve_model = "bonding_curve"
-        if token_reserve is None or quote_reserve is None:
-            reason = "missing_bonding_curve_reserves"
-    elif pool == "pump-amm":
-        tokens_in_pool = _to_float(event.get("tokensInPool"))
-        quote_in_pool = _to_float(event.get("quoteInPool"))
-        virtual_tokens = _to_float(event.get("virtualTokensInPool"))
-        virtual_quote = _to_float(event.get("virtualQuoteInPool"))
-        virtual_tokens_active = virtual_tokens is not None and virtual_tokens != 0.0
-        virtual_quote_active = virtual_quote is not None and virtual_quote != 0.0
+    if quote_mint != WSOL_MINT and (
+        quote_price_sol is None or quote_price_sol <= 0.0
+    ):
+        reason = "missing_quote_price"
 
-        if tokens_in_pool is None or quote_in_pool is None:
-            reason = "missing_amm_reserves"
-        elif virtual_tokens_active and virtual_quote_active:
-            # The feed uses exactly one virtual reserve style per pool. Seeing both
-            # non-zero makes the price identity ambiguous, so refuse to guess.
-            reason = "ambiguous_virtual_reserves"
-        elif virtual_tokens_active:
-            # Price identity: quoteInPool / (tokensInPool + virtualTokensInPool)
-            token_reserve = tokens_in_pool + virtual_tokens
-            quote_reserve = quote_in_pool
-            reserve_model = "amm_virtual_tokens"
-        elif virtual_quote is not None:
-            # Price identity: (quoteInPool + virtualQuoteInPool) / tokensInPool
-            token_reserve = tokens_in_pool
-            quote_reserve = quote_in_pool + virtual_quote
-            reserve_model = "amm_virtual_quote"
+    if reason is None:
+        if pool in BONDING_CURVE_POOLS:
+            token_reserve = _to_float(event.get("vTokensInBondingCurve"))
+            quote_reserve = _to_float(event.get("vQuoteInBondingCurve"))
+            reserve_model = "bonding_curve"
+            if token_reserve is None or quote_reserve is None:
+                reason = "missing_bonding_curve_reserves"
+        elif pool == PUMP_AMM_POOL:
+            tokens_in_pool = _to_float(event.get("tokensInPool"))
+            quote_in_pool = _to_float(event.get("quoteInPool"))
+            virtual_tokens = _to_float(event.get("virtualTokensInPool"))
+            virtual_quote = _to_float(event.get("virtualQuoteInPool"))
+            virtual_tokens_active = (
+                virtual_tokens is not None and virtual_tokens != 0.0
+            )
+            virtual_quote_active = (
+                virtual_quote is not None and virtual_quote != 0.0
+            )
+
+            if tokens_in_pool is None or quote_in_pool is None:
+                reason = "missing_amm_reserves"
+            elif virtual_tokens_active and virtual_quote_active:
+                # The feed uses exactly one virtual reserve style per pool.
+                # Seeing both non-zero makes the price identity ambiguous, so
+                # refuse to guess.
+                reason = "ambiguous_virtual_reserves"
+            elif virtual_tokens_active:
+                # Price identity: quoteInPool / (tokensInPool + virtualTokensInPool)
+                token_reserve = tokens_in_pool + virtual_tokens
+                quote_reserve = quote_in_pool
+                reserve_model = "amm_virtual_tokens"
+            elif virtual_quote is not None:
+                # Price identity: (quoteInPool + virtualQuoteInPool) / tokensInPool
+                token_reserve = tokens_in_pool
+                quote_reserve = quote_in_pool + virtual_quote
+                reserve_model = "amm_virtual_quote"
+            else:
+                reason = "missing_amm_reserves"
+        elif pool in VAULT_CP_POOLS:
+            token_reserve = _to_float(event.get("tokensInPool"))
+            quote_reserve = _to_float(event.get("quoteInPool"))
+            reserve_model = "amm_vault"
+            if token_reserve is None or quote_reserve is None:
+                reason = "missing_amm_reserves"
+        elif pool in LAUNCHPAD_CURVE_POOLS:
+            token_reserve = _to_float(event.get("tokensInPool"))
+            quote_reserve = _to_float(event.get("quoteInPool"))
+            reserve_model = "launchpad_linear_curve"
+            if token_reserve is None or quote_reserve is None:
+                reason = "missing_amm_reserves"
+            elif price_sol is None or price_sol <= 0.0:
+                reason = "missing_price_sol"
+        elif pool in CONCENTRATED_LIQUIDITY_POOLS:
+            reason = "unsupported_concentrated_liquidity"
         else:
-            reason = "missing_amm_reserves"
-    else:
-        reason = "unsupported_pool_model"
+            reason = "unsupported_pool_model"
 
     if reason is None and (
         token_reserve is None
@@ -158,7 +238,20 @@ def snapshot_from_event(event: dict[str, Any]) -> PoolSnapshot | None:
     ):
         reason = "non_positive_reserves"
 
-    if reason is None and (fee_rate is None or not 0.0 <= fee_rate < 1.0):
+    if reason is None and (
+        token_reserve < MIN_TOKEN_RESERVE
+        or quote_reserve * (quote_price_sol or 1.0) < MIN_QUOTE_RESERVE_SOL
+    ):
+        reason = "pool_reserves_below_floor"
+
+    if reason is None and (
+        route_fee_rate is None or not 0.0 <= route_fee_rate < 1.0
+    ):
+        reason = "missing_or_invalid_pool_fee_rate"
+
+    if reason is None and (
+        pool_fee_rate is None or not 0.0 <= pool_fee_rate < 1.0
+    ):
         reason = "missing_or_invalid_pool_fee_rate"
 
     return PoolSnapshot(
@@ -169,11 +262,14 @@ def snapshot_from_event(event: dict[str, Any]) -> PoolSnapshot | None:
         quote_mint=quote_mint,
         token_reserve=token_reserve,
         quote_reserve=quote_reserve,
-        fee_rate=fee_rate,
+        fee_rate=route_fee_rate,
         signature=str(event.get("signature") or "") or None,
         action=action,
         reserve_model=reserve_model,
         unsupported_reason=reason,
+        quote_price_sol=quote_price_sol,
+        pool_fee_rate=pool_fee_rate,
+        price_sol=price_sol,
     )
 
 
@@ -191,10 +287,25 @@ class PoolState:
     last_snapshot_ms: int
     last_signature: str | None
     reserve_model: str | None = None
+    quote_price_sol: float = 1.0
+    pool_fee_rate: float = 0.0
+    raw_price_sol: float | None = None
+    shadow_price_sol: float | None = None
+    curve_slope: float | None = None
 
     @property
     def spot_price(self) -> float:
+        """Spot price in quote-asset units per token."""
         return self.shadow_quote_reserve / self.shadow_token_reserve
+
+    @property
+    def spot_price_sol(self) -> float | None:
+        """Spot price in SOL per token, or None when it cannot be derived."""
+        if self.reserve_model == "launchpad_linear_curve":
+            return self.shadow_price_sol
+        if self.shadow_token_reserve <= 0:
+            return None
+        return self.spot_price * self.quote_price_sol
 
 
 @dataclass(slots=True)
@@ -224,14 +335,24 @@ class FillResult:
     reserve_quote_after: float | None = None
     signature: str | None = None
     reason: str | None = None
+    quote_price_sol: float | None = None
+    pool_fee_rate: float | None = None
 
 
 class ExecutionSimulator:
-    """Replay pool reserve snapshots and simulate SOL-quoted Pump executions.
+    """Replay pool reserve snapshots and simulate SOL-quoted executions.
 
     Pool reserves are advanced by applying observed historical reserve deltas to a
     shadow state. Simulated orders modify that shadow state but never rewrite the
     historical source events.
+
+    Fills are always costed in SOL. For a non-WSOL pool the quote-side reserves
+    are converted with the event's ``quotePriceSol`` oracle and the all-in SOL fee
+    is ``solRouteFeeRate``, which is the feed's multiplicative composition of the
+    pool fee and the SOL route fee. Simulated buys add the net quote to the
+    shadow reserve and sells remove the gross curve output; every later snapshot
+    reanchors the shadow state on observed reserves, so that convention only
+    affects the interval between a fill and the next observation.
     """
 
     def __init__(
@@ -240,10 +361,15 @@ class ExecutionSimulator:
         *,
         max_state_age_ms: int | None = 60_000,
         max_price_impact_bps: float | None = None,
+        min_curve_slope_quote: float = 0.01,
     ) -> None:
         self.events_path = Path(events_path)
         self.max_state_age_ms = max_state_age_ms
         self.max_price_impact_bps = max_price_impact_bps
+        # A launchpad price-curve slope is only estimated from observations that
+        # moved the quote reserve by at least this much SOL; smaller deltas are
+        # dominated by rounding in quoteInPool.
+        self.min_curve_slope_quote = min_curve_slope_quote
         self._events = iter_jsonl_events(self.events_path)
         self._next_snapshot: PoolSnapshot | None = None
         self._last_event_timestamp_ms = -1
@@ -251,6 +377,7 @@ class ExecutionSimulator:
         self._line_index = 0
         self._states: dict[tuple[str, str], PoolState] = {}
         self._metadata: dict[tuple[str, str], PoolSnapshot] = {}
+        self._latest_valid: dict[tuple[str, str], PoolSnapshot] = {}
         self._eof = False
         self.stats = {
             "events_read": 0,
@@ -259,6 +386,7 @@ class ExecutionSimulator:
             "invalid_snapshots_seen": 0,
             "pool_states_initialized": 0,
             "pool_state_updates": 0,
+            "curve_slope_updates": 0,
         }
 
     def _read_next_snapshot(self) -> PoolSnapshot | None:
@@ -312,10 +440,43 @@ class ExecutionSimulator:
                 last_snapshot_ms=snapshot.timestamp_ms,
                 last_signature=snapshot.signature,
                 reserve_model=snapshot.reserve_model,
+                quote_price_sol=snapshot.quote_price_sol or 1.0,
+                pool_fee_rate=snapshot.pool_fee_rate
+                if snapshot.pool_fee_rate is not None
+                else snapshot.fee_rate,
+                raw_price_sol=snapshot.price_sol,
+                shadow_price_sol=snapshot.price_sol,
+                curve_slope=None,
             )
             self.stats["pool_states_initialized"] += 1
             self.stats["valid_snapshots_applied"] += 1
+            self._latest_valid[key] = snapshot
             return
+
+        if state.reserve_model == "launchpad_linear_curve":
+            # The reported price is linear in the quote raised over short
+            # horizons, so consecutive observations give a local dp/dq that is
+            # accurate enough to price a small order (measured median error
+            # ~1e-5 of the fill price on the 2026-11-08 corpus).
+            previous_quote_sol = (
+                state.raw_quote_reserve * state.quote_price_sol
+            )
+            current_quote_sol = (
+                snapshot.quote_reserve * (snapshot.quote_price_sol or 1.0)
+            )
+            quote_delta_sol = current_quote_sol - previous_quote_sol
+            price_delta_sol = (
+                None
+                if snapshot.price_sol is None or state.raw_price_sol is None
+                else snapshot.price_sol - state.raw_price_sol
+            )
+            if (
+                price_delta_sol is not None
+                and price_delta_sol > 0.0
+                and quote_delta_sol >= self.min_curve_slope_quote
+            ):
+                state.curve_slope = price_delta_sol / quote_delta_sol
+                self.stats["curve_slope_updates"] += 1
 
         token_delta = snapshot.token_reserve - state.raw_token_reserve
         quote_delta = snapshot.quote_reserve - state.raw_quote_reserve
@@ -335,13 +496,142 @@ class ExecutionSimulator:
         state.shadow_token_reserve = shadow_token
         state.shadow_quote_reserve = shadow_quote
         state.fee_rate = snapshot.fee_rate
+        state.pool_fee_rate = (
+            snapshot.pool_fee_rate
+            if snapshot.pool_fee_rate is not None
+            else snapshot.fee_rate
+        )
+        state.quote_price_sol = snapshot.quote_price_sol or 1.0
         state.last_snapshot_ms = snapshot.timestamp_ms
         state.last_signature = snapshot.signature
         state.pool = snapshot.pool
         state.quote_mint = snapshot.quote_mint
         state.reserve_model = snapshot.reserve_model
+        if snapshot.price_sol is not None:
+            if state.shadow_price_sol is not None and state.raw_price_sol is not None:
+                # Carry the simulated fill's price offset across observations.
+                state.shadow_price_sol += snapshot.price_sol - state.raw_price_sol
+            else:
+                state.shadow_price_sol = snapshot.price_sol
+            state.raw_price_sol = snapshot.price_sol
         self.stats["pool_state_updates"] += 1
         self.stats["valid_snapshots_applied"] += 1
+        self._latest_valid[key] = snapshot
+
+    def resolve_pool(
+        self,
+        mint: str,
+        timestamp_ms: int,
+        *,
+        max_age_ms: int | None = None,
+    ) -> PoolSnapshot | None:
+        """Return the pool a market order should be routed to at ``timestamp_ms``.
+
+        Among the pools that have a valid, fresh snapshot for ``mint``, prefer a
+        WSOL-quoted pool and then the deepest one. Resolving again at exit time
+        is what handles mints that migrate from ``pump`` to ``pump-amm`` (or to a
+        new launchpad pool) inside the replay window.
+        """
+        self.advance_before(int(timestamp_ms))
+        age_limit = self.max_state_age_ms if max_age_ms is None else max_age_ms
+        candidates: list[PoolSnapshot] = []
+        for key, snapshot in self._latest_valid.items():
+            if key[0] != mint or key not in self._states:
+                continue
+            if snapshot.unsupported_reason is not None:
+                continue
+            latest = self._metadata.get(key)
+            if latest is not None and latest.unsupported_reason is not None:
+                if latest.timestamp_ms >= snapshot.timestamp_ms:
+                    continue
+            age = int(timestamp_ms) - snapshot.timestamp_ms
+            if age < 0:
+                continue
+            if age_limit is not None and age > age_limit:
+                continue
+            candidates.append(snapshot)
+
+        if not candidates:
+            return None
+        wsol_quoted = [item for item in candidates if item.quote_mint == WSOL_MINT]
+        pool = wsol_quoted or candidates
+        return max(
+            pool,
+            key=lambda item: (item.quote_reserve or 0.0)
+            * (item.quote_price_sol or 1.0),
+        )
+
+    def spot_price_sol(self, mint: str, timestamp_ms: int) -> tuple[float, int, str] | None:
+        """Latest mark price for ``mint`` as (SOL per token, timestamp, pool id)."""
+        snapshot = self.resolve_pool(mint, timestamp_ms)
+        if snapshot is None:
+            return None
+        state = self._states.get(snapshot.key)
+        if state is None:
+            return None
+        price = state.spot_price_sol
+        if price is None or price <= 0:
+            return None
+        return price, state.last_snapshot_ms, state.pool_id
+
+    def latest_spot_price_sol(self, mint: str) -> tuple[float, int, str] | None:
+        """Last observed mark for ``mint``, ignoring state age.
+
+        Used to mark open positions at the end of the replay: a token that
+        stopped trading an hour before the archive ends still has a last known
+        price, and treating it as unpriced would understate the book.
+        """
+        best: tuple[float, int, str] | None = None
+        for key, state in self._states.items():
+            if key[0] != mint:
+                continue
+            price = state.spot_price_sol
+            if price is None or price <= 0:
+                continue
+            if best is None or state.last_snapshot_ms > best[1]:
+                best = (price, state.last_snapshot_ms, state.pool_id)
+        return best
+
+    def mark_price_sol(
+        self, mint: str, timestamp_ms: int
+    ) -> tuple[float, int, str] | None:
+        """Most recent valid mark for ``mint`` at or before ``timestamp_ms``.
+
+        Unlike :meth:`spot_price_sol` this ignores state age, which is what a
+        mark-to-market valuation needs: the position could not be sold because
+        the pool went quiet, but the last observed price is still the best
+        available valuation. Future snapshots are never used.
+        """
+        self.advance_before(int(timestamp_ms))
+        best: tuple[int, int, float, str] | None = None
+        for key, state in self._states.items():
+            if key[0] != mint:
+                continue
+            if state.last_snapshot_ms > timestamp_ms:
+                continue
+            price = state.spot_price_sol
+            if price is None or price <= 0:
+                continue
+            is_wsol = 1 if state.quote_mint == WSOL_MINT else 0
+            candidate = (state.last_snapshot_ms, is_wsol, price, state.pool_id)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+        if best is None:
+            return None
+        return best[2], best[0], best[3]
+
+    @property
+    def last_event_timestamp_ms(self) -> int:
+        return self._last_event_timestamp_ms
+
+    @property
+    def exhausted(self) -> bool:
+        """True once the event stream has been fully consumed."""
+        return self._eof
+
+    def consume_all(self) -> None:
+        """Apply every remaining snapshot so ``last_event_timestamp_ms`` is final."""
+        self.advance_before(2**62)
 
     def advance_before(self, timestamp_ms: int) -> None:
         """Apply all snapshots strictly earlier than the requested execution time."""
@@ -429,14 +719,32 @@ class ExecutionSimulator:
             result.reason = "latest_pool_snapshot_exceeds_max_state_age"
             return result
 
+        quote_price_sol = state.quote_price_sol
         token_before = state.shadow_token_reserve
         quote_before = state.shadow_quote_reserve
-        spot_before = quote_before / token_before
+        quote_before_sol = quote_before * quote_price_sol
         fee_rate = state.fee_rate
+        pool_fee_rate = state.pool_fee_rate
+        is_curve = state.reserve_model == "launchpad_linear_curve"
+        spot_before = state.spot_price_sol
+
+        if spot_before is None or spot_before <= 0:
+            result.status = "unsupported_pool"
+            result.reason = "no_valid_spot_price"
+            return result
+
+        if is_curve and (state.curve_slope is None or state.curve_slope <= 0):
+            # A launchpad curve fill needs the local slope; refuse rather than
+            # pricing the order as if the pool had infinite depth.
+            result.status = "unsupported_pool"
+            result.reason = "missing_curve_slope"
+            return result
 
         result.reference_spot_price = spot_before
         result.reserve_token_before = token_before
-        result.reserve_quote_before = quote_before
+        result.reserve_quote_before = quote_before_sol
+        result.quote_price_sol = quote_price_sol
+        result.pool_fee_rate = pool_fee_rate
 
         if normalized_side == "buy":
             # Fees are always charged in the quote asset, on the gross amount:
@@ -444,31 +752,83 @@ class ExecutionSimulator:
             quote_gross = amount
             quote_fee = quote_gross * fee_rate
             quote_net = quote_gross - quote_fee
-            token_out = token_before * quote_net / (quote_before + quote_net)
-            if token_out <= 0 or token_out >= token_before:
-                result.status = "invalid_fill"
-                result.reason = "buy_output_outside_reserve_bounds"
-                return result
-            curve_average_price = quote_net / token_out
-            price_impact_bps = (curve_average_price / spot_before - 1.0) * 10_000.0
-            average_price = quote_gross / token_out
-            token_after = token_before - token_out
-            quote_after = quote_before + quote_net
+            if is_curve:
+                slope = state.curve_slope
+                assert slope is not None and spot_before is not None
+                token_out = math.log1p(slope * quote_net / spot_before) / slope
+                if token_out <= 0 or token_out >= token_before:
+                    result.status = "invalid_fill"
+                    result.reason = "buy_output_outside_reserve_bounds"
+                    return result
+                curve_average_price = quote_net / token_out
+                price_impact_bps = (
+                    curve_average_price / spot_before - 1.0
+                ) * 10_000.0
+                average_price = quote_gross / token_out
+                token_after = token_before - token_out
+                quote_after = quote_before + quote_net / quote_price_sol
+                price_after = spot_before + slope * quote_net
+            else:
+                quote_net_quote = quote_net / quote_price_sol
+                token_out = (
+                    token_before
+                    * quote_net_quote
+                    / (quote_before + quote_net_quote)
+                )
+                if token_out <= 0 or token_out >= token_before:
+                    result.status = "invalid_fill"
+                    result.reason = "buy_output_outside_reserve_bounds"
+                    return result
+                curve_average_price = quote_net / token_out
+                price_impact_bps = (
+                    curve_average_price / spot_before - 1.0
+                ) * 10_000.0
+                average_price = quote_gross / token_out
+                token_after = token_before - token_out
+                quote_after = quote_before + quote_net_quote
+                price_after = None
         else:
             token_in = amount
             if token_in >= token_before:
                 result.status = "insufficient_liquidity"
                 result.reason = "sell_size_is_not_smaller_than_token_reserve"
                 return result
-            quote_gross = quote_before * token_in / (token_before + token_in)
-            quote_fee = quote_gross * fee_rate
-            quote_net = quote_gross - quote_fee
-            token_out = token_in
-            curve_average_price = quote_gross / token_in
-            price_impact_bps = (1.0 - curve_average_price / spot_before) * 10_000.0
-            average_price = quote_net / token_in
-            token_after = token_before + token_in
-            quote_after = quote_before - quote_gross
+            if is_curve:
+                slope = state.curve_slope
+                assert slope is not None and spot_before is not None
+                exponent = slope * token_in
+                if exponent > 30.0:
+                    result.status = "insufficient_liquidity"
+                    result.reason = "sell_size_exceeds_curve_range"
+                    return result
+                price_after = spot_before * math.exp(exponent)
+                quote_gross = (price_after - spot_before) / slope
+                quote_fee = quote_gross * fee_rate
+                quote_net = quote_gross - quote_fee
+                token_out = token_in
+                curve_average_price = quote_gross / token_in
+                price_impact_bps = (
+                    1.0 - curve_average_price / spot_before
+                ) * 10_000.0
+                average_price = quote_net / token_in
+                token_after = token_before + token_in
+                quote_after = quote_before - quote_gross / quote_price_sol
+            else:
+                quote_gross_quote = (
+                    quote_before * token_in / (token_before + token_in)
+                )
+                quote_gross = quote_gross_quote * quote_price_sol
+                quote_fee = quote_gross * fee_rate
+                quote_net = quote_gross - quote_fee
+                token_out = token_in
+                curve_average_price = quote_gross / token_in
+                price_impact_bps = (
+                    1.0 - curve_average_price / spot_before
+                ) * 10_000.0
+                average_price = quote_net / token_in
+                token_after = token_before + token_in
+                quote_after = quote_before - quote_gross_quote
+                price_after = None
 
         result.token_amount = token_out
         result.quote_gross = quote_gross
@@ -477,7 +837,7 @@ class ExecutionSimulator:
         result.average_price_quote_per_token = average_price
         result.price_impact_bps = max(0.0, price_impact_bps)
         result.reserve_token_after = token_after
-        result.reserve_quote_after = quote_after
+        result.reserve_quote_after = quote_after * quote_price_sol
 
         if (
             self.max_price_impact_bps is not None
@@ -489,6 +849,8 @@ class ExecutionSimulator:
 
         state.shadow_token_reserve = token_after
         state.shadow_quote_reserve = quote_after
+        if price_after is not None:
+            state.shadow_price_sol = price_after
         result.status = "filled"
         return result
 

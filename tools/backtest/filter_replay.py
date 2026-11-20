@@ -73,6 +73,31 @@ KEEP_ACTIONS = frozenset(
     {"buy", "sell", "create", "createPool", "migrate", "add", "remove"}
 )
 
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+
+def normalize_legacy_event(event: dict) -> bool:
+    """Backfill SOL-denominated fields missing from pre-2026-11 archives.
+
+    Archives from 2026-08/10 carry ``price`` and ``marketCapQuote`` in the
+    pool's quote asset but omit ``priceSol``/``marketCapSol``. For WSOL-quoted
+    pools those values are identical, so copying them is exact. Non-WSOL events
+    are left alone: without ``quotePriceSol`` the SOL conversion is unknowable,
+    and inventing one would silently misprice the pool.
+
+    Returns True when a field was added.
+    """
+    if event.get("quoteMint") != WSOL_MINT:
+        return False
+    changed = False
+    if event.get("priceSol") is None and event.get("price") is not None:
+        event["priceSol"] = event["price"]
+        changed = True
+    if event.get("marketCapSol") is None and event.get("marketCapQuote") is not None:
+        event["marketCapSol"] = event["marketCapQuote"]
+        changed = True
+    return changed
+
 # Fields kept verbatim. This is a superset of what raw_to_clean_ohlcv.read_file
 # pulls, plus the bonding-curve reserves and simulator metadata.
 KEEP_FIELDS = (
@@ -151,7 +176,9 @@ def _utc(ms: int | None) -> str | None:
     return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
 
 
-def filter_archive(job: tuple[str, str, list[str]]) -> dict:
+def filter_archive(
+    job: tuple[str, str, list[str]], *, normalize_legacy: bool = False
+) -> dict:
     """Filter one archive into one part file. Returns per-file statistics."""
     source_path, part_path, targets = job
     import zstandard as zstd
@@ -162,6 +189,7 @@ def filter_archive(job: tuple[str, str, list[str]]) -> dict:
         "part": part_path,
         "lines_scanned": 0,
         "events_kept": 0,
+        "legacy_events_normalized": 0,
         "bad_json": 0,
         "action_counts": Counter(),
         "first_timestamp_ms": None,
@@ -196,6 +224,9 @@ def filter_archive(job: tuple[str, str, list[str]]) -> dict:
                     value = event.get(field)
                     if value is not None:
                         compact[field] = value
+
+                if normalize_legacy and normalize_legacy_event(compact):
+                    stats["legacy_events_normalized"] += 1
 
                 breakdown = event.get("breakdown")
                 breakdown = breakdown if isinstance(breakdown, list) else []
@@ -366,6 +397,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep per-archive part files after the merge.",
     )
+    parser.add_argument(
+        "--normalize-legacy",
+        action="store_true",
+        help=(
+            "Backfill priceSol/marketCapSol from price/marketCapQuote for "
+            "WSOL-quoted events. Needed for pre-2026-11 archives; a no-op on "
+            "archives that already carry the SOL-denominated fields."
+        ),
+    )
+    parser.add_argument(
+        "--allow-missing-mints",
+        type=int,
+        default=0,
+        help=(
+            "Tolerate up to this many target mints with no replay events. "
+            "Some venues (for example hookedpad.com) are not covered by the "
+            "feed, so a signal mints file can contain addresses the replay "
+            "never mentions. Missing mints are always listed in the report."
+        ),
+    )
     return parser
 
 
@@ -407,7 +458,10 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(filter_archive, job): job for job in jobs}
+        futures = {
+            pool.submit(filter_archive, job, normalize_legacy=args.normalize_legacy): job
+            for job in jobs
+        }
         for future in as_completed(futures):
             stat = future.result()
             file_stats.append(stat)
@@ -455,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         "mints_with_events": len(mint_counts),
         "mints_without_events": len(missing),
         "mints_missing": missing,
+        "allowed_missing_mints": args.allow_missing_mints,
         "events_per_mint": {
             "min": min(mint_counts.values()) if mint_counts else 0,
             "max": max(mint_counts.values()) if mint_counts else 0,
@@ -479,12 +534,19 @@ def main(argv: list[str] | None = None) -> int:
                 "preBalances/postBalances retained only for events that trigger "
                 "raw_to_clean_ohlcv participant balance audit"
             ),
+            "normalize_legacy": bool(args.normalize_legacy),
+            "legacy_events_normalized": sum(
+                stat["legacy_events_normalized"] for stat in file_stats
+            ),
         },
         "elapsed_seconds": round(time.time() - started, 1),
         "passed": (
             merge_stats["ordering_violations"] == 0
             and merge_stats["events_written"] > 0
-            and (bool(args.limit_files) or not missing)
+            and (
+                bool(args.limit_files)
+                or len(missing) <= args.allow_missing_mints
+            )
         ),
     }
 

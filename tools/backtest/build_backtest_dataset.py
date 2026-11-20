@@ -38,6 +38,82 @@ import pandas as pd  # noqa: E402
 import filter_replay  # noqa: E402
 import verify_backtest_dataset  # noqa: E402
 
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+
+def classify_wsol_routability(
+    events_path: Path, signals: pd.DataFrame, missing_mints: set[str] | None = None
+) -> pd.DataFrame:
+    """Mark each signal routable when its mint trades WSOL at or after the signal.
+
+    Dataset-level routability is deliberately narrow: it only answers "can this
+    filtered stream produce SOL-denominated bars at and following this signal?".
+    Pool model support (bonding curve, PumpSwap virtual reserves, vault AMMs) is
+    a simulator concern and is checked at order time, not here.
+    """
+    import io
+
+    import zstandard as zstd
+
+    absent = {str(mint) for mint in (missing_mints or ())}
+    last_trade_ms: dict[str, int] = {}
+    with events_path.open("rb") as source:
+        reader = zstd.ZstdDecompressor().stream_reader(
+            source, read_across_frames=True
+        )
+        for line in io.BufferedReader(reader, 1 << 20):
+            if not line.strip():
+                continue
+            event = filter_replay._loads(line)
+            if (
+                isinstance(event, dict)
+                and event.get("quoteMint") == WSOL_MINT
+                and event.get("action") in ("buy", "sell")
+            ):
+                mint = str(event.get("mint"))
+                raw_timestamp = event.get("timestamp", event.get("timestamp_ms"))
+                try:
+                    timestamp_ms = int(raw_timestamp)
+                except (TypeError, ValueError):
+                    continue
+                if timestamp_ms > last_trade_ms.get(mint, -1):
+                    last_trade_ms[mint] = timestamp_ms
+
+    rows = []
+    for row in signals.itertuples(index=False):
+        mint = str(row.mint)
+        signal_ms = getattr(row, "signal_timestamp_ms", None)
+        if signal_ms is None:
+            signal_ms = int(
+                pd.Timestamp(row.signal_timestamp_utc).timestamp() * 1000
+            )
+        signal_ms = int(signal_ms)
+        last_trade = last_trade_ms.get(mint)
+        if last_trade is None:
+            # Not a quote problem: the feed has no WSOL market for this mint at
+            # all, usually because it launched on a venue the replay does not
+            # cover.
+            reason = "no_replay_events" if mint in absent else "no_wsol_quoted_trades"
+        elif last_trade < signal_ms:
+            # The market for this mint went quiet before the signal arrived.
+            # The dataset layer cannot know the entry latency or staleness
+            # limit, so it conservatively requires a WSOL trade at or after the
+            # signal; otherwise no bar can follow the signal.
+            reason = "no_wsol_trades_after_signal"
+        else:
+            reason = ""
+        routable = not reason
+        rows.append(
+            {
+                "signal_id": row.signal_id,
+                "signal_timestamp_utc": row.signal_timestamp_utc,
+                "mint": mint,
+                "dataset_routable": int(routable),
+                "reason": reason,
+            }
+        )
+    return pd.DataFrame(rows)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -69,6 +145,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="UTC window for the reference check, e.g. 2026-11-08T05:00/2026-11-08T06:00",
+    )
+    parser.add_argument(
+        "--normalize-legacy",
+        action="store_true",
+        help=(
+            "Backfill priceSol/marketCapSol for WSOL events in pre-2026-11 "
+            "archives, which omit the SOL-denominated fields."
+        ),
+    )
+    parser.add_argument(
+        "--allow-missing-mints",
+        type=int,
+        default=0,
+        help=(
+            "Tolerate up to this many signal mints with no replay events "
+            "(venues the feed does not cover). They are routed out of the "
+            "dataset with reason 'no_replay_events'."
+        ),
     )
     parser.add_argument("--skip-filter", action="store_true")
     parser.add_argument("--skip-ohlcv", action="store_true")
@@ -110,6 +204,10 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if args.workers > 0:
             filter_args += ["--workers", str(args.workers)]
+        if args.normalize_legacy:
+            filter_args.append("--normalize-legacy")
+        if args.allow_missing_mints > 0:
+            filter_args += ["--allow-missing-mints", str(args.allow_missing_mints)]
         exit_code = filter_replay.main(filter_args)
         timings["filter_seconds"] = round(time.time() - started, 1)
         if exit_code != 0:
@@ -152,6 +250,31 @@ def main(argv: list[str] | None = None) -> int:
         report["passed"] = bool(report["filter"].get("passed"))
     else:
         signals = pd.read_csv(args.signals)
+        excluded: set[str] = set()
+        if not filtered_file.exists():
+            raise SystemExit(f"Missing filtered replay: {filtered_file}")
+        missing_mints = set(report["filter"].get("mints_missing") or ())
+        routing = classify_wsol_routability(
+            filtered_file, signals, missing_mints=missing_mints
+        )
+        routing_path = args.output_dir / "signal_routing.csv"
+        routing.to_csv(routing_path, index=False)
+        excluded = set(
+            routing.loc[routing["dataset_routable"] == 0, "mint"].astype(str)
+        )
+        reason_counts = (
+            routing.loc[routing["dataset_routable"] == 0, "reason"]
+            .value_counts()
+            .to_dict()
+        )
+        report["routing"] = {
+            "file": str(routing_path),
+            "signals": int(len(routing)),
+            "dataset_routable": int(routing["dataset_routable"].sum()),
+            "excluded": len(excluded),
+            "excluded_by_reason": {str(k): int(v) for k, v in reason_counts.items()},
+            "excluded_mints": sorted(excluded),
+        }
         reference_window = None
         if args.reference is not None:
             if args.reference_window is None:
@@ -175,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
                 reference_window=reference_window
                 if timeframe == timeframes[0]
                 else None,
+                exclude_mints=excluded,
             )
             (ohlcv_dir / f"dataset_verification_{timeframe}.json").write_text(
                 json.dumps(result, indent=2), encoding="utf-8"

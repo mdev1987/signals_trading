@@ -5,12 +5,25 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv
 .vscode
 messages
 output
+
+# Telegram credentials and session (never commit)
+config.ini
+.env
+.env.*
+!.env.example
+*.session
+tg_session.session
+
+# Machine-specific data links
+replay
 
 # Agent state
 .opencode/

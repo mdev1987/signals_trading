@@ -158,6 +158,76 @@ class FilterReplayTests(unittest.TestCase):
             self.assertIn("postBalances", kept[1])
             self.assertEqual(len(kept[1]["breakdown"]), 2)
 
+    def test_normalize_legacy_backfills_wsol_price_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "20261003_04.jsonl.zst"
+            part = root / "part.jsonl.zst"
+            write_archive(
+                source,
+                [
+                    trade(
+                        "mint-a",
+                        priceSol=None,
+                        price=0.02,
+                        marketCapQuote=200.0,
+                        marketCapSol=None,
+                    )
+                ],
+            )
+
+            stats = filter_archive(
+                (str(source), str(part), ["mint-a"]), normalize_legacy=True
+            )
+            kept = read_archive(part)
+
+            self.assertEqual(stats["legacy_events_normalized"], 1)
+            self.assertEqual(kept[0]["priceSol"], 0.02)
+            self.assertEqual(kept[0]["marketCapSol"], 200.0)
+
+    def test_normalize_legacy_never_overwrites_existing_or_non_wsol(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "20261003_04.jsonl.zst"
+            part = root / "part.jsonl.zst"
+            write_archive(
+                source,
+                [
+                    # Both fields present: the SOL-denominated value wins.
+                    trade("mint-a", priceSol=0.01, price=0.09),
+                    # Non-WSOL quote: conversion is unknowable, so leave it alone.
+                    trade(
+                        "mint-b",
+                        quoteMint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                        priceSol=None,
+                        price=0.03,
+                    ),
+                ],
+            )
+
+            filter_archive((str(source), str(part), ["mint-a", "mint-b"]),
+                           normalize_legacy=True)
+            kept = {event["mint"]: event for event in read_archive(part)}
+
+            self.assertEqual(kept["mint-a"]["priceSol"], 0.01)
+            self.assertNotIn("priceSol", kept["mint-b"])
+
+    def test_normalize_legacy_is_off_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "20261003_04.jsonl.zst"
+            part = root / "part.jsonl.zst"
+            write_archive(
+                source,
+                [trade("mint-a", priceSol=None, price=0.02, marketCapQuote=200.0)],
+            )
+
+            filter_archive((str(source), str(part), ["mint-a"]))
+            kept = read_archive(part)
+
+            self.assertNotIn("priceSol", kept[0])
+            self.assertNotIn("marketCapSol", kept[0])
+
     def test_merge_orders_and_deduplicates_boundary_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

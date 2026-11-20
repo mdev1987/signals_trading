@@ -1,0 +1,11 @@
+[Telegram]
+# Create your own credentials at https://my.telegram.org/apps
+api_id = 123456
+api_hash = replace_with_your_api_hash
+# Full phone number, including + and country code.
+phone = +10000000000
+
+# Where the Telethon session lives (".session" is appended automatically).
+# Use an absolute path so the file does not depend on the working directory.
+# Run get_messages.py once to log in; the session file is gitignored.
+session_file = /absolute/path/to/tg_session

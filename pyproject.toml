@@ -8,5 +8,13 @@ dependencies = [
     "numpy>=2.5.4",
     "orjson>=3.13.0",
     "pandas>=3.1.1",
+    "pyarrow>=26.0.1",
+    "tgdata>=0.1.4",
     "zstandard>=0.25.0",
 ]
+
+[tool.pytest.ini_options]
+# The VectorBT research module is intentionally independent: it has its own uv
+# environment (vectorbt is not a project dependency) and its own test runner.
+# Run it from tools/backtest/vectorbt_research with `uv run python -m pytest`.
+norecursedirs = ["tools/backtest/vectorbt_research"]

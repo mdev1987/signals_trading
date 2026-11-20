@@ -105,6 +105,30 @@ class VerifyBacktestDatasetTests(unittest.TestCase):
         self.assertEqual(report["missing_signaled_mints"], ["mint-b"])
         self.assertFalse(report["checks"]["all_signaled_mints_present"])
 
+    def test_excluded_mints_are_reported_but_not_required(self) -> None:
+        report = verify_dataset(
+            bar_frame(["mint-a"], 5),
+            signal_frame(["mint-a", "mint-b"]),
+            BAR_MS,
+            exclude_mints={"mint-b"},
+        )
+
+        self.assertTrue(report["passed"], report["checks"])
+        self.assertEqual(report["missing_signaled_mints"], [])
+        self.assertEqual(report["excluded_mints"], ["mint-b"])
+        self.assertEqual(report["signaled_mints"], 1)
+
+    def test_excluded_mint_still_fails_when_bars_are_missing_for_others(self) -> None:
+        report = verify_dataset(
+            bar_frame(["mint-a"], 5),
+            signal_frame(["mint-a", "mint-b", "mint-c"]),
+            BAR_MS,
+            exclude_mints={"mint-b"},
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["missing_signaled_mints"], ["mint-c"])
+
     def test_duplicate_and_misaligned_bars_fail(self) -> None:
         frame = bar_frame(["mint-a"], 3)
         duplicated = pd.concat([frame, frame.iloc[[0]]], ignore_index=True)

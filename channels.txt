@@ -1,0 +1,9 @@
+# Telegram signal channels to backtest.
+# Format: one channel username per line (with or without leading @).
+# Lines starting with # are ignored. Blank lines are ignored.
+
+#@migratedpumpfun   # migrations only; produced 0 entry signals
+@AveSignalMonitor
+#@WizzyTrades
+#@Riley_Signals
+#@crawlca

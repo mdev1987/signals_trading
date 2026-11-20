@@ -7,6 +7,11 @@ Entry signal: `2nd Vibe Buy Signal` on Solana, timestamped by the Telegram
 message. Execution is simulated later against the event stream with the
 configured latency.
 
+> **See also:** `tools/backtest/README_multi_day_backtest.md` for the five-day
+> rerun (schema drift, routing, pool coverage, execution/marking rules and
+> strategy results). This document covers the original single-period 11-08
+> dataset stage.
+
 ## Pipeline
 
 ```text
