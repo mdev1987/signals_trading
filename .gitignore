@@ -18,7 +18,8 @@ output
 config.ini
 .env
 .env.*
-!.env.example
+!*.env.example
+*.env
 *.session
 tg_session.session
 

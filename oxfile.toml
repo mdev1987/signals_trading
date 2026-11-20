@@ -1,0 +1,67 @@
+version = 1
+
+# signals-trading — AVE hot-money Telegram listener.
+#
+# The deployed rule is the canonical research rule in
+# `src/ave_hot_money_strategy.py` (spec: `docs/AVE_HOT_MONEY_STRATEGY.md`):
+#
+#   hist_flow_1m_sol  > 9.456   # net buys - sells in the 60 s before the alert
+#   total_buy_sol     > 3.0     # "Total Buy" printed in the Ave alert
+#   hist_pre_vol_30m_sol > 600  # gross traded volume in the prior 30 min
+#
+# Exit is the research horizon: signal + 5 s entry, 5 min hold, no forced
+# closes before the horizon. The flow cutoff is the train-day q80 fitted once
+# on Oct 3-5 2026; do not retune it on live data.
+#
+# Two modes, one binary:
+#   --mode paper (this app)  read-only Jupiter /order quotes, never signs.
+#   --mode live              signs with SOLANA_PRIVATE_KEY and broadcasts
+#                            through Jupiter /execute. Requires BOTH
+#                            --mode live and LIVE_TRADING_ENABLED=1.
+#
+# To switch this app to live execution, change `--mode paper` to `--mode live`
+# and add the keys below (never commit them):
+#   SOLANA_PRIVATE_KEY=<base58 secret key>
+#   LIVE_TRADING_ENABLED=1
+#   LIVE_MINT_ALLOWLIST=<optional comma-separated mints>
+#   LIVE_STARTING_SOL=<wallet balance shown in reports>
+# The live path refuses A/B lanes, preflight sells, and any notional above
+# --notional-sol.
+#
+# One-time setup:
+#   cd /home/mdev/Programming/signals_trading_vector
+#   uv sync                              # .venv with bot dependencies
+#   cp .env.example .env                 # Jupiter key + reporting bot token
+#   cp config.ini.example config.ini     # Telethon api_id/api_hash/phone
+#   .venv/bin/python -m paper_bot login  # needs PYTHONPATH=src, once, TTY
+#
+# Then:
+#   oxmgr apply ./oxfile.toml
+#   oxmgr logs paper-bot -f
+#   oxmgr status paper-bot
+
+[[apps]]
+name = "paper-bot"
+# The package lives under `src/`, so PYTHONPATH is set here instead of
+# installing the research repo as a wheel. `--no-sync` is unnecessary because
+# this runs the venv directly, so a restart never touches the network.
+command = "env PYTHONPATH=/home/mdev/Programming/signals_trading_vector/src /home/mdev/Programming/signals_trading_vector/.venv/bin/python -m paper_bot live --mode paper --rule hot_money_continuation --entry-mode timer --horizon-min 5 --fee 0.0125 --slippage 0 --notional-sol 0.1 --history-horizon-min 35 --history-max-total-events 150000 --history-max-events-per-mint 3000 --history-max-mints 10000 --memory-limit-mb 550"
+cwd = "/home/mdev/Programming/signals_trading_vector"
+restart_policy = "always"
+max_restarts = 100
+# Stop after 5 crash-restarts inside 5 minutes instead of hot-looping.
+crash_restart_limit = 5
+restart_delay_secs = 10
+stop_signal = "SIGTERM"
+# Engine close (25 s) + reporter flush + Telethon disconnect.
+stop_timeout_secs = 90
+unified_logs = true
+
+[apps.env]
+PATH = "/home/mdev/.local/bin:/usr/local/bin:/usr/bin:/bin"
+HOME = "/home/mdev"
+PYTHONUNBUFFERED = "1"
+PAPER_BOT_HOME = "/home/mdev/Programming/signals_trading_vector"
+PAPER_BOT_LOG_LEVEL = "INFO"
+# Fail closed: live execution needs an explicit operator opt-in.
+LIVE_TRADING_ENABLED = "0"

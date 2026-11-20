@@ -147,10 +147,11 @@ Filled candles are excluded from this timeline: a carried-forward `pool_id` is n
 ## Repository layout
 
 ```text
-src/            source modules and the on-chain feature package
+src/            source modules, the Telegram bot, and the on-chain feature package
 src/tests/      unittest suite
 docs/           method and experiment documentation
 pyproject.toml  project metadata and test paths
+oxfile.toml     oxmgr deployment for the Telegram listener
 ```
 
 Runtime inputs are not committed: `messages/`, `output/`, `.env`, `config.ini`,
@@ -223,3 +224,50 @@ The report records the builder version, configured thresholds, PIT delay, eligib
 ## Important limitation
 
 PIT universe selection removes the full-window universe-filter leak. It does not by itself remove every possible source of look-ahead or guarantee executable PnL. The pool timeline makes the selected pool available only after the candle closes, but an adapter must still select it as-of order time and reject stale or unsupported metadata. Historical fills are not hypothetical fills. Signal timing, next-bar order submission, order size, reserve state, fees, and slippage must be modeled separately in the execution/backtest engine.
+
+## Telegram bot
+
+`src/paper_bot/` is the live listener for the AVE channel. It consumes Telegram
+messages, rebuilds the pre-signal flow and volume features from the PumpAPI
+firehose, applies the canonical hot-money rule, and manages the 5-minute exit.
+
+The deployed rule is the one in `src/ave_hot_money_strategy.py` (see
+`docs/AVE_HOT_MONEY_STRATEGY.md`):
+
+```text
+hist_flow_1m_sol   > 9.456   # net buys - sells in the 60 s before the alert
+total_buy_sol      > 3.0     # "Total Buy" printed in the Ave alert
+hist_pre_vol_30m_sol > 600   # gross traded volume in the prior 30 min
+```
+
+Two execution modes share the same state machine and accounting:
+
+| Mode | Quotes | Signs / broadcasts | Requirement |
+|---|---|---|---|
+| `paper` | Jupiter `GET /order` without a taker | never | none |
+| `live` | Jupiter `GET /order` with the wallet taker | Jupiter `POST /execute` | `--mode live` **and** `LIVE_TRADING_ENABLED=1` |
+
+Live mode is single-lane (no A/B), caps every entry at `--notional-sol`, can
+restrict mints with `LIVE_MINT_ALLOWLIST`, and books the executed amounts as-is
+(the on-chain swap already paid its own fee and slippage). Paper runs use the
+research cost model: `--fee 0.0125 --slippage 0`.
+
+```bash
+# Paper: quotes only, safe default
+PYTHONPATH=src uv run python -m paper_bot live --mode paper
+
+# Live: requires SOLANA_PRIVATE_KEY and LIVE_TRADING_ENABLED=1 in the env
+PYTHONPATH=src uv run python -m paper_bot live --mode live --notional-sol 0.1
+
+# Inspect one read-only quote
+PYTHONPATH=src uv run python -m paper_bot quote --mint <MINT> --notional-sol 0.1
+
+# Summarize a run directory
+PYTHONPATH=src uv run python -m paper_bot report output/paper_runs/<run>
+```
+
+`oxfile.toml` deploys the paper lane with the same rule and horizon. To move
+the deployed app to live execution, change `--mode paper` to `--mode live` and
+add the live keys to the app environment. Secrets stay in `.env`, `config.ini`,
+and the Telethon session file; all three are gitignored.
+

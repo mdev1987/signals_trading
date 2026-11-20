@@ -1,0 +1,260 @@
+"""Focused tests for the Telegram live/paper bot.
+
+The research-facing modules are covered elsewhere; these tests pin the pieces
+that decide whether real SOL can move: the deployed rule, the causal history
+features, the live-execution guards, and the paper/live report wording.
+"""
+
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+SRC_DIR = Path(__file__).resolve().parents[1]
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from paper_bot.execution import (  # noqa: E402
+    LiveExecutionConfig,
+    LiveExecutionError,
+    LiveQuoteProvider,
+    LiveSolanaExecutor,
+    live_config_from_env,
+)
+from paper_bot.history import MarketHistory  # noqa: E402
+from paper_bot.models import Signal, TradeEvent  # noqa: E402
+from paper_bot.notifier import format_startup  # noqa: E402
+from paper_bot.signal_parser import parse_signal_message  # noqa: E402
+from paper_bot.signals import GateConfig, evaluate_gate  # noqa: E402
+
+MINT = "So11111111111111111111111111111111111111112"
+SIGNAL_TS = 1_800_000_000_000
+
+
+def signal(features: dict[str, float | None]) -> Signal:
+    return Signal(
+        token_address=MINT,
+        signal_ts_ms=SIGNAL_TS,
+        received_ts_ms=SIGNAL_TS,
+        network="solana",
+        address_status="confirmed",
+        message_type="buy",
+        is_buy_signal=True,
+        is_confirmed_buy_signal=True,
+        features=dict(features),
+    )
+
+
+class AlertParsingTests(unittest.TestCase):
+    def test_total_buy_is_not_double_counted_as_inflow(self) -> None:
+        message = (
+            "\U0001f4b9 Max Pump: 3.5x\n"
+            "\U0001f4b0 4 KOL Wallet Buy\n"
+            "\U0001f911 Current MC: 12.5K\n"
+            "\U0001f4b8 Total Buy 9.5 SOL\n"
+            "\U0001f6d2 Inflow\n"
+            "Buy 4 SOL\n"
+            "Buy 3 SOL\n"
+            "Buy 2.5 SOL\n"
+        )
+        features = parse_signal_message(message)
+        self.assertEqual(features["total_buy_sol"], 9.5)
+        self.assertEqual(features["inflow_n"], 3)
+        self.assertEqual(features["inflow_sum"], 9.5)
+
+
+class HotMoneyGateTests(unittest.TestCase):
+    def gate(self, **features: float | None) -> bool:
+        return evaluate_gate(signal(features), GateConfig()).allowed
+
+    def test_passes_above_all_three_thresholds(self) -> None:
+        self.assertTrue(
+            self.gate(
+                hist_flow_1m_sol=9.47,
+                total_buy_sol=3.01,
+                hist_pre_vol_30m_sol=600.1,
+            )
+        )
+
+    def test_rejects_each_threshold_at_the_boundary(self) -> None:
+        base = dict(
+            hist_flow_1m_sol=20.0,
+            total_buy_sol=10.0,
+            hist_pre_vol_30m_sol=2_000.0,
+        )
+        for key, value in (
+            ("hist_flow_1m_sol", 9.456),
+            ("total_buy_sol", 3.0),
+            ("hist_pre_vol_30m_sol", 600.0),
+        ):
+            with self.subTest(key=key):
+                features = {**base, key: value}
+                self.assertFalse(self.gate(**features))
+
+    def test_cold_start_is_rejected_with_a_reason(self) -> None:
+        decision = evaluate_gate(signal({}), GateConfig())
+        self.assertFalse(decision.allowed)
+        self.assertIn("missing_feature:hist_flow_1m_sol", decision.reasons)
+
+
+class HistoryFeatureTests(unittest.TestCase):
+    def test_flow_and_volume_ignore_trades_at_or_after_the_signal(self) -> None:
+        history = MarketHistory(horizon_ms=3_600_000)
+        # A +10 SOL buy inside the minute and a -2 SOL sell 10 s later.
+        history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=SIGNAL_TS - 30_000,
+                event_index=1,
+                action="buy",
+                price_sol=1.0,
+                token_amount=10.0,
+            )
+        )
+        history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=SIGNAL_TS - 20_000,
+                event_index=2,
+                action="sell",
+                price_sol=1.0,
+                token_amount=2.0,
+            )
+        )
+        # At the signal and one second after it: must not enter either window.
+        history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=SIGNAL_TS,
+                event_index=3,
+                action="buy",
+                price_sol=1.0,
+                token_amount=100.0,
+            )
+        )
+        history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=SIGNAL_TS + 1_000,
+                event_index=4,
+                action="buy",
+                price_sol=1.0,
+                token_amount=100.0,
+            )
+        )
+        stats = history.stats(MINT, SIGNAL_TS)
+        self.assertAlmostEqual(stats["flow_1m_sol"], 8.0)
+        self.assertAlmostEqual(stats["pre_vol_30m_sol"], 12.0)
+
+
+class LiveGuardTests(unittest.TestCase):
+    def test_live_config_fails_closed_without_opt_in(self) -> None:
+        config = live_config_from_env(
+            {"SOLANA_PRIVATE_KEY": "x"}, enabled=True, slippage_bps=50,
+            max_notional_sol=0.1,
+        )
+        self.assertFalse(config.enabled)
+
+    def test_live_config_fails_closed_without_key(self) -> None:
+        with self.assertRaises(ValueError):
+            live_config_from_env(
+                {"LIVE_TRADING_ENABLED": "1"}, enabled=True, slippage_bps=50,
+                max_notional_sol=0.1,
+            )
+
+    def test_notional_cap_and_allowlist_are_enforced(self) -> None:
+        executor = LiveSolanaExecutor(
+            LiveExecutionConfig(
+                enabled=True,
+                private_key="unused-for-guard",
+                max_notional_sol=0.1,
+                allowlist=frozenset({MINT}),
+            )
+        )
+        with self.assertRaises(LiveExecutionError) as caught:
+            executor._guard(MINT, 0.11)
+        self.assertEqual(caught.exception.reason, "live_notional_cap")
+        with self.assertRaises(LiveExecutionError) as caught:
+            executor._guard("other-mint", 0.05)
+        self.assertEqual(caught.exception.reason, "live_mint_not_allowlisted")
+
+    def test_disabled_executor_refuses_to_trade(self) -> None:
+        executor = LiveSolanaExecutor(LiveExecutionConfig(enabled=False))
+        with self.assertRaises(LiveExecutionError) as caught:
+            executor._guard(MINT, 0.01)
+        self.assertEqual(caught.exception.reason, "live_disabled")
+
+    def test_invalid_private_key_never_echoes_the_key(self) -> None:
+        secret = "not-a-base58-secret"
+        executor = LiveSolanaExecutor(
+            LiveExecutionConfig(enabled=True, private_key=secret)
+        )
+        with self.assertRaises(LiveExecutionError) as caught:
+            executor._key()
+        self.assertNotIn(secret, caught.exception.detail or "")
+
+
+class _FakeExecutor:
+    def __init__(self) -> None:
+        self.config = LiveExecutionConfig(enabled=True, private_key="x")
+        self.orders: list[tuple[dict[str, str], str]] = []
+        self.metadata = self
+
+    async def _order(self, params: dict[str, str], *, action: str) -> dict:
+        self.orders.append((params, action))
+        return {}
+
+    async def decimals(self, mint: str, event_decimals: int | None = None) -> int:
+        return 6
+
+    async def buy(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("preflight must not buy")
+
+    async def sell(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("preflight must not sell")
+
+
+class LiveQuoteProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preflight_only_builds_an_order(self) -> None:
+        executor = _FakeExecutor()
+        provider = LiveQuoteProvider(executor)  # type: ignore[arg-type]
+        quote = await provider.exit_quote(
+            MINT, 1_000.0, 0.01, decimals=6, action="preflight"
+        )
+        self.assertEqual(quote.source, "live_preflight")
+        self.assertEqual(len(executor.orders), 1)
+        params, action = executor.orders[0]
+        self.assertEqual(action, "preflight")
+        self.assertEqual(params["amount"], "1000000000")
+
+
+class ReportTests(unittest.TestCase):
+    def startup(self, mode: str) -> str:
+        return format_startup(
+            rule="hot_money_continuation",
+            horizon_min=5,
+            notional_sol=0.1,
+            starting_sol=10,
+            fee=0.0125,
+            slippage=0.0,
+            channels=["@ave"],
+            session_file="bot.session",
+            preflight_exit_route=False,
+            mode=mode,
+        )
+
+    def test_paper_banner_is_explicit(self) -> None:
+        text = self.startup("paper")
+        self.assertIn("PAPER", text)
+        self.assertIn("signed or broadcast", text)
+
+    def test_live_banner_warns_about_broadcast(self) -> None:
+        text = self.startup("live")
+        self.assertIn("LIVE", text)
+        self.assertIn("signed locally", text)
+        self.assertNotIn("Paper trading only", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
