@@ -165,7 +165,14 @@ The exact 5 m numbers by day (all five positive):
 - **Holdout**: the rule is fitted on train days only. Holdout mean is +70.3 %
   at 5 m and holdout 2×+ rate is 27.8 %, so the pattern is not a train artefact.
 - **Fees**: all returns include 1.25 % per side. `net_pnl_sol` at 5 m is
-  +3.60 SOL on 0.1 SOL stakes.
+  +3.53 SOL on 0.1 SOL stakes.
+
+The canonical, executable definition of the rule is
+[`ave_hot_money_strategy.py`](ave_hot_money_strategy.py); its spec, PIT
+guarantees, failure modes and Helius data options are documented in
+[`AVE_HOT_MONEY_STRATEGY.md`](AVE_HOT_MONEY_STRATEGY.md). The module re-computes
+the headline statistics from the saved tables, so the numbers cannot silently
+drift.
 
 ### What predicts rugs
 

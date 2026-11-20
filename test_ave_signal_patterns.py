@@ -17,6 +17,13 @@ from tools.backtest.ave_signal_pattern_rules import (
     build_rules,
     placebo,
 )
+from tools.backtest.ave_hot_money_strategy import (
+    Thresholds as StrategyThresholds,
+    decide,
+    evaluate,
+    fit_thresholds,
+    hot_money_mask,
+)
 
 
 def alert(text: str) -> str:
@@ -203,6 +210,97 @@ class PlaceboTests(unittest.TestCase):
         second = placebo(features, outcomes, rule, 5, draws=200, seed=11)
         self.assertEqual(first, second)
         self.assertEqual(first["size"], 1)
+
+
+class StrategyModuleTests(unittest.TestCase):
+    def make_features(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "signal_id": ["t1", "t2", "t3", "h1", "h2"],
+                "is_train": [True, True, True, False, False],
+                "ev_flow_1m": [1.0, 2.0, 3.0, 1000.0, 2000.0],
+                "alert_total_buy": [5.0, 5.0, 5.0, 5.0, 5.0],
+                "pre_vol_30m": [700.0, 700.0, 700.0, 700.0, 700.0],
+            }
+        )
+
+    def test_fit_thresholds_reads_train_rows_only(self) -> None:
+        features = self.make_features()
+        first = fit_thresholds(features)
+        features.loc[~features["is_train"], "ev_flow_1m"] = -999.0
+        second = fit_thresholds(features)
+        self.assertEqual(first, second)
+        self.assertAlmostEqual(first.flow_1m_sol, 2.6)
+        self.assertEqual(first.alert_total_buy_sol, 3.0)
+        self.assertEqual(first.volume_30m_sol, 600.0)
+
+    def test_mask_requires_every_condition(self) -> None:
+        features = self.make_features()
+        features.loc[
+            ~features["is_train"],
+            ["ev_flow_1m", "alert_total_buy", "pre_vol_30m"],
+        ] = 0.0
+        features.loc[0, "ev_flow_1m"] = 0.0
+        features.loc[1, "alert_total_buy"] = 1.0
+        features.loc[2, "pre_vol_30m"] = 100.0
+        thresholds = StrategyThresholds(
+            flow_1m_sol=2.5, alert_total_buy_sol=3.0, volume_30m_sol=600.0
+        )
+        self.assertFalse(hot_money_mask(features, thresholds).any())
+
+    def test_mask_ignores_missing_values(self) -> None:
+        features = self.make_features()
+        features.loc[0, "ev_flow_1m"] = np.nan
+        thresholds = StrategyThresholds(
+            flow_1m_sol=2.5, alert_total_buy_sol=3.0, volume_30m_sol=600.0
+        )
+        self.assertFalse(bool(hot_money_mask(features, thresholds).iloc[0]))
+
+    def test_decide_explains_failed_checks(self) -> None:
+        thresholds = StrategyThresholds(
+            flow_1m_sol=2.5, alert_total_buy_sol=3.0, volume_30m_sol=600.0
+        )
+        row = pd.Series(
+            {
+                "ev_flow_1m": 3.0,
+                "alert_total_buy": 1.0,
+                "pre_vol_30m": 700.0,
+            }
+        )
+        decision = decide(row, thresholds)
+        self.assertFalse(decision.enter)
+        self.assertEqual(decision.failed_checks(), ["alert_total_buy"])
+
+    def test_evaluate_recomputes_return_statistics(self) -> None:
+        features = pd.DataFrame(
+            {
+                "signal_id": ["a", "b", "c"],
+                "is_train": [True, False, False],
+                "ev_flow_1m": [5.0, 5.0, 5.0],
+                "alert_total_buy": [5.0, 5.0, 5.0],
+                "pre_vol_30m": [700.0, 700.0, 700.0],
+            }
+        )
+        outcomes = pd.DataFrame(
+            {
+                "signal_id": ["a", "b", "c", "d"],
+                "horizon_minutes": [5, 5, 5, 5],
+                "status": ["closed"] * 4,
+                "day": ["d1", "d2", "d2", "d2"],
+                "net_return": [0.5, -0.25, 0.0, 9.0],
+                "net_pnl_sol": [0.05, -0.025, 0.0, 0.9],
+            }
+        )
+        thresholds = StrategyThresholds(
+            flow_1m_sol=2.5, alert_total_buy_sol=3.0, volume_30m_sol=600.0
+        )
+        result = evaluate(features, outcomes, thresholds, horizon=5)
+        self.assertEqual(result["n"], 3)
+        self.assertEqual(result["days_positive"], 1)
+        self.assertEqual(result["days_total"], 2)
+        self.assertAlmostEqual(result["win_rate"], 1.0 / 3.0)
+        self.assertAlmostEqual(result["total_net_pnl_sol"], 0.025)
+        self.assertEqual(result["baseline_n"], 4)
 
 
 if __name__ == "__main__":
