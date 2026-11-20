@@ -22,13 +22,13 @@ config.ini
 *.session
 tg_session.session
 
-# Machine-specific data links
+# Machine-specific replay data and links
 replay
+*.jsonl.zst
 
 # Agent state
 .opencode/
 
 # Generated audit artifacts (not source)
 pool_compatibility_candidates_*.csv
-tools/execution_audit/
 *_fills*.csv

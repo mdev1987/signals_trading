@@ -1,8 +1,8 @@
 [project]
-name = "jsonl-ohlcv"
+name = "signals-trading"
 version = "0.1.0"
 description = "Add your description here"
-readme = "README.md"
+readme = "docs/README.md"
 requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.5.4",
@@ -14,7 +14,5 @@ dependencies = [
 ]
 
 [tool.pytest.ini_options]
-# The VectorBT research module is intentionally independent: it has its own uv
-# environment (vectorbt is not a project dependency) and its own test runner.
-# Run it from tools/backtest/vectorbt_research with `uv run python -m pytest`.
-norecursedirs = ["tools/backtest/vectorbt_research"]
+pythonpath = ["src"]
+testpaths = ["src/tests"]
