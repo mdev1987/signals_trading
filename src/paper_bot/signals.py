@@ -36,8 +36,10 @@ SUPPORTED_RULES = (
 RULE_DESCRIPTIONS = {
     "baseline": "every confirmed BUY signal",
     "hot_money_continuation": (
-        "net buying in the 60 s before the alert > 9.46 SOL, alert Total Buy "
-        "> 3 SOL, and prior 30 min volume > 600 SOL; exit after 5 min"
+        "net buying in the 60 s before the alert > 9.46 SOL and alert "
+        "Total Buy > 3 SOL; drops late-in-the-run buys (pre_ret_15m <= 2%) "
+        "from the quality pool when the live feature is available; exit "
+        "after 5 min"
     ),
     "max_pump_gt_1": "signal message says Max Pump > 1x",
     "max_pump_gt_1_pre_ret_ge_6_3": (
@@ -74,10 +76,18 @@ PRE_RET_THRESHOLD = 6.3
 # ``src/ave_hot_money_strategy.py``. The flow cutoff is the train-day q80,
 # fitted once on Oct 3-5 2026; the other two are fixed round floors. Do not
 # retune these on live data.
+#
+# In-sample variant note (2026-11-21, from the 8-day out-of-sample study, see
+# output/backtest/ave_signals/patterns_5m_8d/rule_variants.md): on the new
+# Nov 18-20 days the pre-30m-volume gate halved the mean return and the win
+# rate (OOS mean +28.4% over +51.5% without it, PnL +1.6 vs +12.6 SOL), while
+# it added nothing that later-in-the-run filters did not add. It is therefore
+# not kept; the flow + total-buy gate is the OOS-validated core, and the
+# pre_ret_15m dip overlay below is a separate, optional quality filter.
 DEFAULT_RULE = "hot_money_continuation"
 HOT_MONEY_FLOW_1M_SOL = 9.456
 HOT_MONEY_ALERT_TOTAL_BUY_SOL = 3.0
-HOT_MONEY_PRE_VOL_30M_SOL = 600.0
+HOT_MONEY_DIP_PRE_RET_MAX = 2.0
 
 # Live-derived thresholds (2026-11-17). Across 90 lane-A trades the pre_ret
 # band below ~10 was the loss source in every run, and trades on tokens with
@@ -242,19 +252,23 @@ def _rule_decision(signal: Signal, rule: str) -> tuple[bool, str | None]:
     if rule == "hot_money_continuation":
         flow = _feature(signal, "hist_flow_1m_sol")
         total_buy = _feature(signal, "total_buy_sol")
-        volume_30m = _feature(signal, "hist_pre_vol_30m_sol")
         if flow is None:
             return False, "missing_feature:hist_flow_1m_sol"
         if total_buy is None:
             return False, "missing_feature:total_buy_sol"
-        if volume_30m is None:
-            return False, "missing_feature:hist_pre_vol_30m_sol"
         if flow <= HOT_MONEY_FLOW_1M_SOL:
             return False, "rule_flow_1m_lte_9_456"
         if total_buy <= HOT_MONEY_ALERT_TOTAL_BUY_SOL:
             return False, "rule_total_buy_lte_3"
-        if volume_30m <= HOT_MONEY_PRE_VOL_30M_SOL:
-            return False, "rule_pre_vol_30m_lte_600"
+        # Quality overlay, active only when the live feature is available:
+        # buys still within 2% of the pre-run price won 67.6% on the
+        # out-of-sample days (OOS median +9.2%), while buys that had already
+        # moved the market 15 minutes out mostly lost. When the feature is
+        # absent the gate passes, so stale/live data differences cannot
+        # silently flip decisions.
+        dip = _feature(signal, "hist_pre_ret_15m")
+        if dip is not None and dip > HOT_MONEY_DIP_PRE_RET_MAX:
+            return False, "rule_pre_ret_15m_gt_2"
         return True, None
 
     if rule == "max_pump_gt_1":

@@ -47,6 +47,7 @@ MISSING_STATS: dict[str, Any] = {
     "high_price_sol": None,
     "first_price_sol": None,
     "pre_ret": None,
+    "pre_ret_15m": None,
     "dd_from_high": None,
     "trades_5m": None,
     "signers_5m": None,
@@ -353,8 +354,19 @@ class MarketHistory:
                 "sells_5m": int((~window_actions).sum()),
                 "flow_1m_sol": flow_1m_sol,
                 "pre_vol_30m_sol": pre_vol_30m_sol,
+                "pre_ret_15m": None,
             }
         )
+
+        # Live proxy for the research ``pre_ret_15m`` bar feature: the
+        # last real price strictly before the signal divided by the last
+        # price at or before the 15 minutes before it (side="right" so an
+        # event exactly at the boundary is still in the past window,
+        # mirroring ``past = close <= start_ts`` in the backtester).
+        base_idx = int(np.searchsorted(ts, signal_ts_ms - 900_000, side="right")) - 1
+        last_price = stats.get("last_price_sol")
+        if base_idx >= 0 and last_price and price[base_idx] > 0:
+            stats["pre_ret_15m"] = last_price / float(price[base_idx]) - 1.0
         return stats
 
 

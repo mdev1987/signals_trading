@@ -68,12 +68,11 @@ class HotMoneyGateTests(unittest.TestCase):
     def gate(self, **features: float | None) -> bool:
         return evaluate_gate(signal(features), GateConfig()).allowed
 
-    def test_passes_above_all_three_thresholds(self) -> None:
+    def test_passes_above_flow_and_buy_thresholds(self) -> None:
         self.assertTrue(
             self.gate(
                 hist_flow_1m_sol=9.47,
                 total_buy_sol=3.01,
-                hist_pre_vol_30m_sol=600.1,
             )
         )
 
@@ -81,16 +80,22 @@ class HotMoneyGateTests(unittest.TestCase):
         base = dict(
             hist_flow_1m_sol=20.0,
             total_buy_sol=10.0,
-            hist_pre_vol_30m_sol=2_000.0,
         )
         for key, value in (
             ("hist_flow_1m_sol", 9.456),
             ("total_buy_sol", 3.0),
-            ("hist_pre_vol_30m_sol", 600.0),
         ):
             with self.subTest(key=key):
                 features = {**base, key: value}
                 self.assertFalse(self.gate(**features))
+
+    def test_rejects_late_in_the_run_buys_when_dip_feature_present(self) -> None:
+        base = dict(hist_flow_1m_sol=20.0, total_buy_sol=10.0)
+        for pre_ret, allowed in ((2.0, True), (2.1, False), (-0.05, True)):
+            with self.subTest(pre_ret=pre_ret):
+                self.assertEqual(
+                    self.gate(**base, hist_pre_ret_15m=pre_ret), allowed
+                )
 
     def test_cold_start_is_rejected_with_a_reason(self) -> None:
         decision = evaluate_gate(signal({}), GateConfig())
@@ -146,6 +151,72 @@ class HistoryFeatureTests(unittest.TestCase):
         stats = history.stats(MINT, SIGNAL_TS)
         self.assertAlmostEqual(stats["flow_1m_sol"], 8.0)
         self.assertAlmostEqual(stats["pre_vol_30m_sol"], 12.0)
+
+    def test_pre_ret_15m_is_last_price_over_price_15m_before_signal(self) -> None:
+        history = MarketHistory(horizon_ms=3_600_000)
+        # Base price at/below the signal-15 min boundary.
+        history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=SIGNAL_TS - 1_080_000,
+                event_index=1,
+                action="buy",
+                price_sol=1.0,
+                token_amount=100.0,
+            )
+        )
+        history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=SIGNAL_TS - 950_000,
+                event_index=2,
+                action="buy",
+                price_sol=1.05,
+                token_amount=100.0,
+            )
+        )
+        # An event 15+ minutes before the signal sets the base price.
+        history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=SIGNAL_TS - 300_000,
+                event_index=3,
+                action="buy",
+                price_sol=1.05,
+                token_amount=100.0,
+            )
+        )
+        # The last price strictly before the signal; pushed up to show the
+        # feature follows it rather than staying pinned at the boundary.
+        history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=SIGNAL_TS - 60_000,
+                event_index=4,
+                action="buy",
+                price_sol=1.2,
+                token_amount=100.0,
+            )
+        )
+        stats = history.stats(MINT, SIGNAL_TS)
+        self.assertAlmostEqual(stats["pre_ret_15m"], 1.2 / 1.05 - 1.0)
+
+    def test_pre_ret_15m_is_none_when_no_price_15m_before_signal(self) -> None:
+        history = MarketHistory(horizon_ms=3_600_000)
+        # First observed trade is 10 minutes before the signal: there is no
+        # price at/below the boundary, so the proxy stays None.
+        history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=SIGNAL_TS - 600_000,
+                event_index=1,
+                action="buy",
+                price_sol=1.0,
+                token_amount=100.0,
+            )
+        )
+        stats = history.stats(MINT, SIGNAL_TS)
+        self.assertIsNone(stats["pre_ret_15m"])
 
 
 class LiveGuardTests(unittest.TestCase):
