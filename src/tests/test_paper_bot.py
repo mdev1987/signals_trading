@@ -20,6 +20,7 @@ from paper_bot.execution import (  # noqa: E402
     LiveExecutionError,
     LiveQuoteProvider,
     LiveSolanaExecutor,
+    jupiter_error_reason,
     live_config_from_env,
 )
 from paper_bot.history import MarketHistory  # noqa: E402
@@ -307,6 +308,58 @@ class LiveGuardTests(unittest.TestCase):
         with self.assertRaises(LiveExecutionError) as caught:
             executor._key()
         self.assertNotIn(secret, caught.exception.detail or "")
+
+    def test_config_accepts_priority_fee_and_jito_tip(self) -> None:
+        config = LiveExecutionConfig(
+            enabled=True,
+            private_key="unused-for-guard",
+            priority_fee_lamports=2000,
+            jito_tip_lamports=10000,
+        )
+        self.assertEqual(config.priority_fee_lamports, 2000)
+        self.assertEqual(config.jito_tip_lamports, 10000)
+
+    def test_config_rejects_negative_fees(self) -> None:
+        with self.assertRaises(ValueError):
+            LiveExecutionConfig(
+                enabled=True,
+                private_key="unused-for-guard",
+                priority_fee_lamports=-1,
+            )
+        with self.assertRaises(ValueError):
+            LiveExecutionConfig(
+                enabled=True,
+                private_key="unused-for-guard",
+                jito_tip_lamports=-1,
+            )
+
+
+class JupiterErrorReasonTests(unittest.TestCase):
+    def test_error_code_1_is_insufficient_funds(self) -> None:
+        self.assertEqual(
+            jupiter_error_reason(1), "live_insufficient_funds"
+        )
+
+    def test_error_code_2_is_insufficient_sol_for_gas(self) -> None:
+        self.assertEqual(
+            jupiter_error_reason(2), "live_insufficient_sol_for_gas"
+        )
+
+    def test_error_code_3_is_below_gasless_min(self) -> None:
+        self.assertEqual(
+            jupiter_error_reason(3), "live_swap_below_gasless_min"
+        )
+
+    def test_unknown_code_falls_back_to_no_transaction(self) -> None:
+        self.assertEqual(
+            jupiter_error_reason(99), "live_order_no_transaction"
+        )
+        self.assertEqual(
+            jupiter_error_reason(None), "live_order_no_transaction"
+        )
+        self.assertEqual(
+            jupiter_error_reason("not-a-number"), "live_order_no_transaction"
+        )
 
 
 class _FakeExecutor:

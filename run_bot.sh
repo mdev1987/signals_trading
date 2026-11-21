@@ -65,6 +65,8 @@ exec "$VENV" -m paper_bot live \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --slippage-bps 50 \
+  --priority-fee-lamports 2000 \
+  --jito-tip-lamports 10000 \
   --fee 0.0125 \
   --history-horizon-min 35 \
   --history-max-mints 10000 \

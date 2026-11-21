@@ -46,6 +46,39 @@ LAMPORTS_PER_SOL = 1_000_000_000
 LIVE_QUOTE_SOURCE = "jupiter_live"
 
 
+def jupiter_error_reason(error_code: object, error_message: str = "") -> str:
+    """Map a Jupiter /order ``errorCode`` to a stable reason string.
+
+    From the Jupiter Swap API V2 docs (swap/v2 /order): when ``taker`` is
+    defined and ``transaction`` is empty, ``errorCode`` is present:
+
+    Aggregator routers (metis, dflow, okx):
+      - 1: Insufficient funds
+      - 2: Insufficient SOL for gas
+      - 3: Swap below minimum for gasless
+
+    JupiterZ router:
+      - 1: Insufficient balance to fund the swap
+      - 2: Missing associated token account
+      - 3: Quote could not be built into a transaction
+
+    Unknown codes fall back to ``live_order_no_transaction``.
+    """
+    if error_code is None:
+        return "live_order_no_transaction"
+    try:
+        code = int(error_code)
+    except (TypeError, ValueError):
+        return "live_order_no_transaction"
+    if code == 1:
+        return "live_insufficient_funds"
+    if code == 2:
+        return "live_insufficient_sol_for_gas"
+    if code == 3:
+        return "live_swap_below_gasless_min"
+    return "live_order_no_transaction"
+
+
 class LiveExecutionError(QuoteError):
     """A live order failed before or during broadcast."""
 
@@ -64,6 +97,11 @@ class LiveExecutionConfig:
     allowlist: frozenset[str] = frozenset()
     timeout_s: float = 30.0
     retries: int = 2
+    # Priority fee (lamports) and Jito MEV tip (lamports) help transactions
+    # land faster during volatile pump launches, reducing entry slippage.
+    # Set to 0 to let Jupiter determine fees automatically.
+    priority_fee_lamports: int = 0
+    jito_tip_lamports: int = 0
 
     def __post_init__(self) -> None:
         if self.slippage_bps < 0 or self.slippage_bps > 10_000:
@@ -74,6 +112,10 @@ class LiveExecutionConfig:
             raise ValueError(
                 "live mode requires SOLANA_PRIVATE_KEY (base58 secret key)"
             )
+        if self.priority_fee_lamports < 0:
+            raise ValueError("priority_fee_lamports must be non-negative")
+        if self.jito_tip_lamports < 0:
+            raise ValueError("jito_tip_lamports must be non-negative")
 
 
 @dataclass(slots=True)
@@ -99,6 +141,8 @@ def live_config_from_env(
     enabled: bool,
     slippage_bps: int,
     max_notional_sol: float,
+    priority_fee_lamports: int = 0,
+    jito_tip_lamports: int = 0,
 ) -> LiveExecutionConfig:
     """Build a live config from ``.env``/environment values.
 
@@ -125,6 +169,10 @@ def live_config_from_env(
         allowlist=allowlist,
         timeout_s=float(get("LIVE_HTTP_TIMEOUT_S", "30") or 30),
         retries=int(get("LIVE_HTTP_RETRIES", "2") or 2),
+        priority_fee_lamports=int(
+            get("LIVE_PRIORITY_FEE_LAMPORTS", "0") or 0
+        ),
+        jito_tip_lamports=int(get("LIVE_JITO_TIP_LAMPORTS", "0") or 0),
     )
 
 
@@ -200,6 +248,14 @@ class LiveSolanaExecutor:
     async def _order(self, params: dict[str, str], *, action: str) -> dict[str, Any]:
         _, taker = self._key()
         params = {**params, "taker": taker}
+        # Jupiter /order params that improve landing speed and efficiency
+        # during volatile pump launches.
+        if self.priority_fee_lamports > 0:
+            params["priorityFeeLamports"] = str(self.priority_fee_lamports)
+        if self.jito_tip_lamports > 0:
+            params["jitoTipLamports"] = str(self.jito_tip_lamports)
+        # Request v1 transactions when supported (more efficient, smaller).
+        params["maxSupportedTransactionVersion"] = "1"
         client = self._client_or_create()
         headers = {"x-api-key": self.config.api_key} if self.config.api_key else {}
         last_error: QuoteError | None = None
@@ -221,9 +277,14 @@ class LiveSolanaExecutor:
                         last_error = LiveExecutionError("live_order_json", str(exc))
                     else:
                         if not payload.get("transaction"):
+                            error_code = payload.get("errorCode")
+                            error_msg = payload.get("error") or payload.get(
+                                "errorMessage", ""
+                            )
+                            reason = jupiter_error_reason(error_code, error_msg)
                             last_error = LiveExecutionError(
-                                "live_order_no_transaction",
-                                str(payload.get("error") or payload.get("errorMessage")),
+                                reason,
+                                f"{error_msg} (errorCode={error_code})",
                             )
                         else:
                             payload["_latency_ms"] = int(

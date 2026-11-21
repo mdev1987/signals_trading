@@ -123,6 +123,18 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--slippage-bps", type=int, default=50)
+    parser.add_argument(
+        "--priority-fee-lamports",
+        type=int,
+        default=0,
+        help="Priority fee in lamports for live execution (faster landing during volatility)",
+    )
+    parser.add_argument(
+        "--jito-tip-lamports",
+        type=int,
+        default=0,
+        help="Jito MEV tip in lamports for live execution (faster block inclusion)",
+    )
     parser.add_argument("--entry-delay-ms", type=int, default=5_000)
     parser.add_argument("--max-entry-delay-ms", type=int, default=120_000)
     parser.add_argument("--safety-screen", action="store_true")
@@ -333,6 +345,8 @@ def main() -> int:
             preflight_exit_route=not args.no_preflight_exit,
             exit_fallback_feed=args.exit_fallback_feed,
             slippage_bps=args.slippage_bps,
+            priority_fee_lamports=args.priority_fee_lamports,
+            jito_tip_lamports=args.jito_tip_lamports,
             entry_delay_ms=args.entry_delay_ms,
             max_entry_delay_ms=args.max_entry_delay_ms,
             safety_screen=args.safety_screen,
