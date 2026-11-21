@@ -42,18 +42,18 @@ close more than 60 s old.
 From the repository root:
 
 ```bash
-.venv/bin/python src/backtest_ave_signals.py
+uv run python src/backtest_ave_signals.py
 ```
 
 Useful options:
 
 ```bash
 # one day, finer horizons
-.venv/bin/python src/backtest_ave_signals.py \
+uv run python src/backtest_ave_signals.py \
   --days 2026-11-08 --horizons 1 3 5 15 30
 
 # drop mints with any flagged candle-range anomaly that day
-.venv/bin/python src/backtest_ave_signals.py \
+uv run python src/backtest_ave_signals.py \
   --exclude-flagged-mints --output-dir output/backtest/ave_signals_unflagged
 ```
 
@@ -101,12 +101,12 @@ consistently profitable. Two exploratory scripts test this out of sample:
 
 ```bash
 # 1. PIT-safe feature table + train/holdout screens (writes patterns/)
-.venv/bin/python src/analyze_ave_signal_patterns.py
-.venv/bin/python src/analyze_ave_signal_patterns.py --horizon 5 \
+uv run python src/analyze_ave_signal_patterns.py
+uv run python src/analyze_ave_signal_patterns.py --horizon 5 \
   --output-dir output/backtest/ave_signals/patterns_5m
 
 # 2. interpretable rules, threshold grid, placebo test
-.venv/bin/python src/ave_signal_pattern_rules.py
+uv run python src/ave_signal_pattern_rules.py
 ```
 
 Every feature is cut off at the entry decision (`signal_timestamp_ms +
@@ -118,13 +118,14 @@ threshold. `patterns/features.csv` is one row per signal.
 ### The rule
 
 ```text
-ev_flow_1m      > 9.5 SOL   # train q80 of net buys-minus-sells in the prior minute
+ev_flow_1m      > 9.456 SOL # train q80 of net buys-minus-sells in the prior minute
 alert_total_buy > 3 SOL     # buy size printed in the Telegram alert
 pre_vol_30m     > 600 SOL   # 30-minute traded volume
 ```
 
 It selects **74 of 680 priceable signals (10.9 %)** and is best used with a
-**5-minute exit**. At that horizon:
+**5-minute exit**. At that horizon (677 of the 680 signals have a 5 m outcome;
+three lack a usable exit bar):
 
 | | Baseline | Rule |
 | --- | ---: | ---: |
@@ -140,8 +141,9 @@ It selects **74 of 680 priceable signals (10.9 %)** and is best used with a
 
 The rule keeps only a tenth of the alerts but captures **33.9 % of all 5 m 2×+
 winners** and 30.9 % of the top 5 m decile. It is a short-horizon continuation
-pattern: the median is still positive at 15 m, but by 30 m it is −41 % with a
-16 % rug rate. Holding longer destroys the edge.
+pattern: the rule subset's median return falls to roughly break-even at 15 m
+(the all-signal baseline median at 15 m is −28.4 %), and by 30 m it is −41 %
+with a 16 % rug rate. Holding longer destroys the edge.
 
 The exact 5 m numbers by day (all five positive):
 
@@ -202,8 +204,8 @@ rug filter, is the selection rule.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest src.tests.test_backtest_ave_signals -v
-.venv/bin/python -m unittest src.tests.test_ave_signal_patterns -v
+uv run python -m unittest src.tests.test_backtest_ave_signals -v
+uv run python -m unittest src.tests.test_ave_signal_patterns -v
 ```
 
 The tests pin the decision-timestamp pricing rules, the two-sided fee formula,

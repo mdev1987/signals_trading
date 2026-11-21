@@ -214,8 +214,6 @@ async def run(args: argparse.Namespace) -> int:
     days = discover_days(replay_root, args.days or None)
     channels = load_channels(Path(args.channels_file))
     config = Path(args.config)
-    if not config.exists():
-        raise FileNotFoundError(f"Telegram config not found: {config}")
 
     print(f"replay root : {replay_root}")
     print(f"days        : {', '.join(name for name, _ in days)}")
@@ -225,6 +223,9 @@ async def run(args: argparse.Namespace) -> int:
             start, end = replay_window(day_dir)
             print(f"  {name}: {start.isoformat()} -> {end.isoformat()}")
         return 0
+
+    if not config.exists():
+        raise FileNotFoundError(f"Telegram config not found: {config}")
 
     for name, day_dir in days:
         report = await fetch_day(

@@ -16,7 +16,7 @@ At the entry decision (`signal_timestamp_ms + 5 s`), enter only when all three
 conditions hold:
 
 ```text
-ev_flow_1m      > 9.46 SOL   # train-day q80 net buys-minus-sells, prior minute
+ev_flow_1m      > 9.456 SOL  # train-day q80 net buys-minus-sells, prior minute
 alert_total_buy > 3 SOL      # "Total Buy" printed in the Telegram alert
 pre_vol_30m     > 600 SOL    # prior 30-minute traded volume
 ```
@@ -24,7 +24,7 @@ pre_vol_30m     > 600 SOL    # prior 30-minute traded volume
 Exit after **5 minutes**. One fixed stake per signal (the validation uses
 0.1 SOL and 1.25 % per side).
 
-The 9.46 SOL flow cutoff is the 80th percentile of `ev_flow_1m` on the train
+The 9.456 SOL flow cutoff is the 80th percentile of `ev_flow_1m` on the train
 days. It is fitted from data; the other two floors are round, interpretable
 values. The threshold-fitting code only ever reads `is_train` rows.
 
@@ -76,9 +76,10 @@ Per day:
 The rule keeps a tenth of the alerts but captures **33.9 % of all 5 m 2×+
 winners** and 30.9 % of the top 5 m decile.
 
-The edge decays with holding time: the median is still near zero at 15 m and
-−41 % at 30 m with a 16 % rug rate. A 5-minute exit is the best mean/median
-compromise; 1–3 minutes has a higher win rate and lower variance.
+The edge decays with holding time: the rule subset's median return falls to
+roughly break-even at 15 m (the all-signal baseline median at 15 m is −28.4 %)
+and to −41 % at 30 m with a 16 % rug rate. A 5-minute exit is the best
+mean/median compromise; 1–3 minutes has a higher win rate and lower variance.
 
 ## Robustness
 
@@ -95,14 +96,14 @@ compromise; 1–3 minutes has a higher win rate and lower variance.
 
 ```bash
 # canonical rule + re-computed validation
-.venv/bin/python src/ave_hot_money_strategy.py
+uv run python src/ave_hot_money_strategy.py
 
 # machine-readable
-.venv/bin/python src/ave_hot_money_strategy.py --json
+uv run python src/ave_hot_money_strategy.py --json
 
 # rebuild the exploratory evidence (needs the local dataset)
-.venv/bin/python src/analyze_ave_signal_patterns.py
-.venv/bin/python src/ave_signal_pattern_rules.py
+uv run python src/analyze_ave_signal_patterns.py
+uv run python src/ave_signal_pattern_rules.py
 ```
 
 `src/ave_hot_money_strategy.py` re-computes the headline statistics from the saved

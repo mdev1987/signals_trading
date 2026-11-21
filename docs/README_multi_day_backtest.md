@@ -40,8 +40,8 @@ Telegram ──► src/fetch_signals.py ──► src/prepare_signal_inputs.py �
 
 The canonical artifacts stay in their original formats:
 
-- `replay/` — read-only source archives (`/mnt/HDD/PumpAPI_Replay_Zst`, 5 day
-  directories, 128 files, 68 GiB). Never modified.
+- `replay/` — read-only source archives (`/mnt/HDD/PumpAPI_Replay_Zst`, local
+  research-machine path, 5 day directories, 128 files, 68 GiB). Never modified.
 - `output/backtest/days/<day>/replay_filtered/target_mints_events.jsonl.zst` —
   filtered stream, still plain JSONL + zstd. This is what the simulator reads.
 - `output/backtest/days/<day>/ohlcv/ohlcv_1m.csv` — the audit pipeline's
@@ -316,7 +316,16 @@ exit was attempted) and marked to market:
 - `open_exit_failed` rows keep the rejection reason in `note`.
 
 Equity = cash + Σ(tokens × mark). `unrealized_pnl_sol` is reported separately
-from `realized_pnl_sol`, and `equity_end_sol` uses both.
+from `realized_pnl_sol`, and `equity_end_sol` uses both. Because
+`unrealized_pnl_sol = mark_value − stake_sol`, the open position's stake stays
+inside equity, so the identity is:
+
+```text
+equity = start_sol + realized_pnl_sol + unrealized_pnl_sol + open_position_stake
+```
+
+For example, 2026-08-09 is `10 − 1.438 − 0.290 + 1.0 = 9.272`. Without the
+open-stake term the Realized/Unrealized columns will not add up to Return.
 
 ### 5.2 Outputs
 
@@ -363,7 +372,8 @@ Interpretation, from `trades.csv` across the 336 closed trades:
 - fees are 1.9% of stake at the median (3.8% mean), and price impact is
   ~10 bps entry / ~7 bps exit at the median on 0.1 SOL — small relative to the
   price move;
-- win rate 24–31% per day, and no day is profitable at a 30 min horizon.
+- win rate 24–31 % on the four days with wins, and 0 % on 2026-08-09 (6 closed,
+  0 wins); no day is profitable at a 30 min horizon.
 
 These are paper results on a 0.1 SOL size. Nothing here says the signal cannot
 work with a different hold, a momentum filter, or adaptive sizing; it says that
@@ -573,8 +583,14 @@ paths. Re-running a dataset stage is cheap with `--skip-filter --skip-ohlcv`
 
 ```bash
 uv run --with pytest pytest -q
-ruff check . --exclude .venv
+uv run --with ruff ruff check . --exclude .venv
 ```
+
+`pytest` and `ruff` are declared in the `dev` dependency group in
+`pyproject.toml`, so `uv sync --group dev` installs them. The lint gate is
+configured in `[tool.ruff.lint]` and selects `E4`, `E7`, `E9` and `F`
+(syntax, undefined names, unused imports/variables); run `ruff check` without
+that config to see the optional style rules.
 
 Relevant suites:
 
@@ -588,6 +604,6 @@ Relevant suites:
 - `test_filter_replay.py`, `test_verify_backtest_dataset.py` — legacy
   normalisation and verification gates.
 
-`src/shard_filtered_replay.py` retains two pre-existing unused-import
-ruff errors from the earlier sharding work; they are not part of this pipeline
-and are left untouched.
+`src/shard_filtered_replay.py` has a few style-only findings under the optional
+broader rule set (for example `TRY004` and `SIM102`); they are not part of this
+pipeline and are outside the default lint gate.

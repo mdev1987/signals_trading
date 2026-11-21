@@ -1,6 +1,6 @@
 # Point-in-Time Universe Dataset Builder v7.2.1
 
-This package extends the v7.0 Point-in-Time VectorBT dataset with a separate, auditable Pool Selection Timeline. The raw JSONL-to-OHLCV pipeline remains numerically unchanged; it also passes the selected pool protocol (`pool`), quote mint (`quote_mint`), and virtual reserve components (`virtual_tokens_in_pool`, `virtual_quote_in_pool`) through each real candle for downstream routing. Pool metadata is mandatory for validation, and the timeline now records the reserve model and whether the execution simulator can route each row.
+This package extends the v7.0 Point-in-Time VectorBT dataset with a separate, auditable Pool Selection Timeline. The raw JSONL-to-OHLCV values remain bit-identical; the pipeline additionally passes the selected pool protocol (`pool`), quote mint (`quote_mint`), and virtual reserve components (`virtual_tokens_in_pool`, `virtual_quote_in_pool`) through each real candle for downstream routing. Pool metadata is mandatory for validation, and the timeline now records the reserve model and whether the execution simulator can route each row.
 
 ## What changed
 
@@ -148,9 +148,9 @@ Filled candles are excluded from this timeline: a carried-forward `pool_id` is n
 
 ```text
 src/            source modules, the Telegram bot, and the on-chain feature package
-src/tests/      unittest suite
+src/tests/      pytest/unittest suite
 docs/           method and experiment documentation
-pyproject.toml  project metadata and test paths
+pyproject.toml  project metadata, test paths, and lint config
 oxfile.toml     oxmgr deployment for the Telegram listener
 ```
 
@@ -159,6 +159,14 @@ Telegram sessions, and replay archives (`replay/`, `*.jsonl.zst`) are gitignored
 The replay examples below assume a local `05.jsonl.zst` or the `replay/` tree.
 
 ## Run tests
+
+```bash
+uv run --with pytest pytest -q
+uv run --with ruff ruff check . --exclude .venv
+```
+
+`pytest` and `ruff` are in the `dev` dependency group (`uv sync --group dev`).
+The `unittest` runner also works:
 
 ```bash
 uv run python -m unittest discover -s src/tests -t src -p 'test_*.py' -v
@@ -247,10 +255,11 @@ Two execution modes share the same state machine and accounting:
 | `paper` | Jupiter `GET /order` without a taker | never | none |
 | `live` | Jupiter `GET /order` with the wallet taker | Jupiter `POST /execute` | `--mode live` **and** `LIVE_TRADING_ENABLED=1` |
 
-Live mode is single-lane (no A/B), caps every entry at `--notional-sol`, can
-restrict mints with `LIVE_MINT_ALLOWLIST`, and books the executed amounts as-is
-(the on-chain swap already paid its own fee and slippage). Paper runs use the
-research cost model: `--fee 0.0125 --slippage 0`.
+Live mode is single-lane (no A/B), uses `--notional-sol` as the per-trade size
+(the executor's `max_notional_sol` is set from it, so it is not a separate
+cap), can restrict mints with `LIVE_MINT_ALLOWLIST`, and books the executed
+amounts as-is (the on-chain swap already paid its own fee and slippage). Paper
+runs use the research cost model: `--fee 0.0125 --slippage 0`.
 
 ```bash
 # Paper: quotes only, safe default
@@ -266,8 +275,17 @@ PYTHONPATH=src uv run python -m paper_bot quote --mint <MINT> --notional-sol 0.1
 PYTHONPATH=src uv run python -m paper_bot report output/paper_runs/<run>
 ```
 
-`oxfile.toml` deploys the paper lane with the same rule and horizon. To move
-the deployed app to live execution, change `--mode paper` to `--mode live` and
-add the live keys to the app environment. Secrets stay in `.env`, `config.ini`,
+`oxfile.toml` deploys the paper lane with the same rule and horizon. Setup
+before the first import:
+
+```bash
+uv sync --group dev
+cp .env.example .env                 # Jupiter key + reporting bot token
+cp config.ini.example config.ini    # Telethon api_id/api_hash/phone
+env PYTHONPATH=src .venv/bin/python -m paper_bot login
+```
+
+To move the deployed app to live execution, change `--mode paper` to `--mode live`
+and add the live keys to the app environment. Secrets stay in `.env`, `config.ini`,
 and the Telethon session file; all three are gitignored.
 

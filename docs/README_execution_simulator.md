@@ -1,17 +1,26 @@
-# Execution Simulator v1.1
+# Execution Simulator v7.2.1
 
-A first-pass historical, event-driven execution simulator for SOL-quoted PumpAPI pools. It reads the original PumpAPI JSONL or Zstandard JSONL event stream directly. It does not require or read `trades.parquet`.
+A historical, event-driven execution simulator for PumpAPI pools. It reads the original PumpAPI JSONL or Zstandard JSONL event stream directly. It does not require or read `trades.parquet`.
 
 ## Supported pool models
 
-| Pool | Reserve fields | Status |
+| Pool | Reserve fields | Reserve model |
 |---|---|---|
-| `pump` | `vTokensInBondingCurve`, `vQuoteInBondingCurve` | Supported as a virtual-reserve constant-product bonding curve |
-| `pump-amm` (virtual quote) | `tokensInPool`, `quoteInPool`, `virtualQuoteInPool` | Supported constant-product AMM using effective quote reserves |
-| `pump-amm` (virtual tokens) | `tokensInPool`, `quoteInPool`, `virtualTokensInPool` | Supported constant-product AMM using effective token reserves |
-| Other pool types | Protocol-specific reserves and/or curve data | Rejected as unsupported |
+| `pump` | `vTokensInBondingCurve`, `vQuoteInBondingCurve` | `bonding_curve` (virtual-reserve constant product) |
+| `raydium-launchpad` | `vTokensInBondingCurve`, `vQuoteInBondingCurve` | `bonding_curve` (virtual-reserve constant product) |
+| `pump-amm` (virtual quote) | `tokensInPool`, `quoteInPool`, `virtualQuoteInPool` | `amm_virtual_quote` |
+| `pump-amm` (virtual tokens) | `tokensInPool`, `quoteInPool`, `virtualTokensInPool` | `amm_virtual_tokens` |
+| `raydium-cpmm` | `tokensInPool`, `quoteInPool` | `amm_vault` (vault constant product) |
+| `meteora-damm-v2` | `tokensInPool`, `quoteInPool` | `amm_vault` (vault constant product) |
+| `meteora-launchpad` | `tokensInPool`, `quoteInPool`, plus `price` | `launchpad_linear_curve` (price linear in quote raised) |
+| Concentrated liquidity (`raydium-clmm`, `meteora-dlmm`, `orca-whirlpool`) | Active-tick depth, not the reported vault | Rejected as `unsupported_concentrated_liquidity` |
+| Any other pool | — | Rejected as `unsupported_pool_model` |
 
-Only WSOL-quoted pools are supported. USDC and other quote mints are rejected rather than silently treating their amounts as SOL.
+Concentrated-liquidity venues report a vault balance unrelated to the depth inside the active tick range, so they are rejected rather than silently approximated.
+
+### Quote mints
+
+WSOL-quoted pools are used directly. For a non-WSOL pool the simulator converts quote amounts to SOL using the event's `quotePriceSol` oracle value (see `QuoteState.quote_price_sol`); a non-WSOL pool with no `quotePriceSol` is rejected rather than treating its amounts as SOL. `resolve_pool` prefers a WSOL-quoted candidate and only falls back to a non-WSOL one when no WSOL pool is available. See `docs/README_multi_day_backtest.md` for the routing rules.
 
 Pump AMM pools use exactly one virtual reserve style, so the two are mutually exclusive:
 
@@ -22,7 +31,7 @@ virtual token style:  effective_quote_reserve = quoteInPool
                       effective_token_reserve = tokensInPool + virtualTokensInPool
 ```
 
-Both styles reproduce the feed's reported price exactly. Signed virtual values are accepted; `virtualTokensInPool` is typically negative. A snapshot with both virtual components non-zero is rejected as `ambiguous_virtual_reserves`, and a snapshot with neither is rejected as `missing_amm_reserves` rather than silently falling back to vault reserves. Each fill reports the detected `reserve_model` (`bonding_curve`, `amm_virtual_quote`, or `amm_virtual_tokens`).
+Both styles reproduce the feed's reported price exactly. Signed virtual values are accepted; `virtualTokensInPool` is typically negative. A snapshot with both virtual components non-zero is rejected as `ambiguous_virtual_reserves`, and a snapshot with neither is rejected as `missing_amm_reserves` rather than silently falling back to vault reserves. Each fill reports the detected `reserve_model` (`bonding_curve`, `amm_virtual_quote`, `amm_virtual_tokens`, `amm_vault`, or `launchpad_linear_curve`).
 
 ## Order input
 
@@ -39,7 +48,7 @@ timestamp_ms,mint,pool_id,side,amount
 - `side=sell`: `amount` is the number of tokens offered for sale.
 - `pool_id` must be selected using information available at the decision time. Do not select a pool using a future candle.
 - When using `pool_selection_timeline.csv`, join by mint and choose the latest row with `available_at_timestamp_ms <= timestamp_ms` (the order execution time). The timeline selection for a candle is only known at that candle's close, not at its start.
-- Prefer rows where `execution_supported == 1`. That flag means the row has ready pool metadata, is WSOL-quoted, and uses a reserve model this simulator implements. Rows with `pool_selection_status != ready`, a non-WSOL `quote_mint`, or `execution_supported == 0` will be rejected or misrouted; the simulator does not convert non-WSOL quote reserves into SOL.
+- Prefer rows where `execution_supported == 1`. That flag means the row has ready pool metadata (`pool_selection_status == ready`) and uses a reserve model this simulator implements. Rows with `pool_selection_status != ready`, a negative virtual-token reserve, or `execution_supported == 0` will be rejected. A non-WSOL `quote_mint` is supported when the event carries `quotePriceSol`; without it the order is rejected rather than treating the amount as SOL.
 - Amounts use the human-readable units used by PumpAPI events: SOL for WSOL quote amounts and token units for token amounts.
 
 ## Run
@@ -101,7 +110,7 @@ The 19 SELL orders previously missing from the reject total are explicit `insuff
 
 1. The simulator streams source events in timestamp order.
 2. It uses the latest valid snapshot with `event_timestamp < execution_timestamp`. Events at the exact same millisecond as the order are excluded to avoid ambiguous ordering and look-ahead.
-3. It requires positive effective reserves and an explicit `poolFeeRate` in the range `[0, 1)`.
+3. It requires positive effective reserves and an explicit all-in route fee rate (`solRouteFeeRate`, falling back to `poolFeeRate` for pre-2026-11 archives) in the range `[0, 1)`. The pool-level `poolFeeRate` is used for the pool-fee component when present.
 4. For buys, `amount` is the gross quote budget. The modeled fee is deducted from that budget, and the remainder is the curve input: `curve_quote = amount * (1 - fee_rate)`. The fee is charged in the quote asset.
 5. For sells, the curve calculates gross quote output first, then the modeled fee is deducted from proceeds. This is the same fee-in-quote convention as buys.
 6. Price impact is reported separately from the modeled pool fee. The output average price includes the fee.

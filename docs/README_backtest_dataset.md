@@ -1,5 +1,13 @@
 # Backtest Dataset: Filtered Replay and Multi-Hour OHLCV
 
+> **Superseded (single-period 2026-11-08 stage).** The pipeline below is the
+> original single-period layout. The current multi-day pipeline nests each day
+> under `<dataset-root>/<day>/` (for example
+> `output/backtest/days/2026-11-08/replay_filtered/target_mints_events.jsonl.zst`
+> and `output/backtest/signals/2026-11-08/strategy_signals.csv`); see
+> `docs/README_multi_day_backtest.md` for the five-day rerun, schema drift,
+> routing, pool coverage, execution/marking rules and strategy results.
+
 This stage turns the 32 hourly PumpAPI replay archives into a small, reproducible
 dataset that a strategy backtest can run against without loading the full replay.
 
@@ -7,7 +15,7 @@ Entry signal: `2nd Vibe Buy Signal` on Solana, timestamped by the Telegram
 message. Execution is simulated later against the event stream with the
 configured latency.
 
-> **See also:** `src/README_multi_day_backtest.md` for the five-day
+> **See also:** `docs/README_multi_day_backtest.md` for the five-day
 > rerun (schema drift, routing, pool coverage, execution/marking rules and
 > strategy results). This document covers the original single-period 11-08
 > dataset stage.

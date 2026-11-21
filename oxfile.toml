@@ -29,14 +29,14 @@ version = 1
 # --notional-sol.
 #
 # One-time setup:
-#   cd /home/mdev/Programming/signals_trading_vector
+#   cd /home/mdev/Programming/signals_trading
 #   uv sync                              # .venv with bot dependencies
 #   cp .env.example .env                 # Jupiter key + reporting bot token
 #   cp config.ini.example config.ini     # Telethon api_id/api_hash/phone
-#   .venv/bin/python -m paper_bot login  # needs PYTHONPATH=src, once, TTY
+#   env PYTHONPATH=src .venv/bin/python -m paper_bot login  # once, TTY
 #
 # Then:
-#   oxmgr apply ./oxfile.toml
+#   oxmgr import ./oxfile.toml
 #   oxmgr logs paper-bot -f
 #   oxmgr status paper-bot
 
@@ -45,8 +45,8 @@ name = "paper-bot"
 # The package lives under `src/`, so PYTHONPATH is set here instead of
 # installing the research repo as a wheel. `--no-sync` is unnecessary because
 # this runs the venv directly, so a restart never touches the network.
-command = "env PYTHONPATH=/home/mdev/Programming/signals_trading_vector/src /home/mdev/Programming/signals_trading_vector/.venv/bin/python -m paper_bot live --mode paper --rule hot_money_continuation --entry-mode timer --horizon-min 5 --fee 0.0125 --slippage 0 --notional-sol 0.1 --history-horizon-min 35 --history-max-total-events 150000 --history-max-events-per-mint 3000 --history-max-mints 10000 --memory-limit-mb 550"
-cwd = "/home/mdev/Programming/signals_trading_vector"
+command = "env PYTHONPATH=/home/mdev/Programming/signals_trading/src /home/mdev/Programming/signals_trading/.venv/bin/python -m paper_bot live --mode paper --rule hot_money_continuation --entry-mode timer --horizon-min 5 --fee 0.0125 --slippage 0 --notional-sol 0.1 --history-horizon-min 35 --history-max-total-events 150000 --history-max-events-per-mint 3000 --history-max-mints 10000 --memory-limit-mb 550"
+cwd = "/home/mdev/Programming/signals_trading"
 restart_policy = "always"
 max_restarts = 100
 # Stop after 5 crash-restarts inside 5 minutes instead of hot-looping.
@@ -61,7 +61,7 @@ unified_logs = true
 PATH = "/home/mdev/.local/bin:/usr/local/bin:/usr/bin:/bin"
 HOME = "/home/mdev"
 PYTHONUNBUFFERED = "1"
-PAPER_BOT_HOME = "/home/mdev/Programming/signals_trading_vector"
+PAPER_BOT_HOME = "/home/mdev/Programming/signals_trading"
 PAPER_BOT_LOG_LEVEL = "INFO"
 # Fail closed: live execution needs an explicit operator opt-in.
 LIVE_TRADING_ENABLED = "0"

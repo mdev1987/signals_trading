@@ -13,9 +13,7 @@ The original extraction report has `passed=false` because its broad regex counte
 
 ## Install
 
-Copy `src/shard_filtered_replay.py` into:
-
-`src/shard_filtered_replay.py`
+The tool is part of the repository at `src/shard_filtered_replay.py` and runs in place; no copy is required.
 
 ## Run
 

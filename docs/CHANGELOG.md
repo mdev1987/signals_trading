@@ -1,3 +1,9 @@
+# Changelog
+
+Historical release notes live here. The filename predates the first release
+entry (`v7.2.1`) and is kept for continuity; future releases should add
+entries to this file.
+
 # v7.2.1 — Same-Millisecond and Routing Guard Fixes
 
 ## Fixed
@@ -14,7 +20,7 @@
 
 ## Validation
 
-- Full unit test suite: 82/82 passed.
+- Full unit test suite at this release: 82/82 passed.
 - Real full-hour rebuild and candidate integration re-run: routing invariant holds (no unsupported row fills; no supported row fails with a reserve-model error). The 34 order-time `unsupported_pool` rejects on supported rows now report `shadow_reserve_became_non_positive` instead of an empty reason.
 
 ## Real-Data Candidate Audit Reconciliation
@@ -53,7 +59,7 @@
 
 ## Validation
 
-- Full unit test suite: 77/77 passed.
+- Full unit test suite at this release: 77/77 passed.
 - Real full-hour rebuild: `05.jsonl.zst` (1,907,859 events) regenerated to 112,388 one-minute rows, 44,837 real bars, and a 44,837-row pool timeline with every validation check at zero.
 - Real candidate integration: 8,525 candidate rows. Of these, 1,183 bars are `amm_virtual_tokens` and now fill in the simulator; 1,223 buy and 886 sell orders still reject with `missing_amm_reserves`, and every one of them is `execution_supported == 0`.
 - Routing invariant verified on real orders: no `execution_supported == 0` row fills, and no `execution_supported == 1` row fails with a reserve-model error.
