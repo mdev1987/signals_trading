@@ -576,19 +576,37 @@ class PipelineTests(unittest.TestCase):
             with open(input_path, "wb") as handle:
                 handle.write(b"stub")
 
-            def fake_read_file(path, start_idx, stats):
+            def fake_read_frame(path, start_idx, stats):
                 stats["lines_scanned"] = len(raw_rows)
-                return raw_rows, start_idx + len(raw_rows)
+                padded = [
+                    list(row) + [None] * max(0, len(pipeline.ROW_COLS) - len(row))
+                    for row in raw_rows
+                ]
+                return (
+                    pd.DataFrame(padded, columns=pipeline.ROW_COLS),
+                    start_idx + len(padded),
+                )
 
             argv = [
                 "raw_to_clean_ohlcv.py", input_path, "-o", outdir,
                 "-t", "1m", "--fill", "--price-consistency-ratio", "5.0",
                 "--candle-range-ratio", "10.0",
             ]
-            with mock.patch.object(pipeline, "read_file", side_effect=fake_read_file):
-                with mock.patch.object(sys, "argv", argv):
-                    with contextlib.redirect_stderr(io.StringIO()):
-                        pipeline.main()
+            with mock.patch.object(pipeline, "read_frame", side_effect=fake_read_frame):
+                with mock.patch.object(
+                    pipeline,
+                    "_scan_events",
+                    return_value={
+                        "events": 0,
+                        "per_mint": {},
+                        "signature_events": [],
+                        "lines_scanned": 0,
+                        "bad_json": 0,
+                    },
+                ):
+                    with mock.patch.object(sys, "argv", argv):
+                        with contextlib.redirect_stderr(io.StringIO()):
+                            pipeline.main()
 
             report_path = os.path.join(outdir, "cleaning_report.json")
             with open(report_path, encoding="utf-8") as handle:

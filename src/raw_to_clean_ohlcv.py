@@ -35,9 +35,16 @@ Data rules:
   * Cross-candle price discontinuities are audit flags; they never rewrite OHLC data.
   * priceSol is compared with quote-implied execution price as an audit metric only;
     a discrepancy is not, by itself, proof of invalid source data.
+
+Memory: a busy day can hold several million events and every column costs
+memory, so large inputs are split by mint (``--batch-events``, default 1.5M
+events) and merged afterwards. Mints are independent apart from the signature
+multiplicity, which one streaming pass resolves globally, so the output stays
+identical to a single-pass run while peak memory stays bounded.
 """
 
 import argparse
+import gc
 import glob
 import io
 import json
@@ -303,48 +310,331 @@ def _needs_participant_balance_audit(event, breakdown_count):
     return bool(ratio >= BALANCE_AUDIT_TRIGGER_RATIO)
 
 
-def read_file(path, start_idx, stats):
-    """Read BUY/SELL JSONL events, retaining multi-breakdown detail and reserves."""
+_EVENT_HEAD_BYTES = 260
+
+# Fields with a handful of distinct values. Interning them keeps the per-row
+# Python overhead small on multi-million-event days.
+_INTERNED_FIELDS = frozenset(
+    {"action", "mint", "pool_id", "pool", "quote_mint"}
+)
+
+# ``clean_trades`` coerces these to float64 immediately; allocating them as
+# float64 up front avoids one boxed Python float per event.
+_FLOAT_FIELDS = frozenset(
+    {
+        "timestamp_ms", "token_amount", "quote_amount", "price_sol",
+        "quote_price_sol", "tokens_in_pool", "quote_in_pool",
+        "virtual_tokens_in_pool", "virtual_quote_in_pool", "decimals", "supply",
+        "participant_quote_balance_delta_sol", "participant_balance_available",
+        "participant_balance_checked",
+    }
+)
+
+
+def _intern(value):
+    return sys.intern(value) if isinstance(value, str) and value else value
+
+
+def _iter_jsonl(path):
+    """Yield lines from a Zstandard JSONL file without materialising them."""
     try:
         import zstandard as zstd
     except ImportError as exc:
         raise SystemExit("Missing dependency: install zstandard (pip install zstandard).") from exc
 
-    rows, idx = [], start_idx
     with open(path, "rb") as fh:
         reader = zstd.ZstdDecompressor().stream_reader(fh, read_across_frames=True)
         for line in io.BufferedReader(reader, 1 << 22):
-            stats["lines_scanned"] += 1
-            head = line[:260]
-            if b'"action":"buy"' not in head and b'"action":"sell"' not in head:
-                continue
-            try:
-                e = loads(line)
-            except ValueError:
-                stats["bad_json"] += 1
-                continue
-            idx += 1
-            bd = e.get("breakdown")
-            bd = bd if isinstance(bd, list) else []
-            # Store detailed JSON only when aggregation matters. A single component
-            # is represented exactly by top-level fields in this source format.
-            bd_json = json.dumps(bd, separators=(",", ":"), ensure_ascii=False) if len(bd) > 1 else ""
-            balance_checked = int(_needs_participant_balance_audit(e, len(bd)))
-            if balance_checked:
-                balance_delta_sol, balance_available = _participant_quote_balance_delta_sol(e)
-            else:
-                balance_delta_sol, balance_available = np.nan, 0
-            rows.append((
-                idx, e.get("signature"), e.get("action"), e.get("mint"), e.get("poolId"),
-                e.get("pool"), e.get("quoteMint"), e.get("timestamp"), e.get("tokenAmount"),
-                e.get("quoteAmount"), e.get("priceSol"), e.get("quotePriceSol"),
-                len(bd), e.get("block"), bd_json, e.get("tokensInPool"), e.get("quoteInPool"),
-                e.get("virtualTokensInPool"), e.get("virtualQuoteInPool"),
-                e.get("burnedLiquidity"), e.get("poolCreatedBy"),
-                e.get("decimals"), e.get("supply"), balance_delta_sol,
-                balance_available, balance_checked,
-            ))
+            yield line
+
+
+def _is_trade_line(line):
+    head = line[:_EVENT_HEAD_BYTES]
+    return b'"action":"buy"' in head or b'"action":"sell"' in head
+
+
+def _count_event_lines(path):
+    """Count BUY/SELL lines cheaply so the frame can be preallocated.
+
+    This is a streaming decompression pass with no JSON parsing. It lets the
+    reader build one object column per field instead of a list of tuples, which
+    is what used to push multi-million-event days over the memory limit.
+    """
+    return sum(1 for line in _iter_jsonl(path) if _is_trade_line(line))
+
+
+def _parse_event(line, index, stats):
+    """Parse one line into a ROW_COLS tuple, or return None to skip it."""
+    if not _is_trade_line(line):
+        return None
+    try:
+        e = loads(line)
+    except ValueError:
+        stats["bad_json"] += 1
+        return None
+    bd = e.get("breakdown")
+    bd = bd if isinstance(bd, list) else []
+    # Store detailed JSON only when aggregation matters. A single component
+    # is represented exactly by top-level fields in this source format.
+    bd_json = json.dumps(bd, separators=(",", ":"), ensure_ascii=False) if len(bd) > 1 else ""
+    balance_checked = int(_needs_participant_balance_audit(e, len(bd)))
+    if balance_checked:
+        balance_delta_sol, balance_available = _participant_quote_balance_delta_sol(e)
+    else:
+        balance_delta_sol, balance_available = np.nan, 0
+    return (
+        index, e.get("signature"), _intern(e.get("action")), _intern(e.get("mint")),
+        _intern(e.get("poolId")),
+        _intern(e.get("pool")), _intern(e.get("quoteMint")), e.get("timestamp"), e.get("tokenAmount"),
+        e.get("quoteAmount"), e.get("priceSol"), e.get("quotePriceSol"),
+        len(bd), e.get("block"), bd_json, e.get("tokensInPool"), e.get("quoteInPool"),
+        e.get("virtualTokensInPool"), e.get("virtualQuoteInPool"),
+        e.get("burnedLiquidity"), e.get("poolCreatedBy"),
+        e.get("decimals"), e.get("supply"), balance_delta_sol,
+        balance_available, balance_checked,
+    )
+
+
+def read_file(path, start_idx, stats):
+    """Read BUY/SELL JSONL events, retaining multi-breakdown detail and reserves."""
+    rows, idx = [], start_idx
+    for line in _iter_jsonl(path):
+        stats["lines_scanned"] += 1
+        row = _parse_event(line, idx + 1, stats)
+        if row is None:
+            continue
+        idx += 1
+        rows.append(row)
     return rows, idx
+
+
+def _allocate_event_columns(capacity):
+    columns = {name: np.empty(capacity, dtype=object) for name in ROW_COLS}
+    for name in _FLOAT_FIELDS:
+        columns[name] = np.empty(capacity, dtype="float64")
+    # Never-null integer fields can stay numeric, matching pandas inference.
+    columns["event_index"] = np.empty(capacity, dtype="int64")
+    columns["n_breakdown"] = np.empty(capacity, dtype="int64")
+    # ``block`` is an integer identifier, but the source may omit it.
+    block = np.empty(capacity, dtype="int64")
+    block_missing = np.zeros(capacity, dtype=bool)
+    return columns, block, block_missing
+
+
+def _store_event_row(columns, block, block_missing, position, row):
+    for name, value in zip(ROW_COLS, row):
+        if name in _FLOAT_FIELDS:
+            if value is None:
+                columns[name][position] = np.nan
+            else:
+                try:
+                    columns[name][position] = value
+                except (TypeError, ValueError):
+                    # Mirrors pd.to_numeric(..., errors="coerce").
+                    columns[name][position] = np.nan
+        elif name == "block":
+            if value is None:
+                block_missing[position] = True
+            else:
+                try:
+                    block[position] = int(value)
+                except (TypeError, ValueError):
+                    block_missing[position] = True
+        else:
+            columns[name][position] = value
+
+
+def _finalise_event_frame(columns, block, block_missing, filled, capacity):
+    if filled < capacity:
+        columns = {name: column[:filled] for name, column in columns.items()}
+        block = block[:filled]
+        block_missing = block_missing[:filled]
+    if block_missing.any():
+        columns["block"] = np.where(block_missing, np.nan, block.astype("float64"))
+    else:
+        columns["block"] = block
+    frame = pd.DataFrame(columns, columns=ROW_COLS)
+    del columns
+    return frame
+
+
+def read_frame(path, start_idx, stats):
+    """Stream BUY/SELL events into a column-oriented frame.
+
+    Same rows and dtypes as ``pd.DataFrame(read_file(...))`` but without the
+    intermediate list of Python tuples, which dominates peak memory on busy
+    days (5M+ events).
+
+    Numeric fields are allocated with the dtype ``clean_trades`` converts them
+    to anyway, so a busy day does not hold one boxed Python float per value and
+    does not pay for an object-to-float conversion of every column.
+    """
+    capacity = _count_event_lines(path)
+    columns, block, block_missing = _allocate_event_columns(capacity)
+
+    filled = 0
+    for line in _iter_jsonl(path):
+        stats["lines_scanned"] += 1
+        row = _parse_event(line, start_idx + filled + 1, stats)
+        if row is None:
+            continue
+        _store_event_row(columns, block, block_missing, filled, row)
+        filled += 1
+
+    frame = _finalise_event_frame(columns, block, block_missing, filled, capacity)
+    return frame, start_idx + filled
+
+
+def _extract_mint_bytes(line):
+    marker = b'"mint":"'
+    start = line.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = line.find(b'"', start)
+    if end < 0:
+        return None
+    return line[start:end].decode("utf-8", "replace")
+
+
+def read_frame_subset(path, stats, mints, index_lookup):
+    """Read only the events of ``mints``, keeping their global event indices.
+
+    Used by the batched path: the file is streamed once per batch, but only the
+    batch's rows are ever materialised. ``index_lookup`` maps a mint to the
+    global ``event_index`` values assigned by :func:`_scan_events`, so audit
+    identifiers stay identical to a single-pass run.
+    """
+    mints = set(mints)
+    capacity = int(sum(len(index_lookup[mint]) for mint in mints))
+    columns, block, block_missing = _allocate_event_columns(capacity)
+    cursors = dict.fromkeys(mints, 0)
+
+    filled = 0
+    for line in _iter_jsonl(path):
+        if not _is_trade_line(line):
+            continue
+        mint = _extract_mint_bytes(line)
+        if mint is None or mint not in mints:
+            continue
+        position = cursors[mint]
+        row = _parse_event(line, int(index_lookup[mint][position]), stats)
+        if row is None:
+            continue
+        cursors[mint] = position + 1
+        _store_event_row(columns, block, block_missing, filled, row)
+        filled += 1
+
+    frame = _finalise_event_frame(columns, block, block_missing, filled, capacity)
+    return frame, filled
+
+
+def _scan_events(path):
+    """One streaming pass: global event indices per mint and signature multiplicity.
+
+    Returns the compact arrays the batched path needs, plus line and parse
+    counters. Nothing is retained per event apart from one int64 index and one
+    int32 signature count, so this pass is cheap in memory.
+    """
+    per_mint: dict[str, list[int]] = {}
+    signatures: list[str] = []
+    lines_scanned = 0
+    bad_json = 0
+    index = 0
+    for line in _iter_jsonl(path):
+        lines_scanned += 1
+        if not _is_trade_line(line):
+            continue
+        try:
+            event = loads(line)
+        except ValueError:
+            bad_json += 1
+            continue
+        index += 1
+        mint = event.get("mint")
+        key = mint if isinstance(mint, str) else ""
+        per_mint.setdefault(key, []).append(index)
+        signature = event.get("signature")
+        signatures.append(signature if isinstance(signature, str) else "")
+
+    if signatures:
+        _, inverse, counts = np.unique(
+            np.asarray(signatures, dtype=object),
+            return_inverse=True,
+            return_counts=True,
+        )
+        signature_events = counts[inverse].astype("int32")
+        del _, inverse, counts
+    else:
+        signature_events = np.zeros(0, dtype="int32")
+    del signatures
+
+    return {
+        "per_mint": {
+            mint: np.asarray(indices, dtype="int64")
+            for mint, indices in per_mint.items()
+        },
+        "signature_events": signature_events,
+        "lines_scanned": lines_scanned,
+        "bad_json": bad_json,
+        "events": index,
+    }
+
+
+def _pack_batches(per_mint, limit):
+    """First-fit pack mints into batches of at most ``limit`` events."""
+    batches: list[list[str]] = []
+    sizes: list[int] = []
+    for mint, indices in sorted(per_mint.items(), key=lambda item: -len(item[1])):
+        for position, size in enumerate(sizes):
+            if size + len(indices) <= limit:
+                batches[position].append(mint)
+                sizes[position] += len(indices)
+                break
+        else:
+            batches.append([mint])
+            sizes.append(len(indices))
+    return batches
+
+
+_RATIO_KEYS = frozenset(
+    {"comparison_coverage", "median_ratio", "p90_ratio", "p99_ratio"}
+)
+_MAX_KEYS = frozenset({"max_ratio"})
+
+
+def _merge_cleaning_stats(target, source):
+    """Accumulate per-batch ``clean_trades`` counters into one stats dict.
+
+    Counts add up; ratio summaries are weighted by ``comparison_events`` when
+    both sides carry it, and ``max_ratio`` takes the maximum. Per-timeframe
+    validation is recomputed on the merged bars, so it stays exact.
+    """
+    weight_old = target.get("comparison_events")
+    weight_new = source.get("comparison_events")
+    for key, value in source.items():
+        if key not in target:
+            target[key] = value
+            continue
+        current = target[key]
+        if isinstance(value, dict) and isinstance(current, dict):
+            _merge_cleaning_stats(current, value)
+        elif (
+            isinstance(value, list)
+            and isinstance(current, list)
+            and value
+            and current
+        ):
+            target[key] = [min(current[0], value[0]), max(current[-1], value[-1])]
+        elif isinstance(value, bool) or not isinstance(value, (int, float)):
+            target[key] = value
+        elif key in _MAX_KEYS:
+            target[key] = max(current, value)
+        elif key in _RATIO_KEYS and weight_old and weight_new:
+            total = weight_old + weight_new
+            target[key] = (current * weight_old + value * weight_new) / total
+        else:
+            target[key] = current + value
 
 
 # ----------------------------------------------------------------------------- clean
@@ -443,9 +733,40 @@ def _parse_multi_breakdown(row):
     return result
 
 
-def clean_trades(df, args, st):
+_STRING_CACHE: dict[str, str] = {}
+_STRING_CACHE_LIMIT = 50_000
+_STRING_MISSING = object()
+
+
+def _normalise_strings(series, default=""):
+    """``fillna(default).astype(str).str.strip()`` with interned values.
+
+    The plain chain allocates a fresh string per row. On multi-million-event
+    days that costs hundreds of MB for columns with a handful of distinct
+    values (mint, pool id, quote mint, ...), so normalise each distinct value
+    once and share it.
+    """
+    cache = _STRING_CACHE
+
+    def clean(value):
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return default
+        text = value if isinstance(value, str) else str(value)
+        cached = cache.get(text, _STRING_MISSING)
+        if cached is not _STRING_MISSING:
+            return cached
+        stripped = sys.intern(text.strip())
+        if len(cache) < _STRING_CACHE_LIMIT:
+            cache[text] = stripped
+        return stripped
+
+    return series.map(clean)
+
+
+def clean_trades(df, args, st, copy_frame=True):
     """Normalize raw events and reconstruct gross trade flow from breakdowns."""
-    df = df.copy()
+    if copy_frame:
+        df = df.copy()
     for c in (
         "timestamp_ms", "token_amount", "quote_amount", "price_sol", "quote_price_sol",
         "tokens_in_pool", "quote_in_pool", "virtual_tokens_in_pool", "virtual_quote_in_pool",
@@ -464,7 +785,7 @@ def clean_trades(df, args, st):
     ):
         if c not in df:
             df[c] = default
-        df[c] = df[c].fillna(default).astype(str).str.strip()
+        df[c] = _normalise_strings(df[c], default)
     if "participant_balance_available" not in df:
         df["participant_balance_available"] = 0
     df["participant_balance_available"] = pd.to_numeric(
@@ -704,7 +1025,13 @@ def clean_trades(df, args, st):
     df["timestamp_ms"] = df["timestamp_ms"].astype("int64")
     df = df.sort_values(["mint", "timestamp_ms", "event_index"], kind="mergesort").reset_index(drop=True)
 
-    signature_events = df.groupby("signature")["signature"].transform("size")
+    if "signature_events" in df.columns:
+        # Batched runs supply the global signature multiplicity, computed in
+        # one streaming pass over the whole day.
+        signature_events = df["signature_events"].astype("int64")
+        del df["signature_events"]
+    else:
+        signature_events = df.groupby("signature")["signature"].transform("size")
     df["routed"] = (signature_events > 1).astype("int8")
     if args.min_trades > 1:
         mint_trade_count = df.groupby("mint")["mint"].transform("size")
@@ -1575,6 +1902,16 @@ def main():
     )
     ap.add_argument("--drop-jumps", action="store_true")
     ap.add_argument("--bundle-ms", type=int, default=3)
+    ap.add_argument(
+        "--batch-events",
+        type=int,
+        default=1_500_000,
+        help=(
+            "Process at most this many events per in-memory batch, splitting the "
+            "input by mint when a day is larger. Keeps peak memory bounded on "
+            "busy days. 0 disables batching."
+        ),
+    )
     args = ap.parse_args()
 
     if not np.isfinite(args.discontinuity_ratio) or args.discontinuity_ratio <= 1:
@@ -1598,44 +1935,138 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)
     stats = {"lines_scanned": 0, "bad_json": 0}
-    rows, idx = [], 0
-    for p in paths:
-        r, idx = read_file(p, idx, stats)
-        rows += r
-        print(f"[read] {p}: {len(r):,} buy/sell rows", file=sys.stderr)
-
-    stats["raw_buy_sell_rows"] = len(rows)
-    if not rows:
-        sys.exit("No buy/sell events were found in the input files.")
-    # Test doubles and older adapters may emit the v4 tuple shape. Pad missing
-    # v5 audit fields without changing the production reader's tuple contract.
-    rows = [list(row) + [None] * max(0, len(ROW_COLS) - len(row)) for row in rows]
-    df = pd.DataFrame(rows, columns=ROW_COLS)
-    del rows
-    df, dropped = clean_trades(df, args, stats)
-    print(f"[clean] {stats}", file=sys.stderr)
-    if df.empty:
-        sys.exit("No events remain after cleaning and filtering.")
-
-    # Write audit files for manual inspection.
-    dropped.to_csv(os.path.join(args.outdir, "dropped_invalid.csv"), index=False)
+    tf_list = [x.strip() for x in args.timeframes.split(",") if x.strip()]
+    tf_frames: dict[str, list] = {tf: [] for tf in tf_list}
+    dropped_frames: list = []
+    zero_quote_frames: list = []
+    invalid_quote_frames: list = []
     zq_cols = [
         "event_index", "signature", "action", "mint", "pool_id", "quote_mint",
         "timestamp_ms", "token_amount", "quote_amount", "price_sol", "n_breakdown",
         "invalid_quote_reason", "breakdown_json",
     ]
-    df.loc[df["zero_quote"] == 1, zq_cols].to_csv(
-        os.path.join(args.outdir, "flagged_zero_quote.csv"), index=False
-    )
     invalid_quote_cols = [
         "event_index", "signature", "action", "mint", "pool_id", "quote_mint",
         "timestamp_ms", "token_amount", "quote_amount", "quote_price_sol",
         "price_sol", "n_breakdown", "breakdown_json", "invalid_quote_reason",
         "breakdown_invalid_components",
     ]
-    df.loc[df["invalid_quote"] == 1, invalid_quote_cols].to_csv(
+
+    # A single day of filtered replay can hold several million events. Building
+    # every column for all of them at once needs more memory than a laptop has,
+    # so large inputs are split by mint: mints are independent (except for the
+    # signature multiplicity, which the scan resolves globally), so the merged
+    # result is identical to a single-pass run.
+    plan = None
+    batch_mints: list[list[str]] = []
+    if len(paths) == 1 and args.batch_events > 0:
+        candidate = _scan_events(paths[0])
+        if candidate["events"] > args.batch_events:
+            plan = candidate
+            batch_mints = _pack_batches(candidate["per_mint"], args.batch_events)
+            stats["lines_scanned"] = candidate["lines_scanned"]
+            stats["bad_json"] = candidate["bad_json"]
+            print(
+                f"[read] {candidate['events']:,} events -> {len(batch_mints)} "
+                f"batches of <= {args.batch_events:,} events",
+                file=sys.stderr,
+            )
+        del candidate
+
+    if plan is not None:
+        sources = [
+            (paths[0], mints, plan["per_mint"], plan["signature_events"])
+            for mints in batch_mints
+        ]
+    else:
+        sources = [(paths, None, None, None)]
+
+    idx = 0
+    total_rows = 0
+    for batch_no, (source_paths, mints, index_lookup, signature_events) in enumerate(
+        sources, 1
+    ):
+        if mints is None:
+            frames, idx = [], 0
+            for p in source_paths:
+                frame, idx = read_frame(p, idx, stats)
+                frames.append(frame)
+                print(f"[read] {p}: {len(frame):,} buy/sell rows", file=sys.stderr)
+            df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+            del frames
+        else:
+            parse_stats = {"bad_json": 0}
+            df, _ = read_frame_subset(source_paths, parse_stats, mints, index_lookup)
+            stats["bad_json"] += parse_stats["bad_json"]
+            df["signature_events"] = signature_events[
+                df["event_index"].to_numpy(dtype="int64") - 1
+            ]
+            print(
+                f"[read] batch {batch_no}/{len(sources)}: {len(df):,} rows, "
+                f"{len(mints)} mints",
+                file=sys.stderr,
+            )
+        total_rows += len(df)
+
+        batch_stats = stats if plan is None else {}
+        df, dropped = clean_trades(df, args, batch_stats, copy_frame=False)
+        if plan is not None:
+            _merge_cleaning_stats(stats, batch_stats)
+        if df.empty:
+            print(f"[clean] batch {batch_no}: no events remain", file=sys.stderr)
+            del df
+            continue
+
+        dropped_frames.append(dropped)
+        zero_quote_frames.append(df.loc[df["zero_quote"] == 1, zq_cols].copy())
+        invalid_quote_frames.append(
+            df.loc[df["invalid_quote"] == 1, invalid_quote_cols].copy()
+        )
+
+        for tf in tf_list:
+            tf_ms = parse_tf(tf)
+            bars, selected_events = build_bars(
+                df,
+                tf_ms,
+                args.open_prev_close,
+                args.discontinuity_ratio,
+                return_selected=True,
+                candle_range_ratio=args.candle_range_ratio,
+            )
+            if args.fill:
+                bars = fill_gaps(bars, tf_ms, args.candle_range_ratio)
+            tf_frames[tf].append((bars, selected_events))
+        del df
+        gc.collect()
+
+    stats["raw_buy_sell_rows"] = total_rows
+    if not total_rows or not dropped_frames:
+        sys.exit("No buy/sell events were found in the input files.")
+    if plan is not None and len(batch_mints) > 1:
+        stats["batched"] = {
+            "events": total_rows,
+            "batches": len(batch_mints),
+            "limit": int(args.batch_events),
+        }
+    print(f"[clean] {stats}", file=sys.stderr)
+
+    # Write audit files for manual inspection.
+    if len(dropped_frames) == 1:
+        dropped_frames[0].to_csv(
+            os.path.join(args.outdir, "dropped_invalid.csv"), index=False
+        )
+    else:
+        pd.concat(dropped_frames, ignore_index=True).to_csv(
+            os.path.join(args.outdir, "dropped_invalid.csv"), index=False
+        )
+    pd.concat(zero_quote_frames, ignore_index=True).to_csv(
+        os.path.join(args.outdir, "flagged_zero_quote.csv"), index=False
+    )
+    pd.concat(invalid_quote_frames, ignore_index=True).to_csv(
         os.path.join(args.outdir, "flagged_invalid_quote.csv"), index=False
     )
+    del dropped_frames, zero_quote_frames, invalid_quote_frames
+    gc.collect()
 
     report = {
         "version": "v6.2.2",
@@ -1709,18 +2140,20 @@ def main():
         "timeframes": {},
     }
     failed = False
-    for tf in [x.strip() for x in args.timeframes.split(",") if x.strip()]:
-        tf_ms = parse_tf(tf)
-        bars, selected_events = build_bars(
-            df,
-            tf_ms,
-            args.open_prev_close,
-            args.discontinuity_ratio,
-            return_selected=True,
-            candle_range_ratio=args.candle_range_ratio,
-        )
-        if args.fill:
-            bars = fill_gaps(bars, tf_ms, args.candle_range_ratio)
+    for tf in tf_list:
+        batch_frames = tf_frames.pop(tf)
+        if not batch_frames:
+            continue
+        if len(batch_frames) == 1:
+            bars, selected_events = batch_frames[0]
+        else:
+            bars = pd.concat(
+                [frame for frame, _ in batch_frames], ignore_index=True
+            )
+            selected_events = pd.concat(
+                [frame for _, frame in batch_frames], ignore_index=True
+            )
+        del batch_frames
         # Keep serialization fast and avoid fragmented-frame warnings after
         # the wide event-audit columns have been assembled.
         bars = bars.copy()
