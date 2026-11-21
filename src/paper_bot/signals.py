@@ -36,10 +36,10 @@ SUPPORTED_RULES = (
 RULE_DESCRIPTIONS = {
     "baseline": "every confirmed BUY signal",
     "hot_money_continuation": (
-        "net buying in the 60 s before the alert > 9.46 SOL and alert "
-        "Total Buy > 3 SOL; drops late-in-the-run buys (pre_ret_15m <= 2%) "
-        "from the quality pool when the live feature is available; exit "
-        "after 5 min"
+        "net buying in the 60 s before the alert > 9.46 SOL and alert Total "
+        "Buy > 3 SOL; drops late-in-the-run buys (pre_ret_15m > 2%) and "
+        "crowded late chases (signers_5m > 147 or trades_5m > 611) when "
+        "those live features are available; exit after 5 min"
     ),
     "max_pump_gt_1": "signal message says Max Pump > 1x",
     "max_pump_gt_1_pre_ret_ge_6_3": (
@@ -82,8 +82,8 @@ PRE_RET_THRESHOLD = 6.3
 # Nov 18-20 days the pre-30m-volume gate halved the mean return and the win
 # rate (OOS mean +28.4% over +51.5% without it, PnL +1.6 vs +12.6 SOL), while
 # it added nothing that later-in-the-run filters did not add. It is therefore
-# not kept; the flow + total-buy gate is the OOS-validated core, and the
-# pre_ret_15m dip overlay below is a separate, optional quality filter.
+# not kept; the flow + total-buy gate is the OOS-validated core, with the
+# pre_ret_15m dip overlay and anti-crowd overlays applied on top.
 DEFAULT_RULE = "hot_money_continuation"
 HOT_MONEY_FLOW_1M_SOL = 9.456
 HOT_MONEY_ALERT_TOTAL_BUY_SOL = 3.0
@@ -107,6 +107,12 @@ MAX_DELIVERY_LAG_MS = 5_000
 CROWDED_PRE_SIGNERS_GT = 147
 CROWDED_PRE_TRADES_GT = 611
 CROWDED_PRE_RET_MAX = 7.02
+
+# Anti-crowd overlays reused by hot_money_continuation: heavy pre-signal
+# participation (many signers/trades in the prior 5 min) marks a late chase,
+# not a continuation; they lost on OOS.
+HOT_MONEY_SIGNERS_5M_MAX = CROWDED_PRE_SIGNERS_GT
+HOT_MONEY_TRADES_5M_MAX = CROWDED_PRE_TRADES_GT
 
 TICKER_RE = re.compile(r"\$([^\s(]+)")
 PLATFORM_RE = re.compile(r"\(from ([^)]+)\)")
@@ -269,6 +275,16 @@ def _rule_decision(signal: Signal, rule: str) -> tuple[bool, str | None]:
         dip = _feature(signal, "hist_pre_ret_15m")
         if dip is not None and dip > HOT_MONEY_DIP_PRE_RET_MAX:
             return False, "rule_pre_ret_15m_gt_2"
+        # Anti-crowd overlays: heavy pre-signal participation marks a late
+        # chase, not a continuation. Reject when either signers or trades in
+        # the prior 5 minutes exceed the research threshold, but only when the
+        # feature is actually available.
+        signers = _feature(signal, "hist_signers_5m")
+        if signers is not None and signers > HOT_MONEY_SIGNERS_5M_MAX:
+            return False, "rule_signers_5m_gt_147"
+        trades = _feature(signal, "hist_trades_5m")
+        if trades is not None and trades > HOT_MONEY_TRADES_5M_MAX:
+            return False, "rule_trades_5m_gt_611"
         return True, None
 
     if rule == "max_pump_gt_1":

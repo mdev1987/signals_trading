@@ -102,6 +102,49 @@ class HotMoneyGateTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("missing_feature:hist_flow_1m_sol", decision.reasons)
 
+    def test_passes_when_dip_feature_missing(self) -> None:
+        # Cold start: no price history, gate still passes flow + buy.
+        self.assertTrue(
+            self.gate(hist_flow_1m_sol=20.0, total_buy_sol=10.0)
+        )
+
+    def test_rejects_crowded_pre_signal_signers(self) -> None:
+        base = dict(hist_flow_1m_sol=20.0, total_buy_sol=10.0)
+        self.assertTrue(self.gate(**base, hist_signers_5m=147))
+        self.assertFalse(self.gate(**base, hist_signers_5m=148))
+
+    def test_rejects_crowded_pre_signal_trades(self) -> None:
+        base = dict(hist_flow_1m_sol=20.0, total_buy_sol=10.0)
+        self.assertTrue(self.gate(**base, hist_trades_5m=611))
+        self.assertFalse(self.gate(**base, hist_trades_5m=612))
+
+    def test_passes_when_crowd_features_missing(self) -> None:
+        self.assertTrue(
+            self.gate(hist_flow_1m_sol=20.0, total_buy_sol=10.0)
+        )
+
+    def test_all_overlays_pass_together(self) -> None:
+        self.assertTrue(
+            self.gate(
+                hist_flow_1m_sol=20.0,
+                total_buy_sol=10.0,
+                hist_pre_ret_15m=0.5,
+                hist_signers_5m=10,
+                hist_trades_5m=20,
+            )
+        )
+
+    def test_any_overlay_failing_rejects(self) -> None:
+        base = dict(hist_flow_1m_sol=20.0, total_buy_sol=10.0)
+        bad = [
+            dict(**base, hist_pre_ret_15m=5.0),
+            dict(**base, hist_signers_5m=200),
+            dict(**base, hist_trades_5m=700),
+        ]
+        for features in bad:
+            with self.subTest(features=features):
+                self.assertFalse(self.gate(**features))
+
 
 class HistoryFeatureTests(unittest.TestCase):
     def test_flow_and_volume_ignore_trades_at_or_after_the_signal(self) -> None:
