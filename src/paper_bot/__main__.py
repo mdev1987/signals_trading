@@ -126,14 +126,20 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--priority-fee-lamports",
         type=int,
-        default=0,
-        help="Priority fee in lamports for live execution (faster landing during volatility)",
+        default=None,
+        help=(
+            "Priority fee in lamports for live execution "
+            "(overrides LIVE_PRIORITY_FEE_LAMPORTS)"
+        ),
     )
     parser.add_argument(
         "--jito-tip-lamports",
         type=int,
-        default=0,
-        help="Jito MEV tip in lamports for live execution (faster block inclusion)",
+        default=None,
+        help=(
+            "Jito MEV tip in lamports for live execution "
+            "(overrides LIVE_JITO_TIP_LAMPORTS)"
+        ),
     )
     parser.add_argument("--entry-delay-ms", type=int, default=5_000)
     parser.add_argument("--max-entry-delay-ms", type=int, default=120_000)

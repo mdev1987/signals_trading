@@ -22,6 +22,9 @@ config.ini
 *.env
 *.session
 tg_session.session
+*.session-journal
+*.session-wal
+*.session-shm
 
 # Machine-specific replay data and links
 replay

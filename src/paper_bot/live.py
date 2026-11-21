@@ -96,9 +96,10 @@ class LiveConfig:
     slippage_bps: int = 50
     # Priority fee (lamports) and Jito MEV tip (lamports) help live
     # transactions land faster during volatile pump launches, reducing
-    # entry slippage. Set to 0 to let Jupiter determine fees automatically.
-    priority_fee_lamports: int = 0
-    jito_tip_lamports: int = 0
+    # entry slippage. ``None`` means "not passed", so the env var can apply;
+    # an explicit 0 lets Jupiter determine fees automatically.
+    priority_fee_lamports: int | None = None
+    jito_tip_lamports: int | None = None
     entry_delay_ms: int = 5_000
     max_entry_delay_ms: int = 120_000
     safety_screen: bool = False
@@ -177,9 +178,12 @@ class LiveConfig:
             raise ValueError("slippage must be in [0, 1)")
         if not 0 <= self.slippage_bps <= 10_000:
             raise ValueError("slippage_bps must be in [0, 10000]")
-        if self.priority_fee_lamports < 0:
+        if (
+            self.priority_fee_lamports is not None
+            and self.priority_fee_lamports < 0
+        ):
             raise ValueError("priority_fee_lamports must be non-negative")
-        if self.jito_tip_lamports < 0:
+        if self.jito_tip_lamports is not None and self.jito_tip_lamports < 0:
             raise ValueError("jito_tip_lamports must be non-negative")
         if self.notional_sol <= 0:
             raise ValueError("notional_sol must be positive")

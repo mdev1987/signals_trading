@@ -7,6 +7,7 @@ features, the live-execution guards, and the paper/live report wording.
 
 from __future__ import annotations
 
+import base64
 import sys
 import unittest
 from pathlib import Path
@@ -31,6 +32,13 @@ from paper_bot.signals import GateConfig, evaluate_gate  # noqa: E402
 
 MINT = "So11111111111111111111111111111111111111112"
 SIGNAL_TS = 1_800_000_000_000
+
+# Throwaway base58 keypair used only to exercise request building. The tests
+# never broadcast a transaction.
+TEST_PRIVATE_KEY = (
+    "3ccLLgBmuNJBpjuVgCt9SNTPN3TTqh3EEPhbuqj3eEDg4NppbFKxZmqmbmGr9CZtsrs4"
+    "ojpfKEPtYqrjBhQC9LuA"
+)
 
 
 def signal(features: dict[str, float | None]) -> Signal:
@@ -333,6 +341,58 @@ class LiveGuardTests(unittest.TestCase):
                 jito_tip_lamports=-1,
             )
 
+    def test_live_config_cli_fees_override_env(self) -> None:
+        config = live_config_from_env(
+            {
+                "LIVE_PRIORITY_FEE_LAMPORTS": "111",
+                "LIVE_JITO_TIP_LAMPORTS": "222",
+            },
+            enabled=False,
+            slippage_bps=50,
+            max_notional_sol=0.1,
+            priority_fee_lamports=2000,
+            jito_tip_lamports=10000,
+        )
+        self.assertEqual(config.priority_fee_lamports, 2000)
+        self.assertEqual(config.jito_tip_lamports, 10000)
+
+    def test_live_config_falls_back_to_env_fees(self) -> None:
+        config = live_config_from_env(
+            {
+                "LIVE_PRIORITY_FEE_LAMPORTS": "111",
+                "LIVE_JITO_TIP_LAMPORTS": "222",
+            },
+            enabled=False,
+            slippage_bps=50,
+            max_notional_sol=0.1,
+        )
+        self.assertEqual(config.priority_fee_lamports, 111)
+        self.assertEqual(config.jito_tip_lamports, 222)
+
+    def test_live_config_explicit_zero_overrides_env(self) -> None:
+        config = live_config_from_env(
+            {
+                "LIVE_PRIORITY_FEE_LAMPORTS": "111",
+                "LIVE_JITO_TIP_LAMPORTS": "222",
+            },
+            enabled=False,
+            slippage_bps=50,
+            max_notional_sol=0.1,
+            priority_fee_lamports=0,
+            jito_tip_lamports=0,
+        )
+        self.assertEqual(config.priority_fee_lamports, 0)
+        self.assertEqual(config.jito_tip_lamports, 0)
+
+    def test_sign_reports_v1_unsupported(self) -> None:
+        executor = LiveSolanaExecutor(
+            LiveExecutionConfig(enabled=True, private_key=TEST_PRIVATE_KEY)
+        )
+        payload = base64.b64encode(b"\x81\x00\x01\x02").decode()
+        with self.assertRaises(LiveExecutionError) as caught:
+            executor._sign(payload)
+        self.assertEqual(caught.exception.reason, "live_v1_unsupported")
+
 
 class JupiterErrorReasonTests(unittest.TestCase):
     def test_error_code_1_is_insufficient_funds(self) -> None:
@@ -360,6 +420,145 @@ class JupiterErrorReasonTests(unittest.TestCase):
         self.assertEqual(
             jupiter_error_reason("not-a-number"), "live_order_no_transaction"
         )
+
+    def test_jupiterz_codes_use_router_specific_meanings(self) -> None:
+        self.assertEqual(
+            jupiter_error_reason(1, "jupiterz"), "live_insufficient_funds"
+        )
+        self.assertEqual(
+            jupiter_error_reason(2, "jupiterz"), "live_missing_token_account"
+        )
+        self.assertEqual(
+            jupiter_error_reason(3, "jupiterz"), "live_order_build_failed"
+        )
+
+    def test_router_match_is_case_insensitive(self) -> None:
+        self.assertEqual(
+            jupiter_error_reason(2, "JupiterZ"), "live_missing_token_account"
+        )
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: dict | None = None) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = ""
+
+    def json(self) -> dict:
+        if self._payload is None:
+            raise ValueError("no JSON body")
+        return self._payload
+
+
+class _FakeHttpClient:
+    """Minimal httpx.AsyncClient stand-in for the /order request path."""
+
+    def __init__(self, responses: list[_FakeResponse]) -> None:
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+
+    async def get(
+        self,
+        url: str,
+        params: dict | None = None,
+        headers: dict | None = None,
+    ) -> _FakeResponse:
+        self.calls.append(
+            {
+                "url": url,
+                "params": dict(params or {}),
+                "headers": dict(headers or {}),
+            }
+        )
+        return self._responses.pop(0)
+
+
+class LiveOrderTests(unittest.IsolatedAsyncioTestCase):
+    def executor(
+        self, client: _FakeHttpClient, **overrides: object
+    ) -> LiveSolanaExecutor:
+        config = LiveExecutionConfig(
+            enabled=True,
+            private_key=TEST_PRIVATE_KEY,
+            **overrides,
+        )
+        return LiveSolanaExecutor(config, client=client)  # type: ignore[arg-type]
+
+    async def test_order_sends_fee_and_version_params(self) -> None:
+        client = _FakeHttpClient(
+            [_FakeResponse(200, {"transaction": "signed-tx", "router": "metis"})]
+        )
+        executor = self.executor(
+            client, priority_fee_lamports=2000, jito_tip_lamports=10000
+        )
+        order = await executor._order({"inputMint": "a"}, action="entry")
+        self.assertEqual(order["transaction"], "signed-tx")
+        params = client.calls[0]["params"]
+        self.assertEqual(params["priorityFeeLamports"], "2000")
+        self.assertEqual(params["jitoTipLamports"], "10000")
+        self.assertEqual(params["maxSupportedTransactionVersion"], "1")
+        self.assertIn("taker", params)
+
+    async def test_order_omits_zero_fees(self) -> None:
+        client = _FakeHttpClient([_FakeResponse(200, {"transaction": "signed-tx"})])
+        executor = self.executor(client)
+        await executor._order({"inputMint": "a"}, action="entry")
+        params = client.calls[0]["params"]
+        self.assertNotIn("priorityFeeLamports", params)
+        self.assertNotIn("jitoTipLamports", params)
+        self.assertEqual(params["maxSupportedTransactionVersion"], "1")
+
+    async def test_terminal_error_is_not_retried(self) -> None:
+        client = _FakeHttpClient(
+            [
+                _FakeResponse(
+                    200,
+                    {
+                        "transaction": "",
+                        "errorCode": 2,
+                        "router": "metis",
+                        "errorMessage": "no gas",
+                    },
+                )
+            ]
+        )
+        executor = self.executor(client, retries=3)
+        with self.assertRaises(LiveExecutionError) as caught:
+            await executor._order({}, action="entry")
+        self.assertEqual(caught.exception.reason, "live_insufficient_sol_for_gas")
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_jupiterz_error_code_is_router_specific(self) -> None:
+        client = _FakeHttpClient(
+            [
+                _FakeResponse(
+                    200,
+                    {
+                        "transaction": "",
+                        "errorCode": 2,
+                        "router": "jupiterz",
+                        "errorMessage": "missing ata",
+                    },
+                )
+            ]
+        )
+        executor = self.executor(client, retries=1)
+        with self.assertRaises(LiveExecutionError) as caught:
+            await executor._order({}, action="entry")
+        self.assertEqual(caught.exception.reason, "live_missing_token_account")
+        self.assertIn("errorCode=2", caught.exception.detail)
+
+    async def test_transient_error_is_retried(self) -> None:
+        client = _FakeHttpClient(
+            [
+                _FakeResponse(500),
+                _FakeResponse(200, {"transaction": "signed-tx"}),
+            ]
+        )
+        executor = self.executor(client, retries=2)
+        order = await executor._order({}, action="entry")
+        self.assertEqual(order["transaction"], "signed-tx")
+        self.assertEqual(len(client.calls), 2)
 
 
 class _FakeExecutor:

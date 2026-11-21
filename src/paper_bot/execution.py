@@ -46,11 +46,26 @@ LAMPORTS_PER_SOL = 1_000_000_000
 LIVE_QUOTE_SOURCE = "jupiter_live"
 
 
-def jupiter_error_reason(error_code: object, error_message: str = "") -> str:
+# Jupiter /order errorCode values that will not change by retrying the same
+# request. Terminal reasons short-circuit the retry loop.
+_NON_RETRYABLE_LIVE_REASONS = frozenset(
+    {
+        "live_insufficient_funds",
+        "live_insufficient_sol_for_gas",
+        "live_swap_below_gasless_min",
+        "live_missing_token_account",
+        "live_order_build_failed",
+    }
+)
+
+
+def jupiter_error_reason(error_code: object, router: str | None = None) -> str:
     """Map a Jupiter /order ``errorCode`` to a stable reason string.
 
     From the Jupiter Swap API V2 docs (swap/v2 /order): when ``taker`` is
-    defined and ``transaction`` is empty, ``errorCode`` is present:
+    defined and ``transaction`` is empty, ``errorCode`` is present. The
+    meaning depends on the router that quoted the price, so callers must pass
+    the response ``router`` field:
 
     Aggregator routers (metis, dflow, okx):
       - 1: Insufficient funds
@@ -62,7 +77,8 @@ def jupiter_error_reason(error_code: object, error_message: str = "") -> str:
       - 2: Missing associated token account
       - 3: Quote could not be built into a transaction
 
-    Unknown codes fall back to ``live_order_no_transaction``.
+    When ``router`` is missing or is not ``jupiterz``, the aggregator mapping
+    is used. Unknown codes fall back to ``live_order_no_transaction``.
     """
     if error_code is None:
         return "live_order_no_transaction"
@@ -70,13 +86,17 @@ def jupiter_error_reason(error_code: object, error_message: str = "") -> str:
         code = int(error_code)
     except (TypeError, ValueError):
         return "live_order_no_transaction"
-    if code == 1:
-        return "live_insufficient_funds"
-    if code == 2:
-        return "live_insufficient_sol_for_gas"
-    if code == 3:
-        return "live_swap_below_gasless_min"
-    return "live_order_no_transaction"
+    if str(router or "").strip().lower() == "jupiterz":
+        return {
+            1: "live_insufficient_funds",
+            2: "live_missing_token_account",
+            3: "live_order_build_failed",
+        }.get(code, "live_order_no_transaction")
+    return {
+        1: "live_insufficient_funds",
+        2: "live_insufficient_sol_for_gas",
+        3: "live_swap_below_gasless_min",
+    }.get(code, "live_order_no_transaction")
 
 
 class LiveExecutionError(QuoteError):
@@ -141,18 +161,28 @@ def live_config_from_env(
     enabled: bool,
     slippage_bps: int,
     max_notional_sol: float,
-    priority_fee_lamports: int = 0,
-    jito_tip_lamports: int = 0,
+    priority_fee_lamports: int | None = None,
+    jito_tip_lamports: int | None = None,
 ) -> LiveExecutionConfig:
     """Build a live config from ``.env``/environment values.
 
     The caller must opt in twice: ``--mode live`` and
     ``LIVE_TRADING_ENABLED=1``. A missing key or RPC URL fails closed.
+
+    Explicit ``priority_fee_lamports`` / ``jito_tip_lamports`` values (the CLI
+    flags) take precedence over ``LIVE_PRIORITY_FEE_LAMPORTS`` /
+    ``LIVE_JITO_TIP_LAMPORTS``. ``None`` means "not passed", so an explicit
+    ``0`` can override a non-zero environment value.
     """
     import os
 
     def get(name: str, default: str = "") -> str:
         return (env.get(name) or os.environ.get(name) or default).strip()
+
+    def fee(cli_value: int | None, name: str) -> int:
+        if cli_value is not None:
+            return cli_value
+        return int(get(name, "0") or 0)
 
     allow_raw = get("LIVE_MINT_ALLOWLIST")
     allowlist = frozenset(
@@ -169,10 +199,10 @@ def live_config_from_env(
         allowlist=allowlist,
         timeout_s=float(get("LIVE_HTTP_TIMEOUT_S", "30") or 30),
         retries=int(get("LIVE_HTTP_RETRIES", "2") or 2),
-        priority_fee_lamports=int(
-            get("LIVE_PRIORITY_FEE_LAMPORTS", "0") or 0
+        priority_fee_lamports=fee(
+            priority_fee_lamports, "LIVE_PRIORITY_FEE_LAMPORTS"
         ),
-        jito_tip_lamports=int(get("LIVE_JITO_TIP_LAMPORTS", "0") or 0),
+        jito_tip_lamports=fee(jito_tip_lamports, "LIVE_JITO_TIP_LAMPORTS"),
     )
 
 
@@ -250,10 +280,10 @@ class LiveSolanaExecutor:
         params = {**params, "taker": taker}
         # Jupiter /order params that improve landing speed and efficiency
         # during volatile pump launches.
-        if self.priority_fee_lamports > 0:
-            params["priorityFeeLamports"] = str(self.priority_fee_lamports)
-        if self.jito_tip_lamports > 0:
-            params["jitoTipLamports"] = str(self.jito_tip_lamports)
+        if self.config.priority_fee_lamports > 0:
+            params["priorityFeeLamports"] = str(self.config.priority_fee_lamports)
+        if self.config.jito_tip_lamports > 0:
+            params["jitoTipLamports"] = str(self.config.jito_tip_lamports)
         # Request v1 transactions when supported (more efficient, smaller).
         params["maxSupportedTransactionVersion"] = "1"
         client = self._client_or_create()
@@ -278,14 +308,22 @@ class LiveSolanaExecutor:
                     else:
                         if not payload.get("transaction"):
                             error_code = payload.get("errorCode")
-                            error_msg = payload.get("error") or payload.get(
-                                "errorMessage", ""
+                            error_msg = str(
+                                payload.get("error")
+                                or payload.get("errorMessage")
+                                or ""
                             )
-                            reason = jupiter_error_reason(error_code, error_msg)
-                            last_error = LiveExecutionError(
-                                reason,
-                                f"{error_msg} (errorCode={error_code})",
+                            reason = jupiter_error_reason(
+                                error_code, payload.get("router")
                             )
+                            detail = (
+                                f"{error_msg} (errorCode={error_code})"
+                                if error_msg
+                                else f"errorCode={error_code}"
+                            )
+                            last_error = LiveExecutionError(reason, detail)
+                            if reason in _NON_RETRYABLE_LIVE_REASONS:
+                                break
                         else:
                             payload["_latency_ms"] = int(
                                 (time.perf_counter() - started) * 1000
@@ -321,14 +359,27 @@ class LiveSolanaExecutor:
                 "live_missing_solders", "solders is required for live execution"
             ) from exc
         try:
-            tx = VersionedTransaction.from_bytes(
-                base64.b64decode(transaction_b64, validate=True)
-            )
+            raw = base64.b64decode(transaction_b64, validate=True)
+        except Exception as exc:  # never echo the transaction payload
+            raise LiveExecutionError(
+                "live_sign_failed",
+                f"invalid transaction encoding: {type(exc).__name__}",
+            ) from exc
+        # v1 transactions use the 0x81 discriminator (SIMD-0385). solders
+        # >= 0.29.0 is required to deserialize and sign them.
+        is_v1 = bool(raw) and raw[0] == 0x81
+        try:
+            tx = VersionedTransaction.from_bytes(raw)
             keypair, _ = self._key()
             signed = VersionedTransaction(tx.message, [keypair])
         except LiveExecutionError:
             raise
         except Exception as exc:  # never echo the transaction payload
+            if is_v1:
+                raise LiveExecutionError(
+                    "live_v1_unsupported",
+                    "could not sign v1 transaction; require solders>=0.29.0",
+                ) from exc
             raise LiveExecutionError(
                 "live_sign_failed", f"could not sign transaction: {type(exc).__name__}"
             ) from exc

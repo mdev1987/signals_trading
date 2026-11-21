@@ -87,9 +87,9 @@ To stop: `kill $(cat output/paper/bot.pid)`. The bot handles SIGTERM and closes 
 - **Memory guard.** Self-restarts above 550 MB RSS instead of being OOM-killed; systemd restarts it.
 - **Graceful shutdown.** On SIGTERM, open positions are closed within 25 s and a run summary is written.
 - **Secrets never logged.** A logging filter redacts bot tokens and API keys.
-- **Faster landing with priority fees.** Live mode supports `LIVE_PRIORITY_FEE_LAMPORTS` and `LIVE_JITO_TIP_LAMPORTS` (also `--priority-fee-lamports`/`--jito-tip-lamports` CLI args). Higher fees help transactions land faster during volatile pump launches, reducing entry slippage. `run_bot.sh` defaults to 2000 lamports priority fee and 10000 lamports Jito tip.
-- **v1 transaction support.** Live mode requests `maxSupportedTransactionVersion=1` for more efficient transactions when Metis wins the route.
-- **Specific quote error diagnostics.** Jupiter `errorCode` values are parsed from empty-transaction responses: `errorCode=1` → insufficient funds, `errorCode=2` → insufficient SOL for gas, `errorCode=3` → below gasless minimum (aggregator routers); JupiterZ codes map similarly. These appear in logs as `live_insufficient_funds`, `live_insufficient_sol_for_gas`, etc.
+- **Faster landing with priority fees.** Live mode supports `LIVE_PRIORITY_FEE_LAMPORTS` and `LIVE_JITO_TIP_LAMPORTS`, and the `--priority-fee-lamports`/`--jito-tip-lamports` CLI flags. CLI flags take precedence; an explicit `0` overrides the env var. Higher fees help transactions land faster during volatile pump launches, reducing entry slippage. `run_bot.sh` defaults to 2000 lamports priority fee and 10000 lamports Jito tip.
+- **v1 transaction support.** Live mode requests `maxSupportedTransactionVersion=1`, so Jupiter can return larger v1 transactions when Metis wins the route and the order is not gasless; other routers and gasless orders stay v0. Signing v1 requires `solders>=0.29.0` (pinned in `pyproject.toml`).
+- **Specific quote error diagnostics.** Jupiter `errorCode` values are parsed from empty-transaction responses using the response `router`, because the codes differ by router. Aggregator routers (metis/dflow/okx): `1` → insufficient funds, `2` → insufficient SOL for gas, `3` → below gasless minimum. JupiterZ: `1` → insufficient balance, `2` → missing associated token account, `3` → quote could not be built. These appear in logs as `live_insufficient_funds`, `live_insufficient_sol_for_gas`, `live_missing_token_account`, etc., and terminal codes are not retried.
 
 ---
 
