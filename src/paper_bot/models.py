@@ -230,6 +230,10 @@ class ClosedTrade:
     exit_quote_router: str | None
     entry_quote_request_id: str | None
     exit_quote_request_id: str | None
+    # Tolerance that actually routed, so a run shows when a trade only filled
+    # because the slippage ladder widened past the configured level.
+    entry_quote_slippage_bps: int | None
+    exit_quote_slippage_bps: int | None
     exit_quote_attempts: int
     last_quote_error: str | None
     rule: str

@@ -82,6 +82,11 @@ class PaperStore:
                 "quote_request_id": (
                     position.entry_quote.request_id if position.entry_quote else None
                 ),
+                "quote_slippage_bps": (
+                    position.entry_quote.slippage_bps
+                    if position.entry_quote
+                    else None
+                ),
             },
         )
 

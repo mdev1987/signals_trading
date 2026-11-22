@@ -1059,6 +1059,10 @@ class PaperEngine:
             exit_quote_router=quote.router,
             entry_quote_request_id=entry_quote.request_id if entry_quote else None,
             exit_quote_request_id=quote.request_id,
+            entry_quote_slippage_bps=(
+                entry_quote.slippage_bps if entry_quote else None
+            ),
+            exit_quote_slippage_bps=quote.slippage_bps,
             exit_quote_attempts=position.exit_quote_attempts,
             last_quote_error=position.last_quote_error,
             rule=self.gate.rule,
