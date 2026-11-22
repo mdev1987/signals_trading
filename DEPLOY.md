@@ -13,7 +13,7 @@ One channel, one strategy (since 2026-11-22):
 
 The AVE, DRBT and SOLTRENDING lanes are research-only and are not started by
 `run_bot.sh`. Evidence and the reasons for retiring them:
-`output/backtest/channel_comparison/FINAL_REPORT.md`.
+`docs/SCANNER_EVIDENCE.md`.
 
 Paper mode is quote-only; live mode requires a double opt-in and fails closed.
 
@@ -150,16 +150,22 @@ What to watch in the first days:
 - `gate_rejected` reasons `rule_dex_not_pumpfunamm` and `rule_liquidity_*` are normal: the channel posts ~2,800 pools a day and only ~465 are in the band.
 - `skip` reasons on entries that do pass: `entry_delay_exceeded`, `entry_quote_failed`, `no_quote` are the real risk. A lane that cannot fill never had the backtested edge.
 - `Jupiter ... needed N bps` warnings show how often the widening ladder rescued a trade.
-- Compare the realized median and win rate with the backtest: 93.4 % win, +19.6 % median.
+- Compare the realized median and win rate with the deployed-convention
+  backtest (first buy print at/after card + 5 s, exit +5 min): 95.9 % win,
+  +22.1 % median over 1,849 trades. The exit is the fragile side: 17 % of the
+  5-minute exit prints are already over a minute stale, and marking those at
+  −100 % leaves only +3 SOL of the +45 SOL headline.
 
 ---
 
 ## 7. What NOT to change
 
-- Do **not** widen the liquidity band or extend the 5-minute hold: both were measured, and holding is unexecutable (61 % of 15-minute exit prints are stale).
+- Do **not** widen the liquidity band or extend the 5-minute hold: both were
+  measured, and holding is unexecutable (60 % of 15-minute exit prints are
+  already over a minute stale, median 466 s).
 - Do **not** add the AVE, DRBT or SOLTRENDING channels to the deployed bot.
-- Do **not** modify `execution_simulator.py` or `oxfile.toml`.
+- Do **not** modify `execution_simulator.py`.
 - Do **not** commit `.env`, `config.ini`, or `*.session` — all gitignored.
 - Fund the strategy only after the forward paper run passes the gates in
-  `FINAL_REPORT.md` §4 (≥300 trades, win ≥80 %, median ≥+10 %, realized exit no
-  more than 15 % worse than the marked exit).
+  `docs/SCANNER_EVIDENCE.md`: ≥300 trades, win ≥80 %, median ≥+10 %,
+  realized exit no more than 15 % worse than the marked exit.

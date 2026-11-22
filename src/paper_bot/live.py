@@ -75,6 +75,10 @@ _MEMORY: dict[str, float] = {"peak_mb": 0.0}
 # arriving a median ~16 s late; this distinguishes "the process was busy" from
 # "Telegram delivered late" without shelling into the host.
 _LOOP_LAG: dict[str, float] = {"max_ms": 0.0, "last_ms": 0.0}
+# Scanner feed telemetry: the channel posts each pool ~3x, and only the first
+# card is traded. Counted so skips.jsonl does not have to guess why two thirds
+# of the cards produced no signal.
+_SCANNER: dict[str, int] = {"cards": 0, "duplicates": 0}
 
 
 @dataclass(slots=True)
@@ -719,7 +723,14 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             ):
                 scanner_key = (lane.name, signal.token_address)
                 if scanner_key in scanner_seen:
+                    _SCANNER["duplicates"] += 1
+                    LOGGER.debug(
+                        "scanner duplicate card lane=%s %s",
+                        lane.name,
+                        signal.token_address,
+                    )
                     continue
+                _SCANNER["cards"] += 1
                 scanner_seen[scanner_key] = None
                 if len(scanner_seen) > config.message_dedup_window:
                     scanner_seen.popitem(last=False)
@@ -909,6 +920,8 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         "pending_entries": len(lane.engine.pending),
                         "wallet": lane.wallet_snapshot,
                         "shutdown_reason": shutdown_reason,
+                        "scanner_cards": _SCANNER["cards"],
+                        "scanner_duplicates": _SCANNER["duplicates"],
                         "stopped_at": datetime.now(UTC).isoformat(),
                     }
                 )

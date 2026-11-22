@@ -4,7 +4,7 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now paper-bot
 #
-# Edit /opt/signals_trading_vector/.env before starting (never committed).
+# Edit /home/mdev/Programming/signals_trading/.env before starting (never committed).
 # Paper mode is the default and never signs or broadcasts anything.
 # Live mode additionally needs LIVE_TRADING_ENABLED=1 and SOLANA_PRIVATE_KEY.
 
@@ -15,10 +15,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/mdev/Programming/signals_trading_vector
-ExecStart=/home/mdev/Programming/signals_trading_vector/run_bot.sh paper
+WorkingDirectory=/home/mdev/Programming/signals_trading
+ExecStart=/home/mdev/Programming/signals_trading/run_bot.sh paper
 # For live trading, change the ExecStart line to:
-#   ExecStart=/home/mdev/Programming/signals_trading_vector/run_bot.sh live
+#   ExecStart=/home/mdev/Programming/signals_trading/run_bot.sh live
 # and set LIVE_TRADING_ENABLED=1 + SOLANA_PRIVATE_KEY in .env.
 
 # Restart policy: always restart, with a backoff to avoid tight loops on
@@ -29,7 +29,7 @@ StartLimitBurst=5
 StartLimitIntervalSec=300
 
 # Environment file (gitignored, never committed).
-EnvironmentFile=-/home/mdev/Programming/signals_trading_vector/.env
+EnvironmentFile=-/home/mdev/Programming/signals_trading/.env
 
 # Resource limits suited to a small VPS (2–4 GB RAM). The bot self-guards at
 # 550 MB RSS and restarts cleanly; this is a hard ceiling.
@@ -39,9 +39,13 @@ MemorySwapMax=0
 # Security: no new privileges, private /tmp, hide kernel details.
 NoNewPrivileges=true
 ProtectSystem=full
-ReadWritePaths=/home/mdev/Programming/signals_trading_vector/output /home/mdev/Programming/signals_trading_vector/tg_session.session
+# Telethon keeps the SQLite session (and its -journal/-wal siblings) next to the
+# repo, so the project root must stay writable. /home is otherwise read-only
+# for this unit; ProtectHome=true would also hide the WorkingDirectory and stop
+# the service from starting at all.
+ReadWritePaths=/home/mdev/Programming/signals_trading
 PrivateTmp=true
-ProtectHome=true
+ProtectHome=read-only
 
 # Logging to journald; the bot also writes output/paper/bot_YYYYMMDD.log.
 StandardOutput=journal

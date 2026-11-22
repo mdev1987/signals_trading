@@ -102,7 +102,20 @@ def main(argv: list[str] | None = None) -> int:
         default=REPO_ROOT
         / "output/backtest/ave_signals/patterns_5m_8d/features.csv",
     )
-    parser.add_argument("--oos-only", action="store_true", default=True)
+    window = parser.add_mutually_exclusive_group()
+    window.add_argument(
+        "--oos-only",
+        dest="oos_only",
+        action="store_true",
+        default=True,
+        help="use holdout days only (default)",
+    )
+    window.add_argument(
+        "--include-train",
+        dest="oos_only",
+        action="store_false",
+        help="include the train days as well",
+    )
     args = parser.parse_args(argv)
 
     ohlcv = load_returns(args.ohlcv, "ohlcv_return")

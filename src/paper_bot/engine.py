@@ -107,6 +107,11 @@ class EngineConfig:
     # behaviour). "timer": quote at the delay regardless of prints, which is
     # what the research backtest assumes (entry at signal + ~5 s).
     entry_mode: str = "trade"
+    # Trade mode re-quotes on every BUY print. A pool that is merely unindexed
+    # emits several prints a second, so without a gap one print becomes a
+    # burst of quote requests. One attempt per mint per second is enough to
+    # catch the first routable print inside the entry window.
+    entry_retry_backoff_ms: int = 1_000
     horizon_ms: int = 900_000
     tp_pct: float | None = None
     sl_pct: float | None = None
@@ -127,6 +132,23 @@ class EngineConfig:
             )
         if self.entry_mode == "timer" and not self.live:
             raise ValueError("entry_mode='timer' requires live=True")
+
+
+def entry_backoff_active(
+    pending: PendingEntry, *, event_ts_ms: int, backoff_ms: int
+) -> bool:
+    """Return whether a failed-entry retry must wait for a later print.
+
+    A pool that is merely unindexed emits several BUY prints a second, and each
+    quote attempt walks the slippage ladder. Without this gap one print becomes
+    a burst of requests; one attempt per mint per interval is enough to catch
+    the first routable print inside the entry window.
+    """
+    return (
+        backoff_ms > 0
+        and pending.trigger_ts_ms is not None
+        and event_ts_ms - pending.trigger_ts_ms < backoff_ms
+    )
 
 
 class PaperEngine:
@@ -415,6 +437,12 @@ class PaperEngine:
                 return
             if event.timestamp_ms > pending.expires_at_ms:
                 self._skip_pending(pending, "entry_delay_exceeded", None)
+                return
+            if entry_backoff_active(
+                pending,
+                event_ts_ms=event.timestamp_ms,
+                backoff_ms=self.config.entry_retry_backoff_ms,
+            ):
                 return
             pending.saw_buy = True
             await self._trigger_entry(

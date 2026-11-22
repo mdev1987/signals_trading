@@ -5,15 +5,18 @@ The replay dataset shipped for the AVE study only contains the 309 mints that
 AveSignalMonitor alerted on, so the scanner feeds cannot be priced from
 ``output/backtest/days/<day>/parquet/events.parquet``. This tool reads the raw
 hourly archives (``/mnt/HDD/PumpAPI_Replay_Zst/<day>/*.jsonl.zst``) once,
-keeps only trades for alerted mints, and records the last real trade at or
-before each decision timestamp — the same realistic fill convention as
-``backtest_ave_signals.py --fill-source event``.
+keeps only trades for alerted mints, and records a real trade print as the
+fill — the same realistic fill convention as
+``backtest_ave_signals.py --fill-source event``. Two entry conventions are
+available: ``last-before`` (the last print at/before the decision, with stale
+prints filtered) and ``first-after`` (the first print at/after it, which is
+what the deployed trade-mode bot does).
 
 Input is the per-day ``channel_features.csv`` written by
 ``prepare_channel_signals.py`` (one row per channel/mint alert). Output is
 ``alerts_priced.csv`` with, for each horizon:
 
-    entry_ts / entry_px / entry_price_age_ms
+    entry_ts / entry_px / entry_price_age_ms / entry_delay_ms
     exit_<h>m_ts / exit_<h>m_px / exit_<h>m_age_ms
     net_<h>m_return              (after --fee-rate per side)
     first_trade_ts / alert_to_first_trade_ms
@@ -52,7 +55,7 @@ ACTION_BYTES_RE = re.compile(rb'"action":"([a-z]+)"')
 def iter_target_trades(
     path: Path,
     targets: set[bytes],
-    min_quote_sol: float = 0.0,
+    min_quote_sol: float = 0.01,
     action: str = "any",
 ):
     """Yield (mint, timestamp, price) for target mints only.
@@ -138,14 +141,41 @@ def load_targets(day: str, latency_ms: int, horizons: list[int]) -> list[dict]:
     return targets
 
 
+def select_entry(
+    target: dict,
+    timestamp: int,
+    price: float,
+    previous: tuple[int, float] | None,
+    mode: str,
+) -> None:
+    """Record the entry fill for one target, if this trade decides it.
+
+    ``last-before`` uses the most recent print at or before the decision and is
+    the conservative mark for a fast mover; ``first-after`` uses the first
+    print at or after it, which is what the deployed trade-mode bot buys.
+    """
+    if target["entry_checked"]:
+        return
+    if mode == "first-after":
+        if timestamp >= target["entry_target"]:
+            target["entry_checked"] = True
+            target["entry_ts"], target["entry_px"] = timestamp, price
+        return
+    if timestamp > target["entry_target"]:
+        target["entry_checked"] = True
+        if previous is not None and previous[0] <= target["entry_target"]:
+            target["entry_ts"], target["entry_px"] = previous
+
+
 def stream_day(
     day: str,
     targets: list[dict],
     horizons: list[int],
     *,
     replay_root: Path = REPLAY_ROOT,
-    min_quote_sol: float = 0.0,
+    min_quote_sol: float = 0.01,
     action: str = "any",
+    entry_fill_mode: str = "last-before",
     verbose: bool = True,
 ) -> int:
     by_mint: dict[str, list[dict]] = {}
@@ -172,10 +202,9 @@ def stream_day(
                 for target in by_mint[mint]:
                     target["first_trade_ts"] = timestamp
             for target in by_mint[mint]:
-                if not target["entry_checked"] and timestamp > target["entry_target"]:
-                    target["entry_checked"] = True
-                    if previous is not None and previous[0] <= target["entry_target"]:
-                        target["entry_ts"], target["entry_px"] = previous
+                select_entry(
+                    target, timestamp, price, previous, entry_fill_mode
+                )
                 for horizon in horizons:
                     key = f"exit_{horizon}"
                     if (
@@ -196,13 +225,20 @@ def stream_day(
             )
 
     # Fill targets whose decision timestamp is after the last trade of the day.
+    # ``first-after`` has nothing to buy once the tape stops, so it stays
+    # unpriced there; ``last-before`` falls back to the final print. Exits are
+    # backfilled either way.
     for mint, mint_targets in by_mint.items():
         previous = last.get(mint)
         if previous is None:
             continue
         timestamp, price = previous
         for target in mint_targets:
-            if target["entry_px"] is None and timestamp <= target["entry_target"]:
+            if (
+                entry_fill_mode == "last-before"
+                and target["entry_px"] is None
+                and timestamp <= target["entry_target"]
+            ):
                 target["entry_ts"], target["entry_px"] = timestamp, price
             for horizon in horizons:
                 key = f"exit_{horizon}"
@@ -219,6 +255,9 @@ def build_frame(
     horizons: list[int],
     latency_ms: int,
     fee_rate: float,
+    *,
+    max_entry_age_ms: int = 0,
+    max_entry_delay_ms: int = 60_000,
 ) -> pd.DataFrame:
     rows = []
     for target in targets:
@@ -227,9 +266,33 @@ def build_frame(
         row["latency_ms"] = latency_ms
         row["entry_ts"] = target["entry_ts"]
         row["entry_px"] = target["entry_px"]
+        # Negative for ``first-after``: the fill happens after the decision.
+        # ``entry_price_age_ms`` is the age of the print (stale side);
+        # ``entry_delay_ms`` is the signed lag of the fill itself.
         row["entry_price_age_ms"] = (
             None if target["entry_ts"] is None else target["entry_target"] - target["entry_ts"]
         )
+        row["entry_delay_ms"] = (
+            None if target["entry_ts"] is None else target["entry_ts"] - target["entry_target"]
+        )
+        too_stale = (
+            max_entry_age_ms > 0
+            and row["entry_price_age_ms"] is not None
+            and row["entry_price_age_ms"] > max_entry_age_ms
+        )
+        too_late = (
+            max_entry_delay_ms > 0
+            and row["entry_delay_ms"] is not None
+            and row["entry_delay_ms"] > max_entry_delay_ms
+        )
+        if too_stale or too_late:
+            # Neither print is a fill the deployed bot could have taken: a
+            # stale mark on one side, a missed entry window on the other.
+            # Drop the entry so the row is excluded from returns.
+            row["entry_ts"] = None
+            row["entry_px"] = None
+            row["entry_price_age_ms"] = None
+            row["entry_delay_ms"] = None
         row["first_trade_ts"] = target["first_trade_ts"]
         row["alert_to_first_trade_ms"] = (
             None
@@ -254,6 +317,10 @@ def build_frame(
                 )
             else:
                 row[f"net_{horizon}m_return"] = None
+        if row["entry_px"] is None:
+            # The entry was rejected as stale; its returns are not observations.
+            for horizon in horizons:
+                row[f"net_{horizon}m_return"] = None
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -268,11 +335,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--min-quote-sol",
         type=float,
-        default=0.0,
+        default=0.01,
         help=(
-            "Ignore trades whose quoteAmount is below this many SOL. Set a "
-            "small floor (e.g. 0.01) to drop sub-cent dust prints that corrupt "
-            "priceSol with impossible values."
+            "Ignore trades whose quoteAmount is below this many SOL. The "
+            "default 0.01 drops sub-cent dust prints whose priceSol is an "
+            "impossible feed artifact rather than an executable price."
         ),
     )
     parser.add_argument(
@@ -280,6 +347,36 @@ def main(argv: list[str] | None = None) -> int:
         choices=("any", "buy", "sell"),
         default="any",
         help="Price only on prints of this side (e.g. 'sell' to model what a seller receives).",
+    )
+    parser.add_argument(
+        "--entry-fill-mode",
+        choices=("last-before", "first-after"),
+        default="last-before",
+        help=(
+            "last-before: the last print at/before the decision (conservative, "
+            "but stale on a fast mover). first-after: the first print at/after "
+            "the decision, which is what the deployed trade-mode bot does."
+        ),
+    )
+    parser.add_argument(
+        "--max-entry-age-ms",
+        type=int,
+        default=2_000,
+        help=(
+            "Drop the entry when the print it would use is older than this. "
+            "0 disables the filter. Ignored for first-after, whose prints are "
+            "always at or after the decision."
+        ),
+    )
+    parser.add_argument(
+        "--max-entry-delay-ms",
+        type=int,
+        default=60_000,
+        help=(
+            "Drop an entry that would fill later than this after the decision "
+            "(the deployed bot gives up at 60 s). Applies to first-after; "
+            "last-before fills are covered by --max-entry-age-ms."
+        ),
     )
     parser.add_argument(
         "--tag",
@@ -301,8 +398,16 @@ def main(argv: list[str] | None = None) -> int:
         replay_root=args.replay_root,
         min_quote_sol=args.min_quote_sol,
         action=args.action,
+        entry_fill_mode=args.entry_fill_mode,
     )
-    frame = build_frame(targets, horizons, args.latency_ms, args.fee_rate)
+    frame = build_frame(
+        targets,
+        horizons,
+        args.latency_ms,
+        args.fee_rate,
+        max_entry_age_ms=args.max_entry_age_ms,
+        max_entry_delay_ms=args.max_entry_delay_ms,
+    )
 
     suffix = f"_{args.tag}" if args.tag else ""
     out = args.out or CHANNEL_ROOT / args.day / f"alerts_priced{suffix}.csv"
@@ -316,6 +421,11 @@ def main(argv: list[str] | None = None) -> int:
         "mints": int(frame["mint"].nunique()),
         "with_entry_price": int(priced.sum()),
         "coverage": float(priced.mean()) if len(frame) else 0.0,
+        "entry_fill_mode": args.entry_fill_mode,
+        "max_entry_age_ms": args.max_entry_age_ms,
+        "max_entry_delay_ms": args.max_entry_delay_ms,
+        "min_quote_sol": args.min_quote_sol,
+        "action": args.action,
     }
     for horizon in horizons:
         column = f"net_{horizon}m_return"

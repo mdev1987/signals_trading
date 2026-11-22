@@ -16,6 +16,7 @@ SRC_DIR = Path(__file__).resolve().parents[1]
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from paper_bot.engine import entry_backoff_active  # noqa: E402
 from paper_bot.execution import (  # noqa: E402
     LiveExecutionConfig,
     LiveExecutionError,
@@ -25,7 +26,7 @@ from paper_bot.execution import (  # noqa: E402
     live_config_from_env,
 )
 from paper_bot.history import MarketHistory  # noqa: E402
-from paper_bot.models import Signal, TradeEvent  # noqa: E402
+from paper_bot.models import PendingEntry, Signal, TradeEvent  # noqa: E402
 from paper_bot.notifier import format_startup  # noqa: E402
 from paper_bot.quotes import (  # noqa: E402
     QuoteError,
@@ -151,6 +152,30 @@ class ScannerCardTests(unittest.TestCase):
         self.assertFalse(allowed(dex="Pumpfunamm", liquidity_usd=100_000.0))
         self.assertFalse(allowed(dex="Raydiumclmm", liquidity_usd=50_000.0))
         self.assertFalse(allowed(dex="Pumpfunamm", liquidity_usd=None))
+
+    def test_market_cap_and_symbol_are_mapped_for_the_gate(self) -> None:
+        result = parse_signal_text(
+            SCANNER_CARD,
+            signal_ts_ms=SIGNAL_TS,
+            received_ts_ms=SIGNAL_TS,
+        )
+        self.assertEqual(result.features["mc_usd"], 29_030.0)
+        self.assertEqual(result.features["mcap_usd"], 29_030.0)
+        self.assertEqual(result.features["symbol"], "BERNIE")
+        # A market-cap bound now actually reads the card's cap instead of
+        # rejecting every scanner signal for a missing ``mc_usd``.
+        self.assertNotIn(
+            "mc_below_min",
+            evaluate_gate(
+                result, GateConfig(rule=SCANNER_RULE, min_mc_usd=10_000.0)
+            ).reasons,
+        )
+        self.assertIn(
+            "mc_above_max",
+            evaluate_gate(
+                result, GateConfig(rule=SCANNER_RULE, max_mc_usd=10_000.0)
+            ).reasons,
+        )
 
     def test_card_liquidity_is_judged_against_the_rule(self) -> None:
         result = parse_signal_text(
@@ -359,6 +384,43 @@ class HistoryFeatureTests(unittest.TestCase):
         )
         stats = history.stats(MINT, SIGNAL_TS)
         self.assertIsNone(stats["pre_ret_15m"])
+
+
+class EntryBackoffTests(unittest.TestCase):
+    def pending(self, trigger_ts_ms: int | None) -> PendingEntry:
+        return PendingEntry(
+            signal=signal({}),
+            eligible_at_ms=SIGNAL_TS,
+            expires_at_ms=SIGNAL_TS + 60_000,
+            trigger_ts_ms=trigger_ts_ms,
+        )
+
+    def test_first_attempt_is_never_blocked(self) -> None:
+        self.assertFalse(
+            entry_backoff_active(
+                self.pending(None), event_ts_ms=SIGNAL_TS, backoff_ms=1_000
+            )
+        )
+
+    def test_retry_waits_for_the_interval(self) -> None:
+        item = self.pending(SIGNAL_TS)
+        self.assertTrue(
+            entry_backoff_active(
+                item, event_ts_ms=SIGNAL_TS + 200, backoff_ms=1_000
+            )
+        )
+        self.assertFalse(
+            entry_backoff_active(
+                item, event_ts_ms=SIGNAL_TS + 1_000, backoff_ms=1_000
+            )
+        )
+
+    def test_zero_backoff_disables_the_gate(self) -> None:
+        self.assertFalse(
+            entry_backoff_active(
+                self.pending(SIGNAL_TS), event_ts_ms=SIGNAL_TS, backoff_ms=0
+            )
+        )
 
 
 class LiveGuardTests(unittest.TestCase):
@@ -697,6 +759,14 @@ class QuoteRobustnessTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(slippage_ladder(0, 100), (50, 100))
         self.assertEqual(slippage_ladder(300, 200), (300,))
+        # A zero ceiling stays zero; the old floor silently exceeded it.
+        self.assertEqual(slippage_ladder(0, 0), (0,))
+
+    def test_provider_rejects_a_max_below_the_base(self) -> None:
+        with self.assertRaises(ValueError):
+            JupiterQuoteProvider(
+                api_key=None, slippage_bps=200, max_slippage_bps=100
+            )
 
     def test_no_route_is_transient_for_entries_but_terminal_for_exits(self) -> None:
         self.assertTrue(is_transient_quote_error("quote_no_route"))

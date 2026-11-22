@@ -53,9 +53,11 @@ LIVE_QUOTE_SOURCE = "jupiter_live"
 
 
 # Jupiter /order errorCode values that will not change by retrying the exact
-# same request. Terminal reasons short-circuit the inner retry loop; the outer
-# loop may still widen the slippage tolerance before giving up.
-_NON_RETRYABLE_LIVE_REASONS = frozenset(
+# same request. "Inner terminal" short-circuits the retry loop at one
+# tolerance; the outer slippage loop may still try a wider one, which is why a
+# reason can appear in both sets. The names describe *which loop* the predicate
+# stops, not whether the trade is abandoned.
+_INNER_TERMINAL_LIVE_REASONS = frozenset(
     {
         "live_insufficient_funds",
         "live_insufficient_sol_for_gas",
@@ -67,7 +69,8 @@ _NON_RETRYABLE_LIVE_REASONS = frozenset(
 
 # Failures where a wider slippage tolerance can turn "no transaction" into a
 # signed order. A fresh Pumpfun AMM pool is routinely unrouteable at 50 bps.
-_ESCALATABLE_LIVE_REASONS = frozenset(
+# Overlap with the inner-terminal set above is intentional (see its comment).
+_OUTER_ESCALATABLE_LIVE_REASONS = frozenset(
     {
         "quote_no_route",
         "live_order_build_failed",
@@ -257,6 +260,9 @@ class LiveSolanaExecutor:
         )
         self._keypair: Any | None = None
         self._pubkey: str | None = None
+        # Some deployments reject maxSupportedTransactionVersion. Remember the
+        # rejection so the slippage ladder does not pay a 400 at every level.
+        self._v1_supported = True
 
     @property
     def enabled(self) -> bool:
@@ -326,7 +332,7 @@ class LiveSolanaExecutor:
                 )
             except LiveExecutionError as exc:
                 last_error = exc
-                if exc.reason not in _ESCALATABLE_LIVE_REASONS:
+                if exc.reason not in _OUTER_ESCALATABLE_LIVE_REASONS:
                     raise
                 LOGGER.info(
                     "Jupiter %s found no order at %d bps (%s); widening",
@@ -355,7 +361,8 @@ class LiveSolanaExecutor:
         # Request v1 transactions when supported (more efficient, smaller).
         # Older deployments reject the parameter outright, so a 400 naming it
         # drops it and retries instead of failing every order.
-        request["maxSupportedTransactionVersion"] = "1"
+        if self._v1_supported:
+            request["maxSupportedTransactionVersion"] = "1"
         # Jupiter /order params that improve landing speed and efficiency
         # during volatile pump launches.
         if self.config.priority_fee_lamports > 0:
@@ -402,8 +409,8 @@ class LiveSolanaExecutor:
                             )
                             last_error = LiveExecutionError(reason, detail)
                             if (
-                                reason in _NON_RETRYABLE_LIVE_REASONS
-                                or reason in _ESCALATABLE_LIVE_REASONS
+                                reason in _INNER_TERMINAL_LIVE_REASONS
+                                or reason in _OUTER_ESCALATABLE_LIVE_REASONS
                             ):
                                 # Either terminal at this tolerance or better
                                 # tried with a wider one: repeating the identical
@@ -425,8 +432,10 @@ class LiveSolanaExecutor:
                         "maxsupportedtransactionversion" in lowered
                         and "maxSupportedTransactionVersion" in request
                     ):
-                        # The endpoint does not know the parameter: drop it and
-                        # retry without spending one of the retry attempts.
+                        # The endpoint does not know the parameter: drop it for
+                        # good (every later order and ladder level) and retry
+                        # without spending one of the retry attempts.
+                        self._v1_supported = False
                         request.pop("maxSupportedTransactionVersion")
                         attempts -= 1
                         continue

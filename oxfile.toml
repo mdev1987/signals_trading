@@ -4,7 +4,7 @@ version = 1
 #
 # One channel, one strategy. The deployed rule is `scanner_pumpfun_amm`
 # (`src/paper_bot/signals.py`); evidence and the reasons the other feeds were
-# retired are in `output/backtest/channel_comparison/FINAL_REPORT.md`:
+# retired are in `docs/SCANNER_EVIDENCE.md`:
 #
 #   channel  @AveSolanaTokenScanner   first card per mint (the channel re-posts
 #                                    each pool ~3x; only the first is used)
@@ -15,7 +15,8 @@ version = 1
 #   size     0.1 SOL, at most 10 concurrent positions
 #
 # Do not widen the liquidity band or extend the hold: the median token stops
-# printing by minute 7, and 61 % of 15-minute exit marks are already stale.
+# printing by minute 7, and 60 % of 15-minute exit marks are already over a
+# minute stale.
 # The AVE and DRBT feeds are retired. `channels.txt` is the research list and
 # never changes what this app consumes: the channel is pinned on the command
 # line below.
@@ -40,7 +41,8 @@ version = 1
 #   LIVE_STARTING_SOL=<wallet balance shown in reports>
 #   LIVE_MAX_SLIPPAGE_BPS=1000
 # The live path refuses A/B lanes, preflight sells, and any notional above
-# --notional-sol. Fund it only after the paper gates in FINAL_REPORT.md §4.
+# --notional-sol. Fund it only after the paper gates in
+# `docs/SCANNER_EVIDENCE.md`.
 #
 # One-time setup:
 #   cd /home/mdev/Programming/signals_trading

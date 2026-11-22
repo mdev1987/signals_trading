@@ -76,12 +76,16 @@ RULE_DESCRIPTIONS = {
 }
 
 # Scanner-feed strategy (2026-11-22). On the four replay days with scanner
-# history, fresh Pumpfun AMM pools were the only positive cohort: buying the
-# first pool card at +20 s and selling 5 minutes later won 93.4% of 1,860
-# trades, median +19.6%. Every other DEX and the sub-20k / over-100k liquidity
-# bands were flat or negative. The win rate is implausibly high and is assumed
-# to be a bundled-launch chart pump, so this ships as a paper lane until it is
-# validated forward. See output/backtest/channel_comparison/FINDINGS.md.
+# history, fresh Pumpfun AMM pools were the only positive cohort. Priced the
+# way the bot trades — first buy print at/after the card + 5 s, hard exit
+# 5 min later — the band won 95.9% of 1,849 trades, median +22.1% (+45.1 SOL
+# at 0.1 SOL). The earlier 20 s last-before mark (93.4%) is not the deployed
+# convention and leaned on stale prints: 30% of those entries used a print
+# more than 2 s old. Every other DEX and the sub-20k / over-100k liquidity
+# bands were flat or negative. The win rate is implausibly high and is
+# assumed to be a bundled-launch chart pump, and 17% of 5-minute exit prints
+# are already over a minute stale, so this ships as a paper lane until it is
+# validated forward. See docs/SCANNER_EVIDENCE.md.
 SCANNER_RULE = "scanner_pumpfun_amm"
 SCANNER_ALLOWED_DEX = "Pumpfunamm"
 SCANNER_MIN_LIQUIDITY_USD = 20_000.0
@@ -277,7 +281,13 @@ def _scanner_signal(
         "dex": card.get("dex"),
         "liquidity_usd": card.get("liquidity_usd"),
         "mcap_usd": card.get("mcap_usd"),
+        # The gate's market-cap bounds read ``mc_usd``; keep both names so a
+        # scanner card is filtered by the same field the AVE feed populates.
+        "mc_usd": card.get("mcap_usd"),
         "card_symbol": card.get("symbol"),
+        # Notifications read ``features['symbol']``; without this a scanner
+        # buy/sell renders as ``None`` even though the card prints a ticker.
+        "symbol": card.get("symbol"),
     }
     if received_ts_ms > 0 and signal_ts_ms > 0:
         features["delivery_lag_ms"] = max(0, received_ts_ms - signal_ts_ms)

@@ -42,7 +42,13 @@ def available(days: list[str] | None, tag: str = "") -> list[str]:
     return found
 
 
-def load(days: list[str], horizon: int, tag: str = "") -> pd.DataFrame:
+def load(
+    days: list[str],
+    horizon: int,
+    tag: str = "",
+    max_entry_delay_ms: int = 60_000,
+    max_entry_age_ms: int = 2_000,
+) -> pd.DataFrame:
     suffix = f"_{tag}" if tag else ""
     frames = []
     for day in days:
@@ -52,12 +58,20 @@ def load(days: list[str], horizon: int, tag: str = "") -> pd.DataFrame:
         frame = pd.read_csv(path)
         frame["day"] = day
         frame["return"] = frame[f"net_{horizon}m_return"]
-        frame = frame[
+        keep = (
             frame["entry_px"].notna()
             & frame["entry_ts"].notna()
             & frame["return"].notna()
             & np.isfinite(frame["return"])
-        ].copy()
+        )
+        if "entry_delay_ms" in frame and max_entry_delay_ms > 0:
+            # A first-after fill that arrived minutes later is not a trade the
+            # deployed 60 s window could have taken.
+            keep &= frame["entry_delay_ms"].fillna(0) <= max_entry_delay_ms
+        if "entry_price_age_ms" in frame and max_entry_age_ms > 0:
+            # A last-before fill older than the tolerance is a stale mark.
+            keep &= frame["entry_price_age_ms"].fillna(0) <= max_entry_age_ms
+        frame = frame[keep].copy()
         frames.append(frame)
     if not frames:
         return pd.DataFrame()
@@ -143,9 +157,13 @@ def channel_table(frame: pd.DataFrame) -> pd.DataFrame:
     for channel, block in frame.groupby("channel"):
         row = {"channel": channel, "priced": len(block)}
         row.update(describe(block["return"]))
-        row["entry_age_s_median"] = round(
-            float(block["entry_price_age_ms"].median()) / 1000, 1
-        )
+        # Negative = the fill used a print older than the decision (a stale
+        # mark); positive = the bot waited for a print after it.
+        if "entry_delay_ms" in block:
+            lag = block["entry_delay_ms"]
+        else:
+            lag = -block["entry_price_age_ms"]
+        row["entry_lag_s_median"] = round(float(lag.median()) / 1000, 1)
         rows.append(row)
     return table(rows).sort_values("n", ascending=False)
 
@@ -346,14 +364,25 @@ def write_report(
     greedy: pd.DataFrame,
     out_dir: Path,
     latency_ms: int,
+    fill_mode: str = "last-before",
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
+    if fill_mode == "first-after":
+        entry_note = (
+            "Entry = the first real trade at or after the decision (the "
+            "deployed trade-mode convention)."
+        )
+    else:
+        entry_note = (
+            "Entry = the last real trade at or before the decision, with "
+            "prints older than the entry-age filter dropped."
+        )
     lines = [
         f"# Channel comparison, realistic {horizon}-minute fills",
         "",
-        f"Days: {', '.join(days)}. Entry = first alert + {latency_ms / 1000:g} s,"
-        " priced at the last",
-        "real trade at or before the decision; 1.25 % fee per side.",
+        f"Days: {', '.join(days)}. First alert + {latency_ms / 1000:g} s. "
+        f"{entry_note}",
+        "Exit = last print at/before the horizon; 1.25 % fee per side.",
         "",
         "## Base rates",
         "",
@@ -404,10 +433,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--tag", default="", help="Read alerts_priced_<tag>.csv instead of the default."
     )
+    parser.add_argument(
+        "--fill-mode",
+        choices=("last-before", "first-after"),
+        default="last-before",
+        help="Entry convention used when pricing (report label only).",
+    )
+    parser.add_argument(
+        "--max-entry-delay-ms",
+        type=int,
+        default=60_000,
+        help=(
+            "Drop first-after fills later than this after the decision "
+            "(matches the deployed entry window); 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--max-entry-age-ms",
+        type=int,
+        default=2_000,
+        help="Drop last-before fills whose print is older than this; 0 disables.",
+    )
     args = parser.parse_args(argv)
 
     days = available(args.days, args.tag)
-    frame = load(days, args.horizon, args.tag)
+    frame = load(
+        days,
+        args.horizon,
+        args.tag,
+        args.max_entry_delay_ms,
+        args.max_entry_age_ms,
+    )
     if frame.empty:
         raise SystemExit("No priced alerts found; run alert_outcomes.py first.")
     if "@AveSignalMonitor" not in set(frame["channel"]):
@@ -452,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         block.to_csv(out_dir / f"bucket_{safe}.csv", index=False)
     path = write_report(
         days, args.horizon, frame, channels, overlap, pairs, buckets, dex_table,
-        greedy, out_dir, args.latency_ms,
+        greedy, out_dir, args.latency_ms, args.fill_mode,
     )
 
     summary = {

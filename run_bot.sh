@@ -7,7 +7,7 @@
 #   entry on the first buy print after the card, hard exit at +5 min.
 #
 # The AVE, DRBT and SOLTRENDING lanes are research-only and are NOT started by
-# this script. See output/backtest/channel_comparison/FINAL_REPORT.md.
+# this script. See docs/SCANNER_EVIDENCE.md.
 #
 # Usage:
 #   ./run_bot.sh              # paper mode (quote-only, never broadcasts) — recommended start

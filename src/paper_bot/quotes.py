@@ -55,12 +55,15 @@ PERMANENT_QUOTE_ERRORS = frozenset(
 
 # Reasons where a wider slippage tolerance can turn a miss into a route. A new
 # Pumpfun AMM pool frequently quotes at 100-500 bps while failing at 50.
+#
+# Deliberately narrow: ``quote_not_ready`` (HTTP 400 on an unindexed pool) is a
+# *time* problem, not a tolerance problem, and escalating it turns one buy
+# print into a six-request burst without improving the odds. The engine
+# retries it on the next print with a per-mint backoff instead.
 ESCALATABLE_QUOTE_ERRORS = frozenset(
     {
         "quote_no_route",
-        "quote_not_ready",
         "quote_missing_out_amount",
-        "quote_zero_out",
     }
 )
 
@@ -81,14 +84,18 @@ def slippage_ladder(
     """Return the slippage levels to try, cheapest first.
 
     ``base`` is the configured tolerance. Each level doubles it (with a floor
-    of 50 bps when base is 0) until ``max_bps``, which is always the last
-    level. The ladder is deduplicated and monotonic.
+    of 50 bps when base is 0) until ``max_bps``, which is the last level. The
+    ladder is deduplicated and monotonic, and never exceeds ``max_bps``: a
+    zero ceiling stays zero rather than jumping to the 50 bps floor.
     """
     base = max(0, int(base_bps))
     cap = max(base, int(max_bps))
-    levels = [base if base > 0 else 50]
+    if cap <= 0:
+        return (0,)
+    levels = [min(50, cap) if base <= 0 else base]
+    start = levels[0]
     for factor in (2, 4, 8, 16, 32):
-        level = (base if base > 0 else 50) * factor
+        level = start * factor
         if level > cap:
             break
         if level > levels[-1]:
@@ -230,13 +237,19 @@ class JupiterQuoteProvider:
         metadata: TokenMetadataResolver | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        if slippage_bps < 0 or slippage_bps > 10_000:
+            raise ValueError("slippage_bps must be in [0, 10000]")
+        if not slippage_bps <= max_slippage_bps <= 10_000:
+            raise ValueError(
+                "max_slippage_bps must be between slippage_bps and 10000"
+            )
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
         self.retries = max(1, retries)
         self.backoff_s = backoff_s
         self.slippage_bps = slippage_bps
-        self.max_slippage_bps = max(slippage_bps, max_slippage_bps)
+        self.max_slippage_bps = max_slippage_bps
         self._client = client
         self._owns_client = client is None
         self.metadata = metadata or TokenMetadataResolver(
@@ -259,7 +272,9 @@ class JupiterQuoteProvider:
         client = await self._get_client()
         headers = {"x-api-key": self.api_key} if self.api_key else {}
         last_error: QuoteError | None = None
+        attempts = 0
         for attempt in range(self.retries):
+            attempts += 1
             started = time.perf_counter()
             try:
                 response = await client.get(
@@ -354,7 +369,7 @@ class JupiterQuoteProvider:
         LOGGER.warning(
             "Jupiter /order %s failed after %d attempt(s) (%s): %s",
             action,
-            self.retries,
+            attempts,
             last_error.reason,
             str(last_error.detail)[:300],
         )
