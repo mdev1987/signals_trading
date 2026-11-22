@@ -209,6 +209,48 @@ async def fetch_day(
     return report
 
 
+def channel_totals(reports: list[dict]) -> list[dict]:
+    """Sum one channel's exports across days.
+
+    ``run`` used to print only the first channel's summary, which let a handle
+    that never resolves (e.g. ``@SOLTRENDING``, which exported 0 messages on
+    eight separate days) look like a successful fetch. The totals make an empty
+    channel explicit.
+    """
+    totals: dict[str, dict] = {}
+    for report in reports:
+        for channel, entry in report.get("channels", {}).items():
+            summary = entry.get("summary", {})
+            total = totals.setdefault(
+                channel,
+                {"channel": channel, "days": 0, "messages": 0, "solana_ca_rows": 0, "empty_days": 0},
+            )
+            total["days"] += 1
+            total["messages"] += int(summary.get("messages") or 0)
+            total["solana_ca_rows"] += int(summary.get("solana_ca_rows") or 0)
+            if not summary.get("messages"):
+                total["empty_days"] += 1
+    return list(totals.values())
+
+
+def format_channel_totals(totals: list[dict]) -> list[str]:
+    """One aligned line per channel plus a hint when a channel is empty."""
+    if not totals:
+        return []
+    width = max(len(total["channel"]) for total in totals)
+    lines = []
+    for total in totals:
+        line = (
+            f"  {total['channel']:<{width}}  {total['messages']:>7} messages  "
+            f"{total['solana_ca_rows']:>6} solana CAs  "
+            f"empty on {total['empty_days']}/{total['days']} days"
+        )
+        if total["messages"] == 0:
+            line += "  <-- EMPTY: check the handle with src/probe_channels.py"
+        lines.append(line)
+    return lines
+
+
 async def run(args: argparse.Namespace) -> int:
     replay_root = Path(args.replay_root)
     days = discover_days(replay_root, args.days or None)
@@ -227,6 +269,7 @@ async def run(args: argparse.Namespace) -> int:
     if not config.exists():
         raise FileNotFoundError(f"Telegram config not found: {config}")
 
+    reports: list[dict] = []
     for name, day_dir in days:
         report = await fetch_day(
             channels=channels,
@@ -238,6 +281,7 @@ async def run(args: argparse.Namespace) -> int:
             limit=args.limit,
             force=args.force,
         )
+        reports.append(report)
         summary = report["channels"][channels[0]]["summary"]
         print(
             f"{name}: {summary['messages']} messages, "
@@ -245,6 +289,10 @@ async def run(args: argparse.Namespace) -> int:
             f"{summary['solana_ca_rows']} solana CAs, "
             f"{summary['date_range']}"
         )
+
+    print("channel totals:")
+    for line in format_channel_totals(channel_totals(reports)):
+        print(line)
     return 0
 
 

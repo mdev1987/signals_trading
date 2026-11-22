@@ -148,5 +148,45 @@ class FetchSignalsTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
 
 
+class ChannelTotalsTests(unittest.TestCase):
+    def report(self, **channels: int) -> dict:
+        return {
+            "channels": {
+                name: {
+                    "summary": {
+                        "messages": count,
+                        "solana_ca_rows": count // 2,
+                    }
+                }
+                for name, count in channels.items()
+            }
+        }
+
+    def test_sums_across_days(self) -> None:
+        totals = fetch_signals.channel_totals(
+            [
+                self.report(**{"@A": 10, "@B": 0}),
+                self.report(**{"@A": 5, "@B": 0}),
+            ]
+        )
+        by_name = {total["channel"]: total for total in totals}
+        self.assertEqual(by_name["@A"]["messages"], 15)
+        self.assertEqual(by_name["@A"]["solana_ca_rows"], 7)
+        self.assertEqual(by_name["@A"]["empty_days"], 0)
+        self.assertEqual(by_name["@B"]["empty_days"], 2)
+
+    def test_empty_channel_is_flagged(self) -> None:
+        totals = fetch_signals.channel_totals([self.report(**{"@A": 10, "@B": 0})])
+        lines = fetch_signals.format_channel_totals(totals)
+        self.assertEqual(len(lines), 2)
+        self.assertNotIn("EMPTY", lines[0])
+        self.assertIn("EMPTY", lines[1])
+        self.assertIn("probe_channels.py", lines[1])
+        self.assertIn("empty on 1/1 days", lines[1])
+
+    def test_no_reports_renders_nothing(self) -> None:
+        self.assertEqual(fetch_signals.format_channel_totals([]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
