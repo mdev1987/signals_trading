@@ -52,7 +52,7 @@ from .feeds import (
 from .history import MarketHistory
 from .notifier import ReporterStats, TelegramReporter
 from .paths import env_file
-from .quotes import JupiterQuoteProvider
+from .quotes import DEFAULT_MAX_SLIPPAGE_BPS, JupiterQuoteProvider
 from .signals import (
     DEFAULT_RULE,
     RULE_DESCRIPTIONS,
@@ -96,6 +96,9 @@ class LiveConfig:
     slippage: float = 0.0
     notional_sol: float = 0.1
     slippage_bps: int = 50
+    # A fresh Pumpfun AMM pool often has no route at 50 bps. Buy and sell
+    # orders widen the tolerance up to this cap before giving up.
+    max_slippage_bps: int = DEFAULT_MAX_SLIPPAGE_BPS
     # Priority fee (lamports) and Jito MEV tip (lamports) help live
     # transactions land faster during volatile pump launches, reducing
     # entry slippage. ``None`` means "not passed", so the env var can apply;
@@ -180,6 +183,10 @@ class LiveConfig:
             raise ValueError("slippage must be in [0, 1)")
         if not 0 <= self.slippage_bps <= 10_000:
             raise ValueError("slippage_bps must be in [0, 10000]")
+        if not self.slippage_bps <= self.max_slippage_bps <= 10_000:
+            raise ValueError(
+                "max_slippage_bps must be between slippage_bps and 10000"
+            )
         if (
             self.priority_fee_lamports is not None
             and self.priority_fee_lamports < 0
@@ -373,6 +380,7 @@ def _lane_meta(
         "fee": config.fee,
         "slippage": config.slippage,
         "slippage_bps": config.slippage_bps,
+        "max_slippage_bps": config.max_slippage_bps,
         "notional_sol": config.notional_sol,
         "starting_sol": config.starting_sol,
         "preflight_exit_route": config.preflight_exit_route,
@@ -572,6 +580,7 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             env,
             enabled=True,
             slippage_bps=config.slippage_bps,
+            max_slippage_bps=config.max_slippage_bps,
             max_notional_sol=config.notional_sol,
             priority_fee_lamports=config.priority_fee_lamports,
             jito_tip_lamports=config.jito_tip_lamports,
@@ -614,6 +623,7 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
         quotes = JupiterQuoteProvider(
             api_key=api_key,
             slippage_bps=config.slippage_bps,
+            max_slippage_bps=config.max_slippage_bps,
         )
     lanes: list[StrategyLane] = []
     for index, (name, rule, entry_mode) in enumerate(specs):

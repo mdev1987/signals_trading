@@ -106,6 +106,10 @@ class FillQuote:
     router: str | None = None
     request_id: str | None = None
     latency_ms: int | None = None
+    # Slippage tolerance that produced this route. A fresh pool often needs a
+    # wider tolerance than the default before Jupiter can build a route, so the
+    # value actually used is recorded rather than assumed.
+    slippage_bps: int | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

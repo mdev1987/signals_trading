@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# Start the AVE hot-money paper/live bot for 24/7 operation.
+# Start the live/paper bot for 24/7 operation.
+#
+# One channel, one strategy (2026-11-22):
+#   @AveSolanaTokenScanner -> scanner_pumpfun_amm
+#   first card per mint, dex == Pumpfunamm, 20k-100k USD launch liquidity,
+#   entry on the first buy print after the card, hard exit at +5 min.
+#
+# The AVE, DRBT and SOLTRENDING lanes are research-only and are NOT started by
+# this script. See output/backtest/channel_comparison/FINAL_REPORT.md.
 #
 # Usage:
 #   ./run_bot.sh              # paper mode (quote-only, never broadcasts) — recommended start
@@ -11,6 +19,7 @@
 #   SOLANA_PRIVATE_KEY     — required only for live mode
 #   SOLANA_RPC_URL         — required only for live mode
 #   LIVE_TRADING_ENABLED=1 — required only for live mode (fails closed otherwise)
+#   LIVE_MAX_SLIPPAGE_BPS  — optional ceiling for the quote widening ladder (default 1000)
 #   TELEGRAM_BOT_TOKEN     — required for Telegram reports
 #   TELEGRAM_CHAT_ID       — required for Telegram reports
 set -euo pipefail
@@ -44,51 +53,35 @@ if [[ "$MODE" == "live" ]]; then
   echo ">>> LIVE MODE ENABLED — real SOL will be spent. Notional cap applies."
 fi
 
-# Sanity: the research signals directory must exist for the strategy to have data.
-if [[ ! -d output/backtest/signals ]]; then
-  echo "WARNING: output/backtest/signals not found. The live rule gate still works,"
-  echo "         but pre-signal features come from the PumpAPI firehose only."
-fi
-
 echo ">>> Starting paper_bot in $MODE mode"
 echo ">>> CWD: $SCRIPT_DIR"
-echo ">>> Logs: output/paper/bot.log  (Ctrl-C to stop; systemd restarts on crash)"
+echo ">>> Strategy: scanner_pumpfun_amm on @AveSolanaTokenScanner (5 min hold)"
+echo ">>> Logs: output/paper/bot_$(date +%Y%m%d).log  (Ctrl-C to stop; systemd restarts on crash)"
 
 mkdir -p output/paper
 
-# Paper mode also runs the scanner lane as a second wallet so the new
-# Pumpfunamm rule accumulates forward evidence next to the AVE control. A/B
-# mode is refused in live execution, so this cannot reach real money.
-EXTRA_ARGS=()
-if [[ "$MODE" == "paper" ]]; then
-  EXTRA_ARGS+=(
-    --ab-rule scanner_pumpfun_amm
-    --ab-entry-mode trade
-    --channel @AveSolanaTokenScanner
-  )
-  echo ">>> Paper A/B: lane A hot_money_continuation, lane B scanner_pumpfun_amm"
-fi
-
-# The AVE lane is pinned to its channel so growing channels.txt (which is the
-# research list) never silently subscribes the deployed bot to new firehoses.
+# The channel is pinned here, not read from channels.txt: that file is the
+# research list and may grow without widening what the deployed bot consumes.
+# ``--entry-mode trade`` fills on the first buy print after the card, which is
+# how the 4-day backtest priced the entry.
 exec "$VENV" -m paper_bot live \
   --mode "$MODE" \
-  --rule hot_money_continuation \
-  --channel @AveSignalMonitor \
-  --entry-mode timer \
+  --rule scanner_pumpfun_amm \
+  --channel @AveSolanaTokenScanner \
+  --entry-mode trade \
   --entry-delay-ms 5_000 \
   --max-entry-delay-ms 60_000 \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --slippage-bps 50 \
+  --max-slippage-bps 1000 \
   --priority-fee-lamports 2000 \
   --jito-tip-lamports 10000 \
   --fee 0.0125 \
-  --history-horizon-min 35 \
+  --history-horizon-min 10 \
   --history-max-mints 10000 \
   --history-max-events-per-mint 3000 \
   --history-max-total-events 150000 \
-  "${EXTRA_ARGS[@]}" \
   --memory-limit-mb 550 \
   --memory-report-s 300 \
   --shutdown-timeout-ms 25000 \

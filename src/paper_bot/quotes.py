@@ -33,9 +33,13 @@ class QuoteError(RuntimeError):
 # (timeout, 5xx, 429, auth, metadata lookup, malformed response) is treated as
 # a venue/network problem: the position is marked at the last observed feed
 # price instead of being written off as worthless.
+#
+# ``quote_no_route`` is deliberately *not* permanent: a pool that was created
+# seconds ago is often not indexed yet, and the same request routes a moment
+# later. Entries retry it inside their window; exits still treat it as terminal
+# after the exit timeout (see :func:`is_terminal_exit_error`).
 PERMANENT_QUOTE_ERRORS = frozenset(
     {
-        "quote_no_route",
         "quote_bad_request",
         "quote_zero_out",
         "quote_zero_amount",
@@ -49,12 +53,65 @@ PERMANENT_QUOTE_ERRORS = frozenset(
     }
 )
 
+# Reasons where a wider slippage tolerance can turn a miss into a route. A new
+# Pumpfun AMM pool frequently quotes at 100-500 bps while failing at 50.
+ESCALATABLE_QUOTE_ERRORS = frozenset(
+    {
+        "quote_no_route",
+        "quote_not_ready",
+        "quote_missing_out_amount",
+        "quote_zero_out",
+    }
+)
+
+# 10 % is the ceiling: beyond it an "exit" is worse than marking the position
+# and letting the operator see it, and a buy at that tolerance is no longer the
+# trade the backtest measured.
+DEFAULT_MAX_SLIPPAGE_BPS = 1_000
+# pump.fun mints are always 6 decimals. Jupiter's metadata index lags pool
+# creation, so a brand-new pool otherwise fails with ``unknown_decimals`` and
+# the entry is dropped for a token the feed can already price.
+PUMPFUN_MINT_SUFFIX = "pump"
+PUMPFUN_DECIMALS = 6
+
+
+def slippage_ladder(
+    base_bps: int, max_bps: int = DEFAULT_MAX_SLIPPAGE_BPS
+) -> tuple[int, ...]:
+    """Return the slippage levels to try, cheapest first.
+
+    ``base`` is the configured tolerance. Each level doubles it (with a floor
+    of 50 bps when base is 0) until ``max_bps``, which is always the last
+    level. The ladder is deduplicated and monotonic.
+    """
+    base = max(0, int(base_bps))
+    cap = max(base, int(max_bps))
+    levels = [base if base > 0 else 50]
+    for factor in (2, 4, 8, 16, 32):
+        level = (base if base > 0 else 50) * factor
+        if level > cap:
+            break
+        if level > levels[-1]:
+            levels.append(level)
+    if cap > levels[-1]:
+        levels.append(cap)
+    return tuple(dict.fromkeys(levels))
+
 
 def is_transient_quote_error(reason: str | None) -> bool:
     """Return whether a quote failure should be retried rather than written off."""
     if reason is None:
         return True
     return reason not in PERMANENT_QUOTE_ERRORS
+
+
+def is_terminal_exit_error(reason: str | None) -> bool:
+    """Return whether a failed sale means the tokens are unsellable.
+
+    A missing route is terminal for an exit (nothing to sell into) but not for
+    an entry, which is why it needs its own predicate.
+    """
+    return reason in PERMANENT_QUOTE_ERRORS or reason == "quote_no_route"
 
 
 class TokenMetadataResolver:
@@ -95,21 +152,37 @@ class TokenMetadataResolver:
 
         client = await self._get_client()
         headers = {"x-api-key": self.api_key} if self.api_key else {}
-        try:
-            response = await client.get(
-                f"{self.base_url}/tokens/v2/search",
-                params={"query": mint},
-                headers=headers,
-            )
-        except httpx.HTTPError as exc:
-            raise QuoteError("token_metadata_network", str(exc)) from exc
-        if response.status_code != 200:
-            raise QuoteError("token_metadata_http", f"HTTP {response.status_code}")
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise QuoteError("token_metadata_json", str(exc)) from exc
-        items = payload if isinstance(payload, list) else payload.get("tokens", [])
+        payload: Any = None
+        for attempt in range(2):
+            try:
+                response = await client.get(
+                    f"{self.base_url}/tokens/v2/search",
+                    params={"query": mint},
+                    headers=headers,
+                )
+            except httpx.HTTPError as exc:
+                if attempt == 0:
+                    await asyncio.sleep(0.25)
+                    continue
+                return self._or_fallback(mint, "token_metadata_network", str(exc))
+            if response.status_code != 200:
+                if attempt == 0 and response.status_code >= 500:
+                    await asyncio.sleep(0.25)
+                    continue
+                return self._or_fallback(
+                    mint, "token_metadata_http", f"HTTP {response.status_code}"
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                return self._or_fallback(mint, "token_metadata_json", str(exc))
+            break
+
+        items = (
+            payload
+            if isinstance(payload, list)
+            else (payload or {}).get("tokens", [])
+        )
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -118,7 +191,27 @@ class TokenMetadataResolver:
                 if raw is not None:
                     self._cache[mint] = int(raw)
                     return int(raw)
-        raise QuoteError("unknown_decimals", mint)
+        return self._or_fallback(mint, "unknown_decimals", mint)
+
+    def _or_fallback(self, mint: str, reason: str, detail: str) -> int:
+        """Return pump.fun's fixed decimals, or raise ``reason``.
+
+        Jupiter's token index lags pool creation, so a seconds-old pool often
+        has no metadata. pump.fun mints are always 6 decimals; the assumption
+        is logged once per mint and only applied to the ``pump`` suffix.
+        """
+        if mint.endswith(PUMPFUN_MINT_SUFFIX):
+            if mint not in self._cache:
+                LOGGER.warning(
+                    "Jupiter metadata failed for %s (%s); using pump.fun's %d "
+                    "decimals",
+                    mint,
+                    reason,
+                    PUMPFUN_DECIMALS,
+                )
+            self._cache[mint] = PUMPFUN_DECIMALS
+            return PUMPFUN_DECIMALS
+        raise QuoteError(reason, detail)
 
 
 class JupiterQuoteProvider:
@@ -133,6 +226,7 @@ class JupiterQuoteProvider:
         retries: int = 3,
         backoff_s: float = 0.4,
         slippage_bps: int = 50,
+        max_slippage_bps: int = DEFAULT_MAX_SLIPPAGE_BPS,
         metadata: TokenMetadataResolver | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -142,6 +236,7 @@ class JupiterQuoteProvider:
         self.retries = max(1, retries)
         self.backoff_s = backoff_s
         self.slippage_bps = slippage_bps
+        self.max_slippage_bps = max(slippage_bps, max_slippage_bps)
         self._client = client
         self._owns_client = client is None
         self.metadata = metadata or TokenMetadataResolver(
@@ -246,6 +341,13 @@ class JupiterQuoteProvider:
                         "quote_server_error", f"HTTP {response.status_code}"
                     )
 
+            if last_error is not None and (
+                last_error.reason in ESCALATABLE_QUOTE_ERRORS
+            ):
+                # Widen the tolerance instead of repeating the identical
+                # request: a pool created seconds ago rarely becomes routable
+                # at the same slippage on the next attempt.
+                break
             if attempt + 1 < self.retries:
                 await asyncio.sleep(self.backoff_s * (2**attempt))
         assert last_error is not None
@@ -256,6 +358,46 @@ class JupiterQuoteProvider:
             last_error.reason,
             str(last_error.detail)[:300],
         )
+        raise last_error
+
+    async def _order_with_escalation(
+        self, params: dict[str, str], *, action: str
+    ) -> dict[str, Any]:
+        """Ask for a route, widening the slippage tolerance on a miss.
+
+        A pool created seconds ago is often unindexed, or routes only once the
+        tolerance is wider than the configured 50 bps. Each level is a fresh
+        request; non-route failures propagate immediately so a timeout or an
+        auth error is not retried at every tolerance.
+        """
+        last_error: QuoteError | None = None
+        levels = slippage_ladder(self.slippage_bps, self.max_slippage_bps)
+        for bps in levels:
+            try:
+                payload = await self._order(
+                    {**params, "slippageBps": str(bps)}, action=action
+                )
+            except QuoteError as exc:
+                last_error = exc
+                if exc.reason not in ESCALATABLE_QUOTE_ERRORS:
+                    raise
+                LOGGER.debug(
+                    "Jupiter %s miss at %d bps (%s); widening",
+                    action,
+                    bps,
+                    exc.reason,
+                )
+                continue
+            payload["_slippage_bps"] = bps
+            if bps != self.slippage_bps:
+                LOGGER.info(
+                    "Jupiter %s routed at %d bps after widening from %d",
+                    action,
+                    bps,
+                    self.slippage_bps,
+                )
+            return payload
+        assert last_error is not None
         raise last_error
 
     async def entry_quote(
@@ -269,17 +411,18 @@ class JupiterQuoteProvider:
         if notional_sol <= 0:
             raise QuoteError("invalid_notional", str(notional_sol))
         amount = max(1, int(round(notional_sol * 1_000_000_000)))
-        payload = await self._order(
+        # Resolve decimals before spending a route request: the metadata call
+        # is the cheaper failure and pump.fun mints can be priced without it.
+        token_decimals = await self.metadata.decimals(mint, decimals)
+        payload = await self._order_with_escalation(
             {
                 "inputMint": WSOL_MINT,
                 "outputMint": mint,
                 "amount": str(amount),
-                "slippageBps": str(self.slippage_bps),
                 "swapMode": "ExactIn",
             },
             action="entry",
         )
-        token_decimals = await self.metadata.decimals(mint, decimals)
         out_amount = int(payload["outAmount"])
         if out_amount <= 0:
             raise QuoteError("quote_zero_out", "entry outAmount is zero")
@@ -295,6 +438,7 @@ class JupiterQuoteProvider:
             router=payload.get("router"),
             request_id=payload.get("requestId"),
             latency_ms=payload.get("_latency_ms"),
+            slippage_bps=payload.get("_slippage_bps"),
             raw=payload,
         )
 
@@ -313,12 +457,11 @@ class JupiterQuoteProvider:
         amount = int(round(size_tokens * (10**token_decimals)))
         if amount <= 0:
             raise QuoteError("quote_zero_amount", "token amount rounds to zero")
-        payload = await self._order(
+        payload = await self._order_with_escalation(
             {
                 "inputMint": mint,
                 "outputMint": WSOL_MINT,
                 "amount": str(amount),
-                "slippageBps": str(self.slippage_bps),
                 "swapMode": "ExactIn",
             },
             action=action,
@@ -338,6 +481,7 @@ class JupiterQuoteProvider:
             router=payload.get("router"),
             request_id=payload.get("requestId"),
             latency_ms=payload.get("_latency_ms"),
+            slippage_bps=payload.get("_slippage_bps"),
             raw=payload,
         )
 

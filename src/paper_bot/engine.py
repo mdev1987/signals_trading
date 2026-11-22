@@ -46,7 +46,11 @@ from .models import (
     SkipRecord,
     TradeEvent,
 )
-from .quotes import QuoteError, is_transient_quote_error
+from .quotes import (
+    QuoteError,
+    is_terminal_exit_error,
+    is_transient_quote_error,
+)
 from .safety import safety_check
 from .signals import (
     POST_SIGNAL_CROWDED_RULES,
@@ -872,8 +876,9 @@ class PaperEngine:
                 # off. A timeout/5xx/auth failure is a venue outage, so mark
                 # the remainder at the last observed feed price and flag the
                 # trade as synthetic instead of pretending the tokens are
-                # worth zero.
-                transient = is_transient_quote_error(position.last_quote_error)
+                # worth zero. ``quote_no_route`` is terminal for a sale but
+                # retryable for an entry, so it needs the exit-specific test.
+                transient = not is_terminal_exit_error(position.last_quote_error)
                 if self.config.exit_fallback_feed:
                     self._finalize_fallback(position)
                 elif transient:

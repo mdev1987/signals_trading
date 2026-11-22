@@ -27,6 +27,14 @@ from paper_bot.execution import (  # noqa: E402
 from paper_bot.history import MarketHistory  # noqa: E402
 from paper_bot.models import Signal, TradeEvent  # noqa: E402
 from paper_bot.notifier import format_startup  # noqa: E402
+from paper_bot.quotes import (  # noqa: E402
+    QuoteError,
+    JupiterQuoteProvider,
+    TokenMetadataResolver,
+    is_terminal_exit_error,
+    is_transient_quote_error,
+    slippage_ladder,
+)
 from paper_bot.signal_parser import (  # noqa: E402
     parse_scanner_card,
     parse_signal_message,
@@ -423,6 +431,24 @@ class LiveGuardTests(unittest.TestCase):
                 jito_tip_lamports=-1,
             )
 
+    def test_config_rejects_max_slippage_below_base(self) -> None:
+        with self.assertRaises(ValueError):
+            LiveExecutionConfig(
+                enabled=True,
+                private_key="unused-for-guard",
+                slippage_bps=200,
+                max_slippage_bps=100,
+            )
+
+    def test_live_config_reads_max_slippage_from_env(self) -> None:
+        config = live_config_from_env(
+            {"LIVE_MAX_SLIPPAGE_BPS": "400"},
+            enabled=False,
+            slippage_bps=50,
+            max_notional_sol=0.1,
+        )
+        self.assertEqual(config.max_slippage_bps, 400)
+
     def test_live_config_cli_fees_override_env(self) -> None:
         config = live_config_from_env(
             {
@@ -641,6 +667,83 @@ class LiveOrderTests(unittest.IsolatedAsyncioTestCase):
         order = await executor._order({}, action="entry")
         self.assertEqual(order["transaction"], "signed-tx")
         self.assertEqual(len(client.calls), 2)
+
+    async def test_missing_transaction_widens_slippage(self) -> None:
+        client = _FakeHttpClient(
+            [
+                _FakeResponse(
+                    200,
+                    {"transaction": "", "errorCode": 99, "router": "metis"},
+                ),
+                _FakeResponse(200, {"transaction": "signed-tx"}),
+            ]
+        )
+        executor = self.executor(client)
+        order = await executor._order({"inputMint": "a"}, action="entry")
+        self.assertEqual(order["transaction"], "signed-tx")
+        self.assertEqual(
+            [call["params"]["slippageBps"] for call in client.calls],
+            ["50", "100"],
+        )
+        self.assertEqual(order["_slippage_bps"], 100)
+
+
+class QuoteRobustnessTests(unittest.IsolatedAsyncioTestCase):
+    """A pool seconds old is often unindexed; both sides must survive that."""
+
+    def test_slippage_ladder_is_monotonic_and_capped(self) -> None:
+        self.assertEqual(
+            slippage_ladder(50, 1000), (50, 100, 200, 400, 800, 1000)
+        )
+        self.assertEqual(slippage_ladder(0, 100), (50, 100))
+        self.assertEqual(slippage_ladder(300, 200), (300,))
+
+    def test_no_route_is_transient_for_entries_but_terminal_for_exits(self) -> None:
+        self.assertTrue(is_transient_quote_error("quote_no_route"))
+        self.assertFalse(is_transient_quote_error("quote_bad_request"))
+        self.assertTrue(is_terminal_exit_error("quote_no_route"))
+        self.assertFalse(is_terminal_exit_error("quote_server_error"))
+
+    async def test_entry_quote_widens_slippage_until_routed(self) -> None:
+        client = _FakeHttpClient(
+            [
+                _FakeResponse(200, {"transaction": None}),
+                _FakeResponse(
+                    200, {"transaction": None, "outAmount": "2000000"}
+                ),
+            ]
+        )
+        provider = JupiterQuoteProvider(
+            api_key=None,
+            retries=1,
+            slippage_bps=50,
+            max_slippage_bps=1000,
+            client=client,  # type: ignore[arg-type]
+        )
+        quote = await provider.entry_quote("mintpump", 0.05, 0.01, decimals=6)
+        self.assertEqual(
+            [call["params"]["slippageBps"] for call in client.calls],
+            ["50", "100"],
+        )
+        self.assertEqual(quote.slippage_bps, 100)
+
+    async def test_pump_mint_decimals_fall_back_when_unindexed(self) -> None:
+        client = _FakeHttpClient([_FakeResponse(404)])
+        resolver = TokenMetadataResolver(
+            api_key=None, client=client  # type: ignore[arg-type]
+        )
+        self.assertEqual(await resolver.decimals("brandnewpump"), 6)
+        self.assertEqual(await resolver.decimals("brandnewpump"), 6)
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_unknown_non_pump_decimals_still_fail(self) -> None:
+        client = _FakeHttpClient([_FakeResponse(404)])
+        resolver = TokenMetadataResolver(
+            api_key=None, client=client  # type: ignore[arg-type]
+        )
+        with self.assertRaises(QuoteError) as caught:
+            await resolver.decimals("someothermint")
+        self.assertEqual(caught.exception.reason, "token_metadata_http")
 
 
 class _FakeExecutor:

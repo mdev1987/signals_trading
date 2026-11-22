@@ -1,4 +1,5 @@
-# systemd unit for the AVE hot-money paper/live bot.
+# systemd unit for the Pumpfun-scanner paper/live bot.
+# Strategy: @AveSolanaTokenScanner -> scanner_pumpfun_amm (5 min hold).
 # Install: copy to /etc/systemd/system/paper-bot.service, then:
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now paper-bot
@@ -8,7 +9,7 @@
 # Live mode additionally needs LIVE_TRADING_ENABLED=1 and SOLANA_PRIVATE_KEY.
 
 [Unit]
-Description=AVE hot-money signal bot (paper/live)
+Description=Pumpfun scanner signal bot (paper/live)
 After=network-online.target
 Wants=network-online.target
 

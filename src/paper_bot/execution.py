@@ -26,6 +26,7 @@ The executed amounts, not the quote, are used for fill accounting.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import time
@@ -35,7 +36,12 @@ from typing import Any
 import httpx
 
 from .models import WSOL_MINT, FillQuote
-from .quotes import QuoteError, TokenMetadataResolver
+from .quotes import (
+    DEFAULT_MAX_SLIPPAGE_BPS,
+    QuoteError,
+    TokenMetadataResolver,
+    slippage_ladder,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,8 +52,9 @@ LAMPORTS_PER_SOL = 1_000_000_000
 LIVE_QUOTE_SOURCE = "jupiter_live"
 
 
-# Jupiter /order errorCode values that will not change by retrying the same
-# request. Terminal reasons short-circuit the retry loop.
+# Jupiter /order errorCode values that will not change by retrying the exact
+# same request. Terminal reasons short-circuit the inner retry loop; the outer
+# loop may still widen the slippage tolerance before giving up.
 _NON_RETRYABLE_LIVE_REASONS = frozenset(
     {
         "live_insufficient_funds",
@@ -55,6 +62,17 @@ _NON_RETRYABLE_LIVE_REASONS = frozenset(
         "live_swap_below_gasless_min",
         "live_missing_token_account",
         "live_order_build_failed",
+    }
+)
+
+# Failures where a wider slippage tolerance can turn "no transaction" into a
+# signed order. A fresh Pumpfun AMM pool is routinely unrouteable at 50 bps.
+_ESCALATABLE_LIVE_REASONS = frozenset(
+    {
+        "quote_no_route",
+        "live_order_build_failed",
+        "live_order_no_transaction",
+        "live_order_rejected",
     }
 )
 
@@ -113,6 +131,10 @@ class LiveExecutionConfig:
     api_key: str = ""
     base_url: str = DEFAULT_BASE_URL
     slippage_bps: int = 50
+    # Widest tolerance the order builder may try when the configured one does
+    # not route. 10 % is the ceiling: past it the fill is no longer the trade
+    # the backtest measured.
+    max_slippage_bps: int = DEFAULT_MAX_SLIPPAGE_BPS
     max_notional_sol: float = 0.1
     allowlist: frozenset[str] = frozenset()
     timeout_s: float = 30.0
@@ -126,6 +148,10 @@ class LiveExecutionConfig:
     def __post_init__(self) -> None:
         if self.slippage_bps < 0 or self.slippage_bps > 10_000:
             raise ValueError("slippage_bps must be in [0, 10000]")
+        if self.max_slippage_bps < self.slippage_bps:
+            raise ValueError("max_slippage_bps must be >= slippage_bps")
+        if self.max_slippage_bps > 10_000:
+            raise ValueError("max_slippage_bps must be <= 10000")
         if self.max_notional_sol <= 0:
             raise ValueError("max_notional_sol must be positive")
         if self.enabled and not self.private_key:
@@ -163,6 +189,7 @@ def live_config_from_env(
     max_notional_sol: float,
     priority_fee_lamports: int | None = None,
     jito_tip_lamports: int | None = None,
+    max_slippage_bps: int | None = None,
 ) -> LiveExecutionConfig:
     """Build a live config from ``.env``/environment values.
 
@@ -188,6 +215,11 @@ def live_config_from_env(
     allowlist = frozenset(
         part.strip() for part in allow_raw.replace(",", " ").split() if part.strip()
     )
+    if max_slippage_bps is None:
+        max_slippage_bps = int(
+            get("LIVE_MAX_SLIPPAGE_BPS", str(DEFAULT_MAX_SLIPPAGE_BPS))
+            or DEFAULT_MAX_SLIPPAGE_BPS
+        )
     return LiveExecutionConfig(
         enabled=enabled and _enabled(get("LIVE_TRADING_ENABLED")),
         private_key=get("SOLANA_PRIVATE_KEY"),
@@ -195,6 +227,7 @@ def live_config_from_env(
         api_key=get("JUPITER_API_KEY"),
         base_url=get("JUPITER_BASE_URL", DEFAULT_BASE_URL),
         slippage_bps=slippage_bps,
+        max_slippage_bps=max_slippage_bps,
         max_notional_sol=max_notional_sol,
         allowlist=allowlist,
         timeout_s=float(get("LIVE_HTTP_TIMEOUT_S", "30") or 30),
@@ -276,24 +309,70 @@ class LiveSolanaExecutor:
             raise LiveExecutionError("live_mint_not_allowlisted", mint)
 
     async def _order(self, params: dict[str, str], *, action: str) -> dict[str, Any]:
+        """Build a signed order, widening slippage when no route is found.
+
+        The inner builder retries transient transport failures at one
+        tolerance; this outer loop tries the tolerance ladder. Every live entry
+        and exit goes through here, so neither can be dropped merely because
+        the configured 50 bps did not route a seconds-old pool.
+        """
+        last_error: LiveExecutionError | None = None
+        for bps in slippage_ladder(
+            self.config.slippage_bps, self.config.max_slippage_bps
+        ):
+            try:
+                payload = await self._order_once(
+                    {**params, "slippageBps": str(bps)}, action=action
+                )
+            except LiveExecutionError as exc:
+                last_error = exc
+                if exc.reason not in _ESCALATABLE_LIVE_REASONS:
+                    raise
+                LOGGER.info(
+                    "Jupiter %s found no order at %d bps (%s); widening",
+                    action,
+                    bps,
+                    exc.reason,
+                )
+                continue
+            payload["_slippage_bps"] = bps
+            if bps != self.config.slippage_bps:
+                LOGGER.warning(
+                    "Jupiter %s needed %d bps (configured %d)",
+                    action,
+                    bps,
+                    self.config.slippage_bps,
+                )
+            return payload
+        assert last_error is not None
+        raise last_error
+
+    async def _order_once(
+        self, params: dict[str, str], *, action: str
+    ) -> dict[str, Any]:
         _, taker = self._key()
-        params = {**params, "taker": taker}
+        request = {**params, "taker": taker}
+        # Request v1 transactions when supported (more efficient, smaller).
+        # Older deployments reject the parameter outright, so a 400 naming it
+        # drops it and retries instead of failing every order.
+        request["maxSupportedTransactionVersion"] = "1"
         # Jupiter /order params that improve landing speed and efficiency
         # during volatile pump launches.
         if self.config.priority_fee_lamports > 0:
-            params["priorityFeeLamports"] = str(self.config.priority_fee_lamports)
+            request["priorityFeeLamports"] = str(self.config.priority_fee_lamports)
         if self.config.jito_tip_lamports > 0:
-            params["jitoTipLamports"] = str(self.config.jito_tip_lamports)
-        # Request v1 transactions when supported (more efficient, smaller).
-        params["maxSupportedTransactionVersion"] = "1"
+            request["jitoTipLamports"] = str(self.config.jito_tip_lamports)
         client = self._client_or_create()
         headers = {"x-api-key": self.config.api_key} if self.config.api_key else {}
         last_error: QuoteError | None = None
-        for attempt in range(max(1, self.config.retries)):
+        attempts = 0
+        max_attempts = max(1, self.config.retries)
+        while attempts < max_attempts:
+            attempts += 1
             started = time.perf_counter()
             try:
                 response = await client.get(
-                    f"{self.config.base_url}/order", params=params, headers=headers
+                    f"{self.config.base_url}/order", params=request, headers=headers
                 )
             except httpx.TimeoutException as exc:
                 last_error = LiveExecutionError("live_order_timeout", str(exc))
@@ -322,7 +401,13 @@ class LiveSolanaExecutor:
                                 else f"errorCode={error_code}"
                             )
                             last_error = LiveExecutionError(reason, detail)
-                            if reason in _NON_RETRYABLE_LIVE_REASONS:
+                            if (
+                                reason in _NON_RETRYABLE_LIVE_REASONS
+                                or reason in _ESCALATABLE_LIVE_REASONS
+                            ):
+                                # Either terminal at this tolerance or better
+                                # tried with a wider one: repeating the identical
+                                # order request only burns the entry window.
                                 break
                         else:
                             payload["_latency_ms"] = int(
@@ -335,7 +420,17 @@ class LiveSolanaExecutor:
                     )
                 elif response.status_code == 400:
                     text = response.text[:300]
-                    if "no route" in text.lower() or "not found" in text.lower():
+                    lowered = text.lower()
+                    if (
+                        "maxsupportedtransactionversion" in lowered
+                        and "maxSupportedTransactionVersion" in request
+                    ):
+                        # The endpoint does not know the parameter: drop it and
+                        # retry without spending one of the retry attempts.
+                        request.pop("maxSupportedTransactionVersion")
+                        attempts -= 1
+                        continue
+                    if "no route" in lowered or "not found" in lowered:
                         raise LiveExecutionError("quote_no_route", text)
                     last_error = LiveExecutionError("live_order_rejected", text)
                 elif response.status_code == 429:
@@ -344,10 +439,8 @@ class LiveSolanaExecutor:
                     last_error = LiveExecutionError(
                         "live_order_server_error", f"HTTP {response.status_code}"
                     )
-            if attempt + 1 < max(1, self.config.retries):
-                import asyncio
-
-                await asyncio.sleep(0.4 * (2**attempt))
+            if attempts < max_attempts:
+                await asyncio.sleep(0.4 * (2 ** (attempts - 1)))
         assert last_error is not None
         raise last_error
 
@@ -461,7 +554,6 @@ class LiveSolanaExecutor:
                 "inputMint": WSOL_MINT,
                 "outputMint": mint,
                 "amount": str(amount),
-                "slippageBps": str(self.config.slippage_bps),
                 "swapMode": "ExactIn",
             },
             action="entry",
@@ -491,6 +583,7 @@ class LiveSolanaExecutor:
             router=order.get("router") or "jupiter",
             request_id=order.get("requestId"),
             latency_ms=order.get("_latency_ms"),
+            slippage_bps=order.get("_slippage_bps"),
             raw={"order": order, "execute": result},
         )
         return LiveFill(
@@ -519,7 +612,6 @@ class LiveSolanaExecutor:
                 "inputMint": mint,
                 "outputMint": WSOL_MINT,
                 "amount": str(amount),
-                "slippageBps": str(self.config.slippage_bps),
                 "swapMode": "ExactIn",
             },
             action="exit",
@@ -548,6 +640,7 @@ class LiveSolanaExecutor:
             router=order.get("router") or "jupiter",
             request_id=order.get("requestId"),
             latency_ms=order.get("_latency_ms"),
+            slippage_bps=order.get("_slippage_bps"),
             raw={"order": order, "execute": result},
         )
         return LiveFill(
@@ -609,7 +702,6 @@ class LiveQuoteProvider:
                     "inputMint": mint,
                     "outputMint": WSOL_MINT,
                     "amount": str(max(1, amount)),
-                    "slippageBps": str(self.executor.config.slippage_bps),
                     "swapMode": "ExactIn",
                 },
                 action="preflight",

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .live import LiveConfig, _load_env, _read_channels, run_live
 from .paths import channels_file, config_file, data_home, env_file
+from .quotes import DEFAULT_MAX_SLIPPAGE_BPS
 from .signals import DEFAULT_RULE
 
 BOT_TOKEN_RE = re.compile(r"(?i)\b(bot\d+:)[A-Za-z0-9_-]{20,}")
@@ -122,7 +123,24 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
             "writing them off"
         ),
     )
-    parser.add_argument("--slippage-bps", type=int, default=50)
+    parser.add_argument(
+        "--slippage-bps",
+        type=int,
+        default=50,
+        help=(
+            "slippage tolerance for the first quote attempt (default 50). A "
+            "fresh pool that does not route is retried with a wider tolerance."
+        ),
+    )
+    parser.add_argument(
+        "--max-slippage-bps",
+        type=int,
+        default=DEFAULT_MAX_SLIPPAGE_BPS,
+        help=(
+            "widest tolerance buy/sell may try before giving up "
+            f"(default {DEFAULT_MAX_SLIPPAGE_BPS} = 10%%)"
+        ),
+    )
     parser.add_argument(
         "--priority-fee-lamports",
         type=int,
@@ -241,6 +259,9 @@ def _parse_args() -> argparse.Namespace:
     quote.add_argument("--mint", required=True)
     quote.add_argument("--notional-sol", type=float, default=1.0)
     quote.add_argument("--slippage-bps", type=int, default=50)
+    quote.add_argument(
+        "--max-slippage-bps", type=int, default=DEFAULT_MAX_SLIPPAGE_BPS
+    )
 
     report = sub.add_parser("report", help="summarize a paper run directory")
     report.add_argument("run_dir", type=Path)
@@ -270,7 +291,11 @@ async def _run_quote(args: argparse.Namespace) -> dict:
     api_key = env.get("JUPITER_API_KEY")
     if not api_key:
         raise SystemExit("JUPITER_API_KEY is not set")
-    provider = JupiterQuoteProvider(api_key=api_key, slippage_bps=args.slippage_bps)
+    provider = JupiterQuoteProvider(
+        api_key=api_key,
+        slippage_bps=args.slippage_bps,
+        max_slippage_bps=args.max_slippage_bps,
+    )
     try:
         quote = await provider.entry_quote(args.mint, args.notional_sol, None)
         return quote.to_dict()
@@ -351,6 +376,7 @@ def main() -> int:
             preflight_exit_route=not args.no_preflight_exit,
             exit_fallback_feed=args.exit_fallback_feed,
             slippage_bps=args.slippage_bps,
+            max_slippage_bps=args.max_slippage_bps,
             priority_fee_lamports=args.priority_fee_lamports,
             jito_tip_lamports=args.jito_tip_lamports,
             entry_delay_ms=args.entry_delay_ms,
