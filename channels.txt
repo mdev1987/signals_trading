@@ -4,5 +4,11 @@
 
 @AveSignalMonitor
 @DRBTSolanaPF
-@SOLTRENDING
 @AveSolanaTokenScanner
+
+# @SOLTRENDING is not a call channel: it is a whale-buy firehose (~20k messages
+# a day), the mint is only inside a jup.ag swap link entity (the CSV export
+# drops it), and its history is deleted after about a day, so it cannot be
+# priced on the replay days. Live-capture only; see
+# output/backtest/channel_comparison/FINDINGS.md.
+# @SOLTRENDING
