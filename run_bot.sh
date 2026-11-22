@@ -73,6 +73,7 @@ exec "$VENV" -m paper_bot live \
   --max-entry-delay-ms 60_000 \
   --horizon-min 5 \
   --notional-sol 0.1 \
+  --starting-sol 10 \
   --slippage-bps 50 \
   --max-slippage-bps 1000 \
   --priority-fee-lamports 2000 \

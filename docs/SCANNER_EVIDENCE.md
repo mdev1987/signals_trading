@@ -19,7 +19,7 @@ The headline is deliberately split in two:
 | filter | `dex == Pumpfunamm` and `20,000 <= liquidity_usd < 100,000` |
 | entry | first BUY print at or after `card + 5 s`; give up at 60 s |
 | exit | hard market sell at `entry + 5 min`; no stop, no trail |
-| size | 0.1 SOL, at most 10 concurrent |
+| size | 0.1 SOL of a 10 SOL wallet; measured overlap ≤9 positions per 5 min (median 2), so no cap binds |
 
 The other channels (`@AveSignalMonitor`, `@DRBTSolanaPF`, `@SOLTRENDING`) and
 every other DEX are retired as trading lanes. They are kept only as research
@@ -220,9 +220,9 @@ Do not fund this lane until a forward paper run shows **all** of:
    is gone.
 3. **Realized median net return ≥+10 %.** Backtest +22.0 % marked, +19.1 %
    with stale exits written off.
-4. **Under 20 % of exits written off.** Read `exit_writeoffs.jsonl` and the
-   `exit_dust` / `exit_quote_failed` reasons; the backtest write-off rate is
-   15.9 %.
+4. **Under 20 % of exits written off.** Count `trades.jsonl` rows whose
+   `exit_reason` is `no_route` (or `wallet.write_offs` in `summary.json`); the
+   backtest write-off rate is 15.9 %.
 5. **No systematic entry failure.** `entry_delay_exceeded` /
    `entry_quote_failed` above ~10 % of in-band alerts means the bot is not
    taking the trades the backtest measured, regardless of the realized win

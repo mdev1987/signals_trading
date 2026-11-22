@@ -9,17 +9,24 @@ version = 1
 #   channel  @AveSolanaTokenScanner   first card per mint (the channel re-posts
 #                                    each pool ~3x; only the first is used)
 #   filter   dex == Pumpfunamm  and  20,000 <= liquidity_usd < 100,000
-#   entry    market buy on the first buy print after the card (5 s delay,
-#            give up if nothing fills within 60 s)
+#   entry    market buy on the first BUY print at/after the card + 5 s; retry
+#            on later prints (at most one attempt per mint per second) and
+#            give up at 60 s
 #   exit     hard market sell at entry + 5 min; no stop, no trail, no hold
-#   size     0.1 SOL, at most 10 concurrent positions
+#   size     0.1 SOL of a 10 SOL paper wallet; measured overlap is at most
+#            9 open positions in any 5-minute window (median 2)
+#
+# Backtested at exactly this convention (first BUY print, 5 s, 5-minute exit):
+# 97.2 % win, +22.0 % median over 1,818 trades, +44.6 SOL at 0.1 SOL. 15.9 % of
+# 5-minute exit prints are already over a minute stale; writing those off at
+# -100 % leaves +5.6 SOL (82.7 % win, +19.1 % median). Compare a live run
+# against the write-off numbers, not the marked ones.
 #
 # Do not widen the liquidity band or extend the hold: the median token stops
 # printing by minute 7, and 59 % of 15-minute exit marks are already over a
-# minute stale.
-# The AVE and DRBT feeds are retired. `channels.txt` is the research list and
-# never changes what this app consumes: the channel is pinned on the command
-# line below.
+# minute stale (median 463 s). The AVE and DRBT feeds are retired.
+# `channels.txt` is the research list and never changes what this app
+# consumes: the channel is pinned on the command line below.
 #
 # Two modes, one binary:
 #   --mode paper (this app)  read-only Jupiter /order quotes, never signs.
@@ -27,10 +34,14 @@ version = 1
 #                            through Jupiter /execute. Requires BOTH
 #                            --mode live and LIVE_TRADING_ENABLED=1.
 #
-# Both modes widen the Jupiter slippage tolerance when a fresh pool has no
-# route: 50 -> 100 -> 200 -> 400 -> 800 -> 1000 bps (--max-slippage-bps).
-# Token decimals are resolved before routing, with a logged pump.fun
-# 6-decimal fallback for mints Jupiter has not indexed yet.
+# Slippage ladder: 50 -> 100 -> 200 -> 400 -> 800 -> 1000 bps, never above
+# --max-slippage-bps. It escalates only `quote_no_route` and
+# `quote_missing_out_amount`; a pool that is merely not indexed yet
+# (`quote_not_ready`) is retried on a later print with a per-mint backoff, not
+# by widening. Token decimals are resolved before routing, with a logged
+# pump.fun 6-decimal fallback for mints Jupiter has not indexed. A rejected
+# maxSupportedTransactionVersion is remembered for the process rather than
+# re-sent at every ladder rung.
 #
 # To switch this app to live execution, change `--mode paper` to `--mode live`
 # and set (never commit these):
@@ -43,6 +54,17 @@ version = 1
 # The live path refuses A/B lanes, preflight sells, and any notional above
 # --notional-sol. Fund it only after the paper gates in
 # `docs/SCANNER_EVIDENCE.md`.
+#
+# What a paper run writes (output/paper/live_YYYYMMDD_HHMMSS/):
+#   summary.json   scanner_cards / scanner_duplicates, feed_received/delivered,
+#                  wallet.write_offs, open_positions, peak_rss_mb
+#   entries.jsonl  quote_slippage_bps and quote_price_impact_pct actually paid
+#   trades.jsonl   entry_delay_ms plus realized exits; exit_reason ==
+#                  "no_route" is a write-off, not a mark
+#   skips.jsonl    why a signal did not become a trade
+# A forward run passes only with >=300 trades over >=5 days, realized win
+# >=80 %, realized median >=+10 %, <20 % exits written off, and entry
+# failures under ~10 % of in-band alerts (details in the evidence doc).
 #
 # One-time setup:
 #   cd /home/mdev/Programming/signals_trading
@@ -61,7 +83,7 @@ name = "paper-bot"
 # The package lives under `src/`, so PYTHONPATH is set here instead of
 # installing the research repo as a wheel. `--no-sync` is unnecessary because
 # this runs the venv directly, so a restart never touches the network.
-command = "env PYTHONPATH=/home/mdev/Programming/signals_trading/src /home/mdev/Programming/signals_trading/.venv/bin/python -m paper_bot live --mode paper --rule scanner_pumpfun_amm --channel @AveSolanaTokenScanner --entry-mode trade --entry-delay-ms 5000 --max-entry-delay-ms 60000 --horizon-min 5 --notional-sol 0.1 --slippage-bps 50 --max-slippage-bps 1000 --priority-fee-lamports 2000 --jito-tip-lamports 10000 --fee 0.0125 --history-horizon-min 10 --history-max-mints 10000 --history-max-events-per-mint 3000 --history-max-total-events 150000 --tick-interval 1.0 --dex-interval 2.0 --memory-limit-mb 550 --memory-report-s 300 --shutdown-timeout-ms 25000"
+command = "env PYTHONPATH=/home/mdev/Programming/signals_trading/src /home/mdev/Programming/signals_trading/.venv/bin/python -m paper_bot live --mode paper --rule scanner_pumpfun_amm --channel @AveSolanaTokenScanner --entry-mode trade --entry-delay-ms 5000 --max-entry-delay-ms 60000 --horizon-min 5 --notional-sol 0.1 --starting-sol 10 --slippage-bps 50 --max-slippage-bps 1000 --priority-fee-lamports 2000 --jito-tip-lamports 10000 --fee 0.0125 --history-horizon-min 10 --history-max-mints 10000 --history-max-events-per-mint 3000 --history-max-total-events 150000 --tick-interval 1.0 --dex-interval 2.0 --memory-limit-mb 550 --memory-report-s 300 --shutdown-timeout-ms 25000"
 cwd = "/home/mdev/Programming/signals_trading"
 restart_policy = "always"
 max_restarts = 100
@@ -79,7 +101,9 @@ HOME = "/home/mdev"
 PYTHONUNBUFFERED = "1"
 PAPER_BOT_HOME = "/home/mdev/Programming/signals_trading"
 PAPER_BOT_LOG_LEVEL = "INFO"
-# Widest tolerance the quote-widening ladder may try (1000 = 10 %).
+# Widest tolerance the quote-widening ladder may try (1000 = 10 %). The
+# --max-slippage-bps flag on the command line wins; kept here so a live switch
+# that drops the flag still fails safe.
 LIVE_MAX_SLIPPAGE_BPS = "1000"
 # Fail closed: live execution needs an explicit operator opt-in.
 LIVE_TRADING_ENABLED = "0"
