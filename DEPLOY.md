@@ -151,21 +151,22 @@ What to watch in the first days:
 - `skip` reasons on entries that do pass: `entry_delay_exceeded`, `entry_quote_failed`, `no_quote` are the real risk. A lane that cannot fill never had the backtested edge.
 - `Jupiter ... needed N bps` warnings show how often the widening ladder rescued a trade.
 - Compare the realized median and win rate with the deployed-convention
-  backtest (first buy print at/after card + 5 s, exit +5 min): 95.9 % win,
-  +22.1 % median over 1,849 trades. The exit is the fragile side: 17 % of the
+  backtest (first buy print at/after card + 5 s, exit +5 min): 97.2 % win,
+  +22.0 % median over 1,818 trades. The exit is the fragile side: 16 % of the
   5-minute exit prints are already over a minute stale, and marking those at
-  −100 % leaves only +3 SOL of the +45 SOL headline.
+  −100 % leaves only +5.6 SOL of the +44.6 SOL headline (82.7 % win,
+  +19.1 % median).
 
 ---
 
 ## 7. What NOT to change
 
 - Do **not** widen the liquidity band or extend the 5-minute hold: both were
-  measured, and holding is unexecutable (60 % of 15-minute exit prints are
-  already over a minute stale, median 466 s).
+  measured, and holding is unexecutable (59 % of 15-minute exit prints are
+  already over a minute stale, median 463 s).
 - Do **not** add the AVE, DRBT or SOLTRENDING channels to the deployed bot.
 - Do **not** modify `execution_simulator.py`.
 - Do **not** commit `.env`, `config.ini`, or `*.session` — all gitignored.
 - Fund the strategy only after the forward paper run passes the gates in
-  `docs/SCANNER_EVIDENCE.md`: ≥300 trades, win ≥80 %, median ≥+10 %,
-  realized exit no more than 15 % worse than the marked exit.
+  `docs/SCANNER_EVIDENCE.md`: ≥300 trades, realized win ≥80 %, realized
+  median ≥+10 %, and under 20 % of exits written off.

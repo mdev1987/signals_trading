@@ -58,7 +58,7 @@ def iter_target_trades(
     min_quote_sol: float = 0.01,
     action: str = "any",
 ):
-    """Yield (mint, timestamp, price) for target mints only.
+    """Yield (mint, timestamp, price, side) for target mints only.
 
     Trade events carry the top-level mint before the price fields, so the first
     ``"mint"`` match is the event mint. Transfer events may carry a nested mint
@@ -89,10 +89,10 @@ def iter_target_trades(
             stamp_match = TIMESTAMP_BYTES_RE.search(line)
             if stamp_match is None:
                 continue
-            if action != "any":
-                action_match = ACTION_BYTES_RE.search(line)
-                if action_match is None or action_match.group(1).decode() != action:
-                    continue
+            action_match = ACTION_BYTES_RE.search(line)
+            side = action_match.group(1).decode() if action_match else ""
+            if action != "any" and side != action:
+                continue
             if min_quote_sol > 0:
                 quote_match = QUOTE_BYTES_RE.search(line)
                 if quote_match is None:
@@ -112,6 +112,7 @@ def iter_target_trades(
                 mint_match.group(1).decode(),
                 int(stamp_match.group(1)),
                 price,
+                side,
             )
 
 
@@ -145,26 +146,35 @@ def select_entry(
     target: dict,
     timestamp: int,
     price: float,
-    previous: tuple[int, float] | None,
+    previous: tuple[int, float] | tuple[int, float, str] | None,
     mode: str,
+    *,
+    eligible: bool = True,
+    side: str | None = None,
 ) -> None:
     """Record the entry fill for one target, if this trade decides it.
 
     ``last-before`` uses the most recent print at or before the decision and is
     the conservative mark for a fast mover; ``first-after`` uses the first
     print at or after it, which is what the deployed trade-mode bot buys.
+
+    ``eligible`` is False for a print the live engine would not buy on (a SELL
+    when the bot is waiting for a BUY); such a print neither fills the entry
+    nor advances ``entry_checked``.
     """
-    if target["entry_checked"]:
+    if not eligible or target["entry_checked"]:
         return
     if mode == "first-after":
         if timestamp >= target["entry_target"]:
             target["entry_checked"] = True
             target["entry_ts"], target["entry_px"] = timestamp, price
+            target["entry_side"] = side
         return
     if timestamp > target["entry_target"]:
         target["entry_checked"] = True
         if previous is not None and previous[0] <= target["entry_target"]:
-            target["entry_ts"], target["entry_px"] = previous
+            target["entry_ts"], target["entry_px"] = previous[0], previous[1]
+            target["entry_side"] = previous[2] if len(previous) > 2 else None
 
 
 def stream_day(
@@ -176,12 +186,15 @@ def stream_day(
     min_quote_sol: float = 0.01,
     action: str = "any",
     entry_fill_mode: str = "last-before",
+    entry_side: str = "any",
     verbose: bool = True,
 ) -> int:
     by_mint: dict[str, list[dict]] = {}
     for target in targets:
         by_mint.setdefault(str(target["row"]["mint"]), []).append(target)
     last: dict[str, tuple[int, float]] = {}
+    # Last print the live engine would buy on (BUY when ``entry_side`` is buy).
+    last_entry: dict[str, tuple[int, float, str]] = {}
     seen_mints: set[str] = set()
 
     archives = sorted((replay_root / day).glob("*.jsonl.zst"))
@@ -192,18 +205,26 @@ def stream_day(
     total = 0
     for archive in archives:
         kept = 0
-        for mint, timestamp, price in iter_target_trades(
+        for mint, timestamp, price, side in iter_target_trades(
             archive, target_bytes, min_quote_sol, action
         ):
             kept += 1
             previous = last.get(mint)
+            side_ok = entry_side == "any" or side == entry_side
+            entry_previous = last_entry.get(mint) if side_ok else None
             if mint not in seen_mints:
                 seen_mints.add(mint)
                 for target in by_mint[mint]:
                     target["first_trade_ts"] = timestamp
             for target in by_mint[mint]:
                 select_entry(
-                    target, timestamp, price, previous, entry_fill_mode
+                    target,
+                    timestamp,
+                    price,
+                    entry_previous,
+                    entry_fill_mode,
+                    eligible=side_ok,
+                    side=side,
                 )
                 for horizon in horizons:
                     key = f"exit_{horizon}"
@@ -216,6 +237,8 @@ def stream_day(
                     ):
                         target[key + "_ts"], target[key + "_px"] = previous
             last[mint] = (timestamp, price)
+            if side_ok:
+                last_entry[mint] = (timestamp, price, side)
         total += kept
         if verbose:
             print(
@@ -233,13 +256,15 @@ def stream_day(
         if previous is None:
             continue
         timestamp, price = previous
+        entry_fill = last_entry.get(mint, (timestamp, price, ""))
         for target in mint_targets:
             if (
                 entry_fill_mode == "last-before"
                 and target["entry_px"] is None
-                and timestamp <= target["entry_target"]
+                and entry_fill[0] <= target["entry_target"]
             ):
-                target["entry_ts"], target["entry_px"] = timestamp, price
+                target["entry_ts"], target["entry_px"] = entry_fill[:2]
+                target["entry_side"] = entry_fill[2] if len(entry_fill) > 2 else None
             for horizon in horizons:
                 key = f"exit_{horizon}"
                 if (
@@ -275,6 +300,7 @@ def build_frame(
         row["entry_delay_ms"] = (
             None if target["entry_ts"] is None else target["entry_ts"] - target["entry_target"]
         )
+        row["entry_side"] = target.get("entry_side")
         too_stale = (
             max_entry_age_ms > 0
             and row["entry_price_age_ms"] is not None
@@ -359,6 +385,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--entry-side",
+        choices=("any", "buy", "sell"),
+        default="buy",
+        help=(
+            "Side of the print that may fill the entry. 'buy' matches the "
+            "deployed engine, which waits for the first BUY print; 'any' is "
+            "the looser research convention."
+        ),
+    )
+    parser.add_argument(
         "--max-entry-age-ms",
         type=int,
         default=2_000,
@@ -399,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         min_quote_sol=args.min_quote_sol,
         action=args.action,
         entry_fill_mode=args.entry_fill_mode,
+        entry_side=args.entry_side,
     )
     frame = build_frame(
         targets,
@@ -426,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         "max_entry_delay_ms": args.max_entry_delay_ms,
         "min_quote_sol": args.min_quote_sol,
         "action": args.action,
+        "entry_side": args.entry_side,
     }
     for horizon in horizons:
         column = f"net_{horizon}m_return"

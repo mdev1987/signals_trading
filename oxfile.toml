@@ -15,7 +15,7 @@ version = 1
 #   size     0.1 SOL, at most 10 concurrent positions
 #
 # Do not widen the liquidity band or extend the hold: the median token stops
-# printing by minute 7, and 60 % of 15-minute exit marks are already over a
+# printing by minute 7, and 59 % of 15-minute exit marks are already over a
 # minute stale.
 # The AVE and DRBT feeds are retired. `channels.txt` is the research list and
 # never changes what this app consumes: the channel is pinned on the command

@@ -78,12 +78,12 @@ RULE_DESCRIPTIONS = {
 # Scanner-feed strategy (2026-11-22). On the four replay days with scanner
 # history, fresh Pumpfun AMM pools were the only positive cohort. Priced the
 # way the bot trades — first buy print at/after the card + 5 s, hard exit
-# 5 min later — the band won 95.9% of 1,849 trades, median +22.1% (+45.1 SOL
+# 5 min later — the band won 97.2% of 1,818 trades, median +22.0% (+44.6 SOL
 # at 0.1 SOL). The earlier 20 s last-before mark (93.4%) is not the deployed
 # convention and leaned on stale prints: 30% of those entries used a print
 # more than 2 s old. Every other DEX and the sub-20k / over-100k liquidity
 # bands were flat or negative. The win rate is implausibly high and is
-# assumed to be a bundled-launch chart pump, and 17% of 5-minute exit prints
+# assumed to be a bundled-launch chart pump, and 16% of 5-minute exit prints
 # are already over a minute stale, so this ships as a paper lane until it is
 # validated forward. See docs/SCANNER_EVIDENCE.md.
 SCANNER_RULE = "scanner_pumpfun_amm"

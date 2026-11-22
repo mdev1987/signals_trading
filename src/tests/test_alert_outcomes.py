@@ -44,6 +44,19 @@ class EntrySelectionTests(unittest.TestCase):
         self.assertEqual(item["entry_ts"], item["entry_target"])
         self.assertEqual(item["entry_px"], 1.0)
 
+    def test_last_before_accepts_a_print_with_its_side(self) -> None:
+        item = target()
+        select_entry(
+            item,
+            item["entry_target"] + 1,
+            2.0,
+            (item["entry_target"], 1.0, "buy"),
+            "last-before",
+        )
+        self.assertEqual(item["entry_ts"], item["entry_target"])
+        self.assertEqual(item["entry_px"], 1.0)
+        self.assertEqual(item["entry_side"], "buy")
+
     def test_last_before_never_fills_from_a_print_after_the_decision(self) -> None:
         item = target()
         select_entry(item, item["entry_target"] + 1, 2.0, None, "last-before")
@@ -64,6 +77,23 @@ class EntrySelectionTests(unittest.TestCase):
         select_entry(item, item["entry_target"] + 1_500, 1.5, None, "first-after")
         self.assertEqual(item["entry_ts"], item["entry_target"] + 800)
         self.assertEqual(item["entry_px"], 1.1)
+
+    def test_ineligible_print_does_not_fill_or_check_the_entry(self) -> None:
+        item = target()
+        # A SELL print while the bot is waiting for a BUY: not a fill.
+        select_entry(
+            item,
+            item["entry_target"] + 200,
+            1.0,
+            None,
+            "first-after",
+            eligible=False,
+        )
+        self.assertFalse(item["entry_checked"])
+        self.assertIsNone(item["entry_px"])
+        select_entry(item, item["entry_target"] + 900, 1.2, None, "first-after")
+        self.assertEqual(item["entry_ts"], item["entry_target"] + 900)
+        self.assertEqual(item["entry_px"], 1.2)
 
 
 class FrameFilterTests(unittest.TestCase):
