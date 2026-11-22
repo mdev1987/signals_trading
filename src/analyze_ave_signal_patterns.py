@@ -288,6 +288,8 @@ def load_bar_features(
     repo_root: Path, day: str, signals: pd.DataFrame, outcomes: pd.DataFrame
 ) -> pd.DataFrame:
     path = repo_root / DAYS_ROOT / day / "ohlcv" / "ohlcv_1m.parquet"
+    if signals.empty:
+        return pd.DataFrame()
     columns = [
         "mint",
         "timestamp_ms",
@@ -390,6 +392,8 @@ def load_event_features(
     repo_root: Path, day: str, signals: pd.DataFrame, outcomes: pd.DataFrame
 ) -> pd.DataFrame:
     path = repo_root / DAYS_ROOT / day / "parquet" / "events.parquet"
+    if signals.empty:
+        return pd.DataFrame()
     columns = [
         "timestamp_ms",
         "mint",
@@ -886,6 +890,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", type=Path, default=BACKTEST_ROOT / "patterns"
     )
+    parser.add_argument(
+        "--outcomes-csv",
+        type=Path,
+        default=BACKTEST_ROOT / "signals_backtest.csv",
+        help=(
+            "Per-signal outcomes to model. Point this at "
+            "ave_signals_8d_event/signals_backtest.csv to score patterns with "
+            "realistic trade fills instead of 1-minute closes."
+        ),
+    )
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     return parser.parse_args(argv)
 
@@ -900,7 +914,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    outcomes = pd.read_csv(repo_root / BACKTEST_ROOT / "signals_backtest.csv")
+    outcomes_path = (
+        args.outcomes_csv
+        if args.outcomes_csv.is_absolute()
+        else repo_root / args.outcomes_csv
+    )
+    outcomes = pd.read_csv(outcomes_path)
     outcomes = outcomes[
         (outcomes["status"] == "closed")
         & (outcomes["horizon_minutes"] == args.horizon)
