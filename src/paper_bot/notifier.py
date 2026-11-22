@@ -224,9 +224,8 @@ def _signal_evidence(features: dict[str, Any]) -> list[str]:
             f"(gate `> 9.46`)"
         )
     if vol_30m is not None:
-        lines.append(
-            f"• Prior 30m volume: `{fmt_sol(vol_30m, 0)} SOL` (gate `> 600`)"
-        )
+        # Context only: the > 600 SOL leg was dropped from the deployed gate.
+        lines.append(f"• Prior 30m volume: `{fmt_sol(vol_30m, 0)} SOL`")
     if max_pump is not None:
         lines.append(f"• Max pump: `{fmt_ratio(max_pump)}`")
     if pre_ret is not None:
