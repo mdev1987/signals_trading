@@ -33,8 +33,9 @@ The only days with scanner-channel history in the replay archive are
 whole.
 
 Fills are **real trade prints**, not 1-minute closes: entry and exit are
-priced at an observed trade, fees are 1.25 % per side, and the PnL column caps
-each trade at +900 % so one 1,000× print cannot carry the table. Nothing is
+priced at an observed trade and fees are 1.25 % per side. PnL caps each
+trade's contribution at +999 %, so one 1,000× print cannot carry the table;
+that is the `pnl_capped` column in `compare_channels.py`. Nothing is
 backfilled beyond the horizon and no position is force-closed early.
 
 Two entry conventions are supported by `src/alert_outcomes.py`:
@@ -71,13 +72,13 @@ headline numbers can be checked without the replay archive.
 
 ## Result: first print after the card, 5-minute exit
 
-| day | n | win | median | mean | capped PnL @ 0.1 SOL | entry lag p50 / p90 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 2026-11-08 | 277 | 98.2 % | +25.2 % | +25.3 % | +7.01 SOL | 0.9 s / 3.0 s |
-| 2026-11-18 | 502 | 96.8 % | +20.6 % | +41.2 % | +11.39 SOL | 1.7 s / 5.5 s |
-| 2026-11-19 | 540 | 97.8 % | +20.3 % | +36.4 % | +12.28 SOL | 1.8 s / 5.3 s |
-| 2026-11-20 | 499 | 96.4 % | +22.9 % | +30.5 % | +13.95 SOL | 1.4 s / 3.5 s |
-| **all** | **1,818** | **97.2 %** | **+22.0 %** | **+34.4 %** | **+44.64 SOL** | 1.5 s / 4.5 s |
+| day | n | win | median | capped PnL @ 0.1 SOL | entry lag p50 / p90 |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-08 | 277 | 98.2 % | +25.2 % | +7.01 SOL | 0.9 s / 3.0 s |
+| 2026-11-18 | 502 | 96.8 % | +20.6 % | +11.39 SOL | 1.7 s / 5.5 s |
+| 2026-11-19 | 540 | 97.8 % | +20.3 % | +12.28 SOL | 1.8 s / 5.3 s |
+| 2026-11-20 | 499 | 96.4 % | +22.9 % | +13.95 SOL | 1.4 s / 3.5 s |
+| **all** | **1,818** | **97.2 %** | **+22.0 %** | **+44.64 SOL** | 1.5 s / 4.5 s |
 
 Median 1.5 s from card to fill, 90th percentile 4.5 s (p99 25 s). The 5 s
 latency and the 60 s entry window cover the observed distribution with room
@@ -86,11 +87,18 @@ to spare. Every fill is a BUY print, matching what the engine waits for.
 Telegram delivery is the one input the bot cannot control. The engine enters
 relative to the message's own timestamp and gives up at 60 s, recording
 `delivery_lag_ms` on every signal. A late delivery therefore shows up as a
-longer entry lag, not as a backdated fill. An earlier falsification run priced
-entries at 5 / 20 / 60 s and stayed positive at all three (+18.9 / +20.3 /
-+16.1 % median), so a slow delivery does not by itself destroy the edge — but
-a forward run where `delivery_lag_ms` is routinely tens of seconds is trading
-a different fill than the table above.
+longer entry lag, not as a backdated fill. Pricing the same cohort at the
+window's outer edge:
+
+| decision delay | n | win | median | capped PnL |
+| --- | --- | --- | --- | --- |
+| 5 s (deployed) | 1,818 | 97.2 % | +22.0 % | +44.64 SOL |
+| 60 s | 1,714 | 95.9 % | +15.5 % | +31.91 SOL |
+
+A slow delivery costs about a third of the median and a fifth of the PnL, but
+does not destroy the edge. A forward run where `delivery_lag_ms` is routinely
+tens of seconds is still a different fill than the 5 s table above, which is
+why the entry lag is recorded on every trade.
 
 ### Why this replaces the old 93.4 % number
 
