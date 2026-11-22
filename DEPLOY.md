@@ -28,7 +28,9 @@ Copy `deploy/env.example` to `.env` and set at minimum:
 
 `config.ini` already has your Telethon credentials (`api_id`, `api_hash`, `phone`) and `tg_session.session` already exists, so you don't need to re-login.
 
-`channels.txt` already lists `@AveSignalMonitor` only.
+`channels.txt` is the **research** list (four channels). The deployed bot pins
+its channels explicitly, so adding a channel there never changes what the bot
+subscribes to.
 
 ---
 
@@ -50,6 +52,44 @@ PYTHONPATH=src .venv/bin/python -m paper_bot live \
 Watch the log for the startup banner (`🤖 TRADING BOT ONLINE · PAPER`). It should connect to Telegram, subscribe to `@AveSignalMonitor`, and print quotes without signing anything.
 
 Verify paper mode never broadcasts: check that no `live_` reasons appear and no transactions are submitted. Paper uses Jupiter `GET /order` (read-only) only.
+
+---
+
+## 2b. Scanner lane (paper validation, 2026-11-22)
+
+The research comparison found exactly one positive cohort: the first
+`@AveSolanaTokenScanner` card for a **Pumpfunamm** pool with **20k–100k USD**
+launch liquidity, held 5 minutes. On the four replay days with scanner history
+it won 93.4 % of 1,860 trades (median +19.6 %, +41.68 SOL at 0.1 SOL/trade).
+That win rate is implausibly high (assumed bundled-launch chart pump), so the
+lane ships in paper mode only.
+
+`run_bot.sh paper` now starts it as a second wallet next to the AVE lane:
+
+```
+lane A  hot_money_continuation   @AveSignalMonitor
+lane B  scanner_pumpfun_amm      @AveSolanaTokenScanner
+```
+
+A/B mode is refused in live execution, so this cannot reach real money. To run
+the scanner lane alone (and stop the AVE lane first — one Telethon session per
+process):
+
+```bash
+./run_scanner.sh paper
+```
+
+What to watch in `output/paper/scanner_*.log`:
+
+- `gate_rejected` reasons: `rule_dex_not_pumpfunamm`, `rule_liquidity_*` are normal.
+- `skip` reasons on the entries that do pass: `no_quote`, `jupiter_error_reason`
+  or a long `entry_delay_ms` are the real risk. The backtest assumed a fill at
+  the last real trade; a paper lane that cannot get a quote never had the edge.
+- Entry delay: the research entry is card + 20 s; the lane enters at card + 5 s
+  and gives up after 60 s.
+
+Do not fund it until the paper lane reproduces a positive median over several
+days.
 
 ---
 

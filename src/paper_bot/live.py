@@ -56,6 +56,8 @@ from .quotes import JupiterQuoteProvider
 from .signals import (
     DEFAULT_RULE,
     RULE_DESCRIPTIONS,
+    SCANNER_MESSAGE_TYPE,
+    SCANNER_RULE,
     SUPPORTED_RULES,
     GateConfig,
     parse_signal_text,
@@ -674,6 +676,10 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
     # Bounded LRU: Telethon can redeliver a message after a reconnect, but the
     # dedup window must never grow for the life of the process.
     seen: OrderedDict[tuple[str, int], None] = OrderedDict()
+    # The scanner channel posts each new pool about three times. The research
+    # signal is the first card only, so keep the first mint seen per lane and
+    # ignore the repeats (bounded like ``seen``).
+    scanner_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
 
     async def on_message(
         *,
@@ -697,6 +703,16 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                 message_id=message_id or None,
             )
             signal.features["strategy_tag"] = lane.name
+            if (
+                lane.rule == SCANNER_RULE
+                and signal.message_type == SCANNER_MESSAGE_TYPE
+            ):
+                scanner_key = (lane.name, signal.token_address)
+                if scanner_key in scanner_seen:
+                    continue
+                scanner_seen[scanner_key] = None
+                if len(scanner_seen) > config.message_dedup_window:
+                    scanner_seen.popitem(last=False)
             decision = await lane.engine.on_signal(signal)
             LOGGER.info(
                 "signal lane=%s %s %s allowed=%s lag_ms=%s reasons=%s",

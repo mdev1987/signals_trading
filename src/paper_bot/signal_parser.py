@@ -242,10 +242,66 @@ def parse_signal_message(message: str) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Scanner "pool launched" cards
+# ---------------------------------------------------------------------------
+# A different feed shape from the call channels: one card per new pool, with
+# the DEX and its liquidity at launch. The cards are posted three times per
+# token, so the consumer keeps the first one per mint.
+SCANNER_CARD_MARKER = "New Solana Pool Launched"
+SCANNER_CA_RE = re.compile(r"(?im)^CA:\s*([1-9A-HJ-NP-Za-km-z]{32,44})\s*$")
+SCANNER_DEX_RE = re.compile(r"(?im)^Dex:\s*([A-Za-z0-9_]+)\s*$")
+SCANNER_LIQUIDITY_RE = re.compile(
+    r"(?im)^Liquidity:\s*\$?([0-9][0-9.,]*)\s*([KMBT]?)\s*$"
+)
+SCANNER_MCAP_RE = re.compile(r"(?im)^MCap:\s*\$?([0-9][0-9.,]*)\s*([KMBT]?)\s*$")
+SCANNER_TOKEN_RE = re.compile(r"(?im)^Token:\s*(.+?)\s*$")
+
+_SCANNER_SCALE = {"": 1.0, "K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
+
+
+def _scanner_usd(raw: str, suffix: str) -> float | None:
+    try:
+        value = float(raw.replace(",", ""))
+    except ValueError:
+        return None
+    return value * _SCANNER_SCALE.get(suffix.upper(), 1.0)
+
+
+def parse_scanner_card(message: str) -> dict[str, object] | None:
+    """Parse a "New Solana Pool Launched" card, or return ``None``.
+
+    Only the fields needed to decide and record a trade are extracted: the
+    contract address, the DEX, and launch-time liquidity / market cap. Prices
+    on the card use a ``$0.0{4}293`` notation and are deliberately not parsed;
+    the live engine marks positions from the trade feed.
+    """
+    if SCANNER_CARD_MARKER not in message:
+        return None
+    ca = SCANNER_CA_RE.search(message)
+    if ca is None:
+        return None
+    card: dict[str, object] = {"token_address": ca.group(1)}
+    dex = SCANNER_DEX_RE.search(message)
+    if dex is not None:
+        card["dex"] = dex.group(1)
+    liquidity = SCANNER_LIQUIDITY_RE.search(message)
+    if liquidity is not None:
+        card["liquidity_usd"] = _scanner_usd(liquidity.group(1), liquidity.group(2))
+    mcap = SCANNER_MCAP_RE.search(message)
+    if mcap is not None:
+        card["mcap_usd"] = _scanner_usd(mcap.group(1), mcap.group(2))
+    symbol = SCANNER_TOKEN_RE.search(message)
+    if symbol is not None:
+        card["symbol"] = symbol.group(1)
+    return card
+
+
 __all__ = [
     "classify_message",
     "extract_address",
     "infer_network",
+    "parse_scanner_card",
     "parse_signal_message",
     "validate_address",
 ]

@@ -27,8 +27,16 @@ from paper_bot.execution import (  # noqa: E402
 from paper_bot.history import MarketHistory  # noqa: E402
 from paper_bot.models import Signal, TradeEvent  # noqa: E402
 from paper_bot.notifier import format_startup  # noqa: E402
-from paper_bot.signal_parser import parse_signal_message  # noqa: E402
-from paper_bot.signals import GateConfig, evaluate_gate  # noqa: E402
+from paper_bot.signal_parser import (  # noqa: E402
+    parse_scanner_card,
+    parse_signal_message,
+)
+from paper_bot.signals import (  # noqa: E402
+    SCANNER_RULE,
+    GateConfig,
+    evaluate_gate,
+    parse_signal_text,
+)
 
 MINT = "So11111111111111111111111111111111111111112"
 SIGNAL_TS = 1_800_000_000_000
@@ -71,6 +79,80 @@ class AlertParsingTests(unittest.TestCase):
         self.assertEqual(features["total_buy_sol"], 9.5)
         self.assertEqual(features["inflow_n"], 3)
         self.assertEqual(features["inflow_sum"], 9.5)
+
+
+SCANNER_CARD = """\U0001f4a0 New Solana Pool Launched \U0001f4a0
+
+Token: BERNIE
+CA: 2Z9UGHFZmKRwaYJ8r2ECn4uP6yey4H243Hszvt2Xpump
+LP: DbnZrPS8tD8jWgLCZWewBTXaujk3mKHGS86masa8cCS7
+
+Init Price: $0.0{4}293
+MCap: $29.03K
+Pair: 210.20M BERNIE / 66.12 SOL
+Dex: Pumpfunamm
+Liquidity: $10.95K
+Insiders: 2(Holdings 0%)
+SNIPES: 15  RUSHERS: 0
+Token Holders: 616
+    |_4ALRKjQWdiXtfxjwTGKGXsmLCxf1Ro9eqESGrx3LM4Ah 0%
+    |_6usR4bEbXTSwzjmPqrm41SAGicpGuJ8r2zAzmfrkAmB2 0.8406%
+Security: Score: 0(\U0001f7e2Low Risk)
+"""
+
+
+class ScannerCardTests(unittest.TestCase):
+    def test_card_fields_are_parsed(self) -> None:
+        card = parse_scanner_card(SCANNER_CARD)
+        assert card is not None
+        self.assertEqual(
+            card["token_address"], "2Z9UGHFZmKRwaYJ8r2ECn4uP6yey4H243Hszvt2Xpump"
+        )
+        self.assertEqual(card["dex"], "Pumpfunamm")
+        self.assertEqual(card["liquidity_usd"], 10_950.0)
+        self.assertEqual(card["mcap_usd"], 29_030.0)
+        self.assertEqual(card["symbol"], "BERNIE")
+
+    def test_non_scanner_message_is_not_a_card(self) -> None:
+        self.assertIsNone(parse_scanner_card("BUY SIGNAL $WIF\nCA: " + MINT))
+
+    def test_signal_uses_the_card_ca_not_a_security_row(self) -> None:
+        result = parse_signal_text(
+            SCANNER_CARD,
+            signal_ts_ms=SIGNAL_TS,
+            received_ts_ms=SIGNAL_TS + 2_000,
+        )
+        self.assertEqual(
+            result.token_address, "2Z9UGHFZmKRwaYJ8r2ECn4uP6yey4H243Hszvt2Xpump"
+        )
+        self.assertTrue(result.is_buy_signal)
+        self.assertEqual(result.address_status, "confirmed")
+        self.assertEqual(result.message_type, "scanner_pool_launch")
+        self.assertEqual(result.features["liquidity_usd"], 10_950.0)
+        self.assertEqual(result.features["delivery_lag_ms"], 2_000)
+
+    def test_scanner_rule_accepts_only_the_priced_band(self) -> None:
+        def allowed(**features: object) -> bool:
+            candidate = signal(features)
+            candidate.message_type = "scanner_pool_launch"
+            return evaluate_gate(candidate, GateConfig(rule=SCANNER_RULE)).allowed
+
+        self.assertTrue(allowed(dex="Pumpfunamm", liquidity_usd=20_000.0))
+        self.assertTrue(allowed(dex="Pumpfunamm", liquidity_usd=99_999.0))
+        self.assertFalse(allowed(dex="Pumpfunamm", liquidity_usd=19_999.0))
+        self.assertFalse(allowed(dex="Pumpfunamm", liquidity_usd=100_000.0))
+        self.assertFalse(allowed(dex="Raydiumclmm", liquidity_usd=50_000.0))
+        self.assertFalse(allowed(dex="Pumpfunamm", liquidity_usd=None))
+
+    def test_card_liquidity_is_judged_against_the_rule(self) -> None:
+        result = parse_signal_text(
+            SCANNER_CARD,
+            signal_ts_ms=SIGNAL_TS,
+            received_ts_ms=SIGNAL_TS,
+        )
+        decision = evaluate_gate(result, GateConfig(rule=SCANNER_RULE))
+        self.assertFalse(decision.allowed)
+        self.assertIn("rule_liquidity_below_20000", decision.reasons)
 
 
 class HotMoneyGateTests(unittest.TestCase):

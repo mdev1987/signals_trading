@@ -15,6 +15,7 @@ from .signal_parser import (
     classify_message,
     extract_address,
     infer_network,
+    parse_scanner_card,
     parse_signal_message,
 )
 
@@ -30,6 +31,7 @@ SUPPORTED_RULES = (
     "exclude_crowded_pre",
     "signers_5m_le_147",
     "smart_wallet_only",
+    "scanner_pumpfun_amm",
 )
 
 # Human-readable descriptions used by the startup report and meta.json.
@@ -67,7 +69,24 @@ RULE_DESCRIPTIONS = {
     ),
     "signers_5m_le_147": "at most 147 unique signers in the prior 5 minutes",
     "smart_wallet_only": "signal is Smart-wallet tagged, not KOL tagged",
+    "scanner_pumpfun_amm": (
+        "new Pumpfun AMM pool with 20k-100k USD launch liquidity; exit after "
+        "5 min (scanner feed only)"
+    ),
 }
+
+# Scanner-feed strategy (2026-11-22). On the four replay days with scanner
+# history, fresh Pumpfun AMM pools were the only positive cohort: buying the
+# first pool card at +20 s and selling 5 minutes later won 93.4% of 1,860
+# trades, median +19.6%. Every other DEX and the sub-20k / over-100k liquidity
+# bands were flat or negative. The win rate is implausibly high and is assumed
+# to be a bundled-launch chart pump, so this ships as a paper lane until it is
+# validated forward. See output/backtest/channel_comparison/FINDINGS.md.
+SCANNER_RULE = "scanner_pumpfun_amm"
+SCANNER_ALLOWED_DEX = "Pumpfunamm"
+SCANNER_MIN_LIQUIDITY_USD = 20_000.0
+SCANNER_MAX_LIQUIDITY_USD = 100_000.0
+SCANNER_MESSAGE_TYPE = "scanner_pool_launch"
 
 MAX_PUMP_THRESHOLD = 1.0
 PRE_RET_THRESHOLD = 6.3
@@ -190,6 +209,17 @@ def parse_signal_text(
     produces a Signal with ``token_address == ""`` so the gate can record why
     it was skipped instead of silently dropping it.
     """
+    card = parse_scanner_card(message)
+    if card is not None:
+        return _scanner_signal(
+            card,
+            message=message,
+            signal_ts_ms=signal_ts_ms,
+            received_ts_ms=received_ts_ms,
+            channel=channel,
+            message_id=message_id,
+        )
+
     message_type, is_candidate, exclusion_reason = classify_message(message)
     address, address_type, method, status = extract_address(message)
     network = infer_network(message, address_type)
@@ -224,6 +254,49 @@ def parse_signal_text(
             is_candidate and address and status == "confirmed"
         ),
         ticker=ticker_match.group(1).upper() if ticker_match else None,
+        features=features,
+    )
+
+
+def _scanner_signal(
+    card: dict[str, object],
+    *,
+    message: str,
+    signal_ts_ms: int,
+    received_ts_ms: int,
+    channel: str,
+    message_id: int | None,
+) -> Signal:
+    """Build a Signal from a scanner pool-launch card.
+
+    The card is a launch notice, not a buy call, so it is only a candidate for
+    the scanner rule. The address comes from the card's own ``CA:`` line
+    because the security block lists several unrelated addresses.
+    """
+    features: dict[str, object] = {
+        "dex": card.get("dex"),
+        "liquidity_usd": card.get("liquidity_usd"),
+        "mcap_usd": card.get("mcap_usd"),
+        "card_symbol": card.get("symbol"),
+    }
+    if received_ts_ms > 0 and signal_ts_ms > 0:
+        features["delivery_lag_ms"] = max(0, received_ts_ms - signal_ts_ms)
+    address = str(card["token_address"])
+    return Signal(
+        token_address=address,
+        signal_ts_ms=signal_ts_ms,
+        received_ts_ms=received_ts_ms,
+        channel=channel,
+        message_id=message_id,
+        message=message,
+        network="solana",
+        address_status="confirmed",
+        address_type="mint",
+        address_extraction_method="scanner_card_ca",
+        message_type=SCANNER_MESSAGE_TYPE,
+        is_buy_signal=True,
+        is_confirmed_buy_signal=True,
+        ticker=str(card["symbol"]) if card.get("symbol") else None,
         features=features,
     )
 
@@ -293,6 +366,19 @@ def _rule_decision(signal: Signal, rule: str) -> tuple[bool, str | None]:
         trades = _feature(signal, "hist_trades_5m")
         if trades is not None and trades > HOT_MONEY_TRADES_5M_MAX:
             return False, "rule_trades_5m_gt_611"
+        return True, None
+
+    if rule == SCANNER_RULE:
+        dex = signal.features.get("dex")
+        if dex != SCANNER_ALLOWED_DEX:
+            return False, f"rule_dex_not_{SCANNER_ALLOWED_DEX.lower()}"
+        liquidity = _feature(signal, "liquidity_usd")
+        if liquidity is None:
+            return False, "missing_feature:liquidity_usd"
+        if liquidity < SCANNER_MIN_LIQUIDITY_USD:
+            return False, "rule_liquidity_below_20000"
+        if liquidity >= SCANNER_MAX_LIQUIDITY_USD:
+            return False, "rule_liquidity_at_or_above_100000"
         return True, None
 
     if rule == "max_pump_gt_1":

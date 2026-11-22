@@ -56,12 +56,24 @@ echo ">>> Logs: output/paper/bot.log  (Ctrl-C to stop; systemd restarts on crash
 
 mkdir -p output/paper
 
+# Paper mode also runs the scanner lane as a second wallet so the new
+# Pumpfunamm rule accumulates forward evidence next to the AVE control. A/B
+# mode is refused in live execution, so this cannot reach real money.
+EXTRA_ARGS=()
+if [[ "$MODE" == "paper" ]]; then
+  EXTRA_ARGS+=(--ab-rule scanner_pumpfun_amm --channel @AveSolanaTokenScanner)
+  echo ">>> Paper A/B: lane A hot_money_continuation, lane B scanner_pumpfun_amm"
+fi
+
+# The AVE lane is pinned to its channel so growing channels.txt (which is the
+# research list) never silently subscribes the deployed bot to new firehoses.
 exec "$VENV" -m paper_bot live \
   --mode "$MODE" \
   --rule hot_money_continuation \
+  --channel @AveSignalMonitor \
   --entry-mode timer \
   --entry-delay-ms 5_000 \
-  --max-entry-delay-ms 120_000 \
+  --max-entry-delay-ms 60_000 \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --slippage-bps 50 \
@@ -72,6 +84,7 @@ exec "$VENV" -m paper_bot live \
   --history-max-mints 10000 \
   --history-max-events-per-mint 3000 \
   --history-max-total-events 150000 \
+  "${EXTRA_ARGS[@]}" \
   --memory-limit-mb 550 \
   --memory-report-s 300 \
   --shutdown-timeout-ms 25000 \
