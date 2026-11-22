@@ -61,7 +61,11 @@ mkdir -p output/paper
 # mode is refused in live execution, so this cannot reach real money.
 EXTRA_ARGS=()
 if [[ "$MODE" == "paper" ]]; then
-  EXTRA_ARGS+=(--ab-rule scanner_pumpfun_amm --channel @AveSolanaTokenScanner)
+  EXTRA_ARGS+=(
+    --ab-rule scanner_pumpfun_amm
+    --ab-entry-mode trade
+    --channel @AveSolanaTokenScanner
+  )
   echo ">>> Paper A/B: lane A hot_money_continuation, lane B scanner_pumpfun_amm"
 fi
 

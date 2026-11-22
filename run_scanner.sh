@@ -54,7 +54,10 @@ exec "$VENV" -m paper_bot live \
   --mode "$MODE" \
   --rule scanner_pumpfun_amm \
   --channel @AveSolanaTokenScanner \
-  --entry-mode timer \
+  # Trade mode fills on the first buy print after the card, which is how the
+  # research backtest priced the entry; timer mode would depend on a Jupiter
+  # route existing for a seconds-old pool.
+  --entry-mode trade \
   --entry-delay-ms 5_000 \
   --max-entry-delay-ms 60_000 \
   --horizon-min 5 \

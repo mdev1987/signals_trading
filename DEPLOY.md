@@ -85,8 +85,8 @@ What to watch in `output/paper/scanner_*.log`:
 - `skip` reasons on the entries that do pass: `no_quote`, `jupiter_error_reason`
   or a long `entry_delay_ms` are the real risk. The backtest assumed a fill at
   the last real trade; a paper lane that cannot get a quote never had the edge.
-- Entry delay: the research entry is card + 20 s; the lane enters at card + 5 s
-  and gives up after 60 s.
+- Entry delay: the research entry is card + 20 s. The lane uses trade mode (the
+  first buy print after the card, +5 s minimum) and gives up after 60 s.
 
 Do not fund it until the paper lane reproduces a positive median over several
 days.
