@@ -14,8 +14,10 @@ if str(SRC_DIR) not in sys.path:
 
 from backtest_ave_signals import (  # noqa: E402
     MintBars,
+    MintTrades,
     _excursions,
     _last_at_or_before,
+    _last_trade_at_or_before,
     backtest,
     load_flagged_mints,
     load_signals,
@@ -36,6 +38,14 @@ def bars(closes: list[float], start_ms: int = 60_000, step_ms: int = 60_000) -> 
         high_px=close_px * 1.1,
         low_px=close_px * 0.9,
     )
+
+
+def trades(
+    points: list[tuple[int, float]],
+) -> MintTrades:
+    ts = np.asarray([point[0] for point in points], dtype="int64")
+    px = np.asarray([point[1] for point in points], dtype="float64")
+    return MintTrades(ts=ts, px=px)
 
 
 def signals(timestamp_ms: int, *, signal_id: str = "telegram:1") -> pd.DataFrame:
@@ -147,6 +157,110 @@ class BacktestTests(unittest.TestCase):
         self.assertAlmostEqual(result["gross_return"], 0.0)
         self.assertAlmostEqual(result["net_return"], expected)
         self.assertLess(result["net_return"], 0.0)
+
+
+class EventFillTests(unittest.TestCase):
+    """The realistic fill uses the last real trade, not the stale bar close."""
+
+    def run_event(
+        self,
+        series: MintTrades,
+        timestamp_ms: int,
+        *,
+        horizons: tuple[int, ...] = (1,),
+        bars_by_day: dict[str, dict[str, MintBars]] | None = None,
+    ):
+        return backtest(
+            signals(timestamp_ms),
+            bars_by_day or {},
+            horizons=horizons,
+            latency_ms=5_000,
+            fee_rate=0.0125,
+            stake_sol=0.1,
+            max_price_age_ms=60_000,
+            fill_source="event",
+            trades_by_day={DAY: {MINT: series}},
+        )
+
+    def test_last_trade_at_or_before_uses_latest_trade(self) -> None:
+        series = trades([(100_000, 1.0), (123_000, 1.5), (130_000, 2.0)])
+        self.assertEqual(_last_trade_at_or_before(series, 124_000), (123_000, 1.5))
+        self.assertEqual(_last_trade_at_or_before(series, 130_000), (130_000, 2.0))
+
+    def test_last_trade_returns_none_before_first_trade(self) -> None:
+        self.assertIsNone(_last_trade_at_or_before(trades([(100_000, 1.0)]), 99_999))
+
+    def test_event_fill_ignores_stale_bar_close(self) -> None:
+        series = trades([(100_000, 1.0), (123_000, 1.5), (130_000, 2.0)])
+        result = self.run_event(series, 119_000).iloc[0]
+        # The ohlcv model would fill at the 120 s bar close (2.0); the realistic
+        # model fills the last real trade before the 124 s decision.
+        self.assertEqual(result["status"], "closed")
+        self.assertEqual(result["entry_price_timestamp_ms"], 123_000)
+        self.assertEqual(result["entry_price_sol"], 1.5)
+        self.assertEqual(result["entry_price_age_ms"], 1_000)
+        self.assertEqual(result["exit_price_timestamp_ms"], 130_000)
+        self.assertEqual(result["exit_price_sol"], 2.0)
+        expected = (2.0 * (1 - 0.0125)) / (1.5 * (1 + 0.0125)) - 1
+        self.assertAlmostEqual(result["net_return"], expected)
+
+    def test_event_mode_reports_mints_without_trades(self) -> None:
+        result = backtest(
+            signals(119_000),
+            {},
+            horizons=(1, 5),
+            latency_ms=5_000,
+            fee_rate=0.0125,
+            stake_sol=0.1,
+            max_price_age_ms=60_000,
+            fill_source="event",
+            trades_by_day={DAY: {}},
+        )
+        self.assertEqual(result["status"].tolist(), ["no_trades", "no_trades"])
+
+    def test_event_mode_requires_trades(self) -> None:
+        with self.assertRaises(ValueError):
+            backtest(
+                signals(119_000),
+                {},
+                horizons=(1,),
+                latency_ms=5_000,
+                fee_rate=0.0125,
+                stake_sol=0.1,
+                max_price_age_ms=60_000,
+                fill_source="event",
+            )
+
+    def test_invalid_fill_source_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            backtest(
+                signals(119_000),
+                {},
+                horizons=(1,),
+                latency_ms=5_000,
+                fee_rate=0.0125,
+                stake_sol=0.1,
+                max_price_age_ms=60_000,
+                fill_source="midpoint",
+            )
+
+    def test_event_mode_keeps_bar_excursions_when_available(self) -> None:
+        series = trades([(100_000, 1.0), (123_000, 1.5), (130_000, 2.0)])
+        excursion_bars = MintBars(
+            close_ts=np.array([60_000, 120_000, 130_000], dtype="int64"),
+            close_px=np.array([1.0, 2.0, 3.0]),
+            high_px=np.array([1.0, 9.0, 3.3]),
+            low_px=np.array([1.0, 0.5, 1.8]),
+        )
+        result = self.run_event(
+            series,
+            119_000,
+            bars_by_day={DAY: {MINT: excursion_bars}},
+        ).iloc[0]
+        # The 130 s bar (120-130 s) carries high 3.3 / low 1.8, used instead of
+        # the raw trade stream so a single bad print cannot swamp MFE/MAE.
+        self.assertAlmostEqual(result["mfe"], 3.3 / 1.5 - 1)
+        self.assertAlmostEqual(result["mae"], 1.8 / 1.5 - 1)
 
 
 class ReportingTests(unittest.TestCase):

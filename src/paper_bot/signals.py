@@ -84,6 +84,14 @@ PRE_RET_THRESHOLD = 6.3
 # it added nothing that later-in-the-run filters did not add. It is therefore
 # not kept; the flow + total-buy gate is the OOS-validated core, with the
 # pre_ret_15m dip overlay and anti-crowd overlays applied on top.
+#
+# Fill-realism warning (2026-11-22): those OOS numbers fill at the close of the
+# latest completed 1-minute bar (median 30 s stale). Re-scored with the last
+# real trade as the fill (``backtest_ave_signals.py --fill-source event``) the
+# same rule goes from 52.5% / +48.2% mean to 36.4% / +2.0% mean at 5 minutes,
+# and the dip overlay subset from 71.4% win to 32.7% win (mean -6.6%). The
+# thresholds below are unchanged, but the rule is an unproven edge, not a
+# validated one. See output/backtest/fill_model_realism.md.
 DEFAULT_RULE = "hot_money_continuation"
 HOT_MONEY_FLOW_1M_SOL = 9.456
 HOT_MONEY_ALERT_TOTAL_BUY_SOL = 3.0

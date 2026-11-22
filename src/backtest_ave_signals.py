@@ -8,20 +8,34 @@ Execution convention (same as the rest of the project, so numbers stay
 comparable):
 
 * entry decision  = signal timestamp + ``--latency-ms`` (default 5 s);
-* entry price     = close of the latest **real** 1-minute bar whose close time
-                    is at or before the entry decision;
 * exit decision   = entry decision + horizon;
-* exit price      = close of the latest real bar at or before the exit decision;
 * ``is_filled == 1`` bars are ignored (stale forward-filled rows).
+
+Two fill models are available through ``--fill-source``:
+
+``ohlcv`` (default, the historical convention)
+    Entry price is the close of the latest **real** 1-minute bar whose close
+    time is at or before the entry decision; exit price is the latest real bar
+    close at or before the exit decision. Because a 1-minute bar closes at the
+    end of its bucket, this fills at a price that is up to 60 s old — median
+    ~29 s in these days. On a token that is moving vertically that stale price
+    is systematically favourable, so this model overstates the edge.
+
+``event`` (realistic)
+    Entry and exit prices are the **last real trade** at or before the decision
+    timestamp, taken from the per-trade replay stream
+    (``days/<day>/parquet/events.parquet``). This is the price a market order
+    would actually have seen, and it is the model live execution faces.
 
 Returns are reported both gross and net of ``--fee-rate`` on each side.
 The per-signal table also records maximum favourable/adverse excursion over the
-holding window using real bar highs/lows (sampled on the 1-minute grid).
+holding window.
 
 Usage (from the repository root)::
 
     python src/backtest_ave_signals.py
     python src/backtest_ave_signals.py --days 2026-11-08
+    python src/backtest_ave_signals.py --fill-source event --output-dir out
 """
 
 from __future__ import annotations
@@ -58,6 +72,14 @@ class MintBars:
     close_px: np.ndarray
     high_px: np.ndarray
     low_px: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class MintTrades:
+    """Real per-trade prices for one mint, sorted by timestamp."""
+
+    ts: np.ndarray
+    px: np.ndarray
 
 
 def load_signals(
@@ -117,6 +139,42 @@ def load_bars(repo_root: Path, day: str, mints: list[str]) -> dict[str, MintBars
     return bars
 
 
+def load_trades(
+    repo_root: Path, day: str, mints: list[str]
+) -> dict[str, MintTrades]:
+    """Load the real per-trade price stream for ``mints`` on ``day``.
+
+    The replay ``events.parquet`` is the same stream the bars are built from, so
+    an event fill stays consistent with the OHLCV dataset while removing the
+    1-minute grid's staleness.
+    """
+    path = repo_root / DAYS_ROOT / day / "parquet" / "events.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing events parquet: {path}")
+    frame = pq.read_table(
+        path,
+        columns=["mint", "timestamp_ms", "price_sol"],
+        filters=[("mint", "in", sorted(set(mints)))],
+    ).to_pandas()
+    if frame.empty:
+        return {}
+    frame = frame[
+        np.isfinite(frame["price_sol"]) & (frame["price_sol"] > 0)
+    ].copy()
+    if frame.empty:
+        return {}
+    frame["timestamp_ms"] = frame["timestamp_ms"].astype("int64")
+    frame["price_sol"] = frame["price_sol"].astype("float64")
+    frame = frame.sort_values(["mint", "timestamp_ms"], kind="stable")
+    trades: dict[str, MintTrades] = {}
+    for mint, group in frame.groupby("mint", sort=True):
+        trades[str(mint)] = MintTrades(
+            ts=group["timestamp_ms"].to_numpy(dtype="int64"),
+            px=group["price_sol"].to_numpy(dtype="float64"),
+        )
+    return trades
+
+
 def load_flagged_mints(repo_root: Path, day: str) -> set[str]:
     """Mints with at least one candle-range anomaly flag on ``day``.
 
@@ -158,6 +216,30 @@ def _excursions(
     return high, low
 
 
+def _last_trade_at_or_before(
+    trades: MintTrades, timestamp_ms: int
+) -> tuple[int, float] | None:
+    index = int(np.searchsorted(trades.ts, timestamp_ms, side="right")) - 1
+    if index < 0:
+        return None
+    return int(trades.ts[index]), float(trades.px[index])
+
+
+def _trade_excursions(
+    trades: MintTrades, start_ts: int, end_ts: int
+) -> tuple[float | None, float | None]:
+    left = int(np.searchsorted(trades.ts, start_ts, side="right"))
+    right = int(np.searchsorted(trades.ts, end_ts, side="right"))
+    if right <= left:
+        return None, None
+    window = trades.px[left:right]
+    high = float(np.nanmax(window))
+    low = float(np.nanmin(window))
+    if not np.isfinite(high) or not np.isfinite(low):
+        return None, None
+    return high, low
+
+
 def backtest(
     signals: pd.DataFrame,
     bars_by_day: dict[str, dict[str, MintBars]],
@@ -168,13 +250,21 @@ def backtest(
     stake_sol: float,
     max_price_age_ms: int,
     flagged_mints_by_day: dict[str, set[str]] | None = None,
+    fill_source: str = "ohlcv",
+    trades_by_day: dict[str, dict[str, MintTrades]] | None = None,
 ) -> pd.DataFrame:
+    if fill_source not in ("ohlcv", "event"):
+        raise ValueError("fill_source must be 'ohlcv' or 'event'")
+    if fill_source == "event" and trades_by_day is None:
+        raise ValueError("fill_source='event' requires trades_by_day")
     flagged_mints_by_day = flagged_mints_by_day or {}
+    trades_by_day = trades_by_day or {}
     rows: list[dict[str, object]] = []
     for signal in signals.itertuples(index=False):
         day = str(signal.day)
         mint = str(signal.mint)
         bars = bars_by_day.get(day, {}).get(mint)
+        trades = trades_by_day.get(day, {}).get(mint)
         signal_ts = int(signal.signal_timestamp_ms)
         decision_ts = signal_ts + latency_ms
         base = {
@@ -189,18 +279,28 @@ def backtest(
             "flagged_mint": mint in flagged_mints_by_day.get(day, set()),
         }
 
-        if bars is None or bars.close_ts.size == 0:
-            for horizon in horizons:
-                rows.append(
-                    {
-                        **base,
-                        "horizon_minutes": horizon,
-                        "status": "no_bars",
-                    }
-                )
-            continue
+        if fill_source == "event":
+            lookup = _last_trade_at_or_before
+            excursions = _trade_excursions
+            if trades is None or trades.ts.size == 0:
+                for horizon in horizons:
+                    rows.append(
+                        {**base, "horizon_minutes": horizon, "status": "no_trades"}
+                    )
+                continue
+            market = trades
+        else:
+            lookup = _last_at_or_before
+            excursions = _excursions
+            if bars is None or bars.close_ts.size == 0:
+                for horizon in horizons:
+                    rows.append(
+                        {**base, "horizon_minutes": horizon, "status": "no_bars"}
+                    )
+                continue
+            market = bars
 
-        entry = _last_at_or_before(bars, decision_ts)
+        entry = lookup(market, decision_ts)  # type: ignore[operator]
         if entry is None:
             for horizon in horizons:
                 rows.append(
@@ -220,7 +320,7 @@ def backtest(
 
         for horizon in horizons:
             exit_decision_ts = decision_ts + horizon * MINUTE_MS
-            exit_ = _last_at_or_before(bars, exit_decision_ts)
+            exit_ = lookup(market, exit_decision_ts)  # type: ignore[operator]
             if exit_ is None:
                 rows.append(
                     {
@@ -245,7 +345,12 @@ def backtest(
             net = (exit_px * (1.0 - fee_rate)) / (
                 entry_px * (1.0 + fee_rate)
             ) - 1.0
-            high, low = _excursions(bars, entry_ts, exit_ts)
+            high, low = excursions(market, entry_ts, exit_ts)  # type: ignore[operator]
+            if fill_source == "event" and bars is not None and bars.close_ts.size:
+                # MFE/MAE from the curated bar highs/lows: the raw event stream
+                # contains occasional bad prints (1e-22 SOL) that would swamp
+                # the excursion statistics without affecting entry/exit fills.
+                high, low = _excursions(bars, entry_ts, exit_ts)
             rows.append(
                 {
                     **base,
@@ -510,6 +615,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Holding horizons in minutes",
     )
     parser.add_argument("--latency-ms", type=int, default=5_000)
+    parser.add_argument(
+        "--fill-source",
+        choices=("ohlcv", "event"),
+        default="ohlcv",
+        help=(
+            "ohlcv: latest real 1-minute close at/before each decision (the "
+            "historical convention, up to 60 s stale). event: last real trade "
+            "at/before each decision (realistic live-like fill)."
+        ),
+    )
     parser.add_argument("--fee-rate", type=float, default=0.0125)
     parser.add_argument("--stake-sol", type=float, default=0.1)
     parser.add_argument("--max-price-age-ms", type=int, default=60_000)
@@ -543,6 +658,16 @@ def main(argv: list[str] | None = None) -> int:
         day: load_bars(repo_root, day, signals.loc[signals.day == day, "mint"].tolist())
         for day in args.days
     }
+    trades_by_day = (
+        {
+            day: load_trades(
+                repo_root, day, signals.loc[signals.day == day, "mint"].tolist()
+            )
+            for day in args.days
+        }
+        if args.fill_source == "event"
+        else None
+    )
     flagged_mints_by_day = {
         day: load_flagged_mints(repo_root, day) for day in args.days
     }
@@ -563,6 +688,8 @@ def main(argv: list[str] | None = None) -> int:
         stake_sol=args.stake_sol,
         max_price_age_ms=args.max_price_age_ms,
         flagged_mints_by_day=flagged_mints_by_day,
+        fill_source=args.fill_source,
+        trades_by_day=trades_by_day,
     )
     summary = summarise(results, horizons)
     primary = 30 if 30 in horizons else horizons[0]
@@ -577,9 +704,10 @@ def main(argv: list[str] | None = None) -> int:
         "stake_sol": args.stake_sol,
         "max_price_age_ms": args.max_price_age_ms,
         "exclude_flagged_mints": bool(args.exclude_flagged_mints),
+        "fill_source": args.fill_source,
         "horizons": list(horizons),
         "generated_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
-        "engine": "standalone_pandas_ohlcv",
+        "engine": f"standalone_pandas_{args.fill_source}",
         "note": (
             "Signal-quality evaluation only. Not an execution simulation and "
             "not the VectorBT portfolio baseline."
