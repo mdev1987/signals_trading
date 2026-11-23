@@ -74,6 +74,9 @@ exec "$VENV" -m paper_bot live \
   --max-delivery-lag-ms 60_000 \
   --max-concurrent-positions 10 \
   --entry-retry-backoff-ms 1_000 \
+  --min-entry-quote-sol 0.01 \
+  --max-reference-age-ms 30_000 \
+  --max-mark-age-ms 120_000 \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --starting-sol 10 \

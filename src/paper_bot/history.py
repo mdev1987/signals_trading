@@ -255,6 +255,39 @@ class MarketHistory:
         latest = max(bucket, key=lambda event: (event.timestamp_ms, event.event_index))
         return latest.price_sol, latest.timestamp_ms, latest.decimals
 
+    def first_buy_between(
+        self,
+        mint: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        min_notional_sol: float = 0.0,
+    ) -> int | None:
+        """Timestamp of the earliest eligible BUY print in ``[start_ms, end_ms)``.
+
+        Used to detect that Telegram delivered a card after the research entry
+        print had already happened: the live bot cannot buy in the past, so the
+        signal is skipped instead of starting a new entry window.
+        ``min_notional_sol`` must be the same entry-size floor the live trigger
+        and the replay use; a sub-cent print is not the print the strategy
+        would have taken, so it must not count as a missed entry.
+        """
+        bucket = self._events.get(mint)
+        if not bucket:
+            return None
+        stamps = []
+        for event in bucket:
+            if not event.is_buy:
+                continue
+            if not (start_ms <= event.timestamp_ms < end_ms):
+                continue
+            if min_notional_sol > 0:
+                notional = event.quote_notional_sol
+                if notional is None or notional < min_notional_sol:
+                    continue
+            stamps.append(event.timestamp_ms)
+        return min(stamps) if stamps else None
+
     def buy_volume_share(
         self, mint: str, start_ms: int, end_ms: int
     ) -> float | None:

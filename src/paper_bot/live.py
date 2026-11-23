@@ -106,7 +106,7 @@ class LiveConfig:
     priority_fee_lamports: int | None = None
     jito_tip_lamports: int | None = None
     entry_delay_ms: int = 5_000
-    max_entry_delay_ms: int = 120_000
+    max_entry_delay_ms: int = 60_000
     # Skip a signal Telegram delivered later than this after the card was
     # posted. The research convention prices card + 5 s and gives up at
     # card + 60 s, so a card that arrives minutes late is not a measured trade.
@@ -121,6 +121,14 @@ class LiveConfig:
     # Minimum gap between quote attempts for the same mint while waiting for
     # its first routable BUY print.
     entry_retry_backoff_ms: int = 1_000
+    # Reject a BUY print below this canonical SOL notional as an entry
+    # trigger. Matches ``alert_outcomes.py --min-quote-sol``.
+    min_entry_quote_sol: float = 0.01
+    # Timer mode quotes a time, not a print: refuse a stale reference mark.
+    max_reference_age_ms: int = 30_000
+    # Marks older than this are excluded from reported NAV. 0 disables the
+    # freshness split (all marks are then treated as current).
+    max_mark_age_ms: int = 120_000
     safety_screen: bool = False
     allow_candidate_address: bool = False
     pumpapi_url: str = DEFAULT_PUMPAPI_URL
@@ -226,6 +234,12 @@ class LiveConfig:
             raise ValueError("max_daily_loss_sol must be non-negative")
         if self.entry_retry_backoff_ms < 0:
             raise ValueError("entry_retry_backoff_ms must be non-negative")
+        if self.min_entry_quote_sol < 0:
+            raise ValueError("min_entry_quote_sol must be non-negative")
+        if self.max_reference_age_ms < 0:
+            raise ValueError("max_reference_age_ms must be non-negative")
+        if self.max_mark_age_ms < 0:
+            raise ValueError("max_mark_age_ms must be non-negative")
         if self.exit_quote_timeout_ms <= 0:
             raise ValueError("exit_quote_timeout_ms must be positive")
         if self.shutdown_timeout_ms <= 0:
@@ -401,6 +415,9 @@ def _lane_meta(
         "max_concurrent_positions": config.max_concurrent_positions,
         "max_daily_loss_sol": config.max_daily_loss_sol,
         "entry_retry_backoff_ms": config.entry_retry_backoff_ms,
+        "min_entry_quote_sol": config.min_entry_quote_sol,
+        "max_reference_age_ms": config.max_reference_age_ms,
+        "max_mark_age_ms": config.max_mark_age_ms,
         "tp_pct": config.tp_pct,
         "sl_pct": config.sl_pct,
         "fee": config.fee,
@@ -490,6 +507,9 @@ def _create_lane(
             max_concurrent_positions=config.max_concurrent_positions,
             max_daily_loss_sol=config.max_daily_loss_sol,
             entry_retry_backoff_ms=config.entry_retry_backoff_ms,
+            min_entry_quote_sol=config.min_entry_quote_sol,
+            max_reference_age_ms=config.max_reference_age_ms,
+            max_mark_age_ms=config.max_mark_age_ms,
             horizon_ms=int(config.horizon_min * 60_000),
             tp_pct=config.tp_pct,
             sl_pct=config.sl_pct,

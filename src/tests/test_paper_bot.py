@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -46,6 +47,7 @@ from paper_bot.signal_parser import (  # noqa: E402
     parse_scanner_card,
     parse_signal_message,
 )
+from paper_bot.store import PaperStore  # noqa: E402
 from paper_bot.signals import (  # noqa: E402
     SCANNER_RULE,
     GateConfig,
@@ -434,7 +436,7 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
 
     NOW_MS = 1_800_000_000_000
 
-    def engine(self, **overrides: object) -> PaperEngine:
+    def engine(self, *, store: PaperStore | None = None, **overrides: object) -> PaperEngine:
         wallet = PaperWallet(WalletConfig(starting_sol=10.0))
         broker = PaperBroker(BrokerConfig(notional_sol=0.1), wallet=wallet)
         config = EngineConfig(
@@ -449,13 +451,21 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
             quotes=object(),
             history=MarketHistory(),
             gate=GateConfig(rule="baseline"),
+            store=store,
             clock=lambda: self.NOW_MS,
         )
 
-    def make_signal(self, *, received_ts_ms: int | None = None) -> Signal:
+    def make_signal(
+        self,
+        *,
+        received_ts_ms: int | None = None,
+        signal_ts_ms: int | None = None,
+    ) -> Signal:
         return Signal(
             token_address=MINT,
-            signal_ts_ms=self.NOW_MS - 1_000,
+            signal_ts_ms=(
+                self.NOW_MS - 1_000 if signal_ts_ms is None else signal_ts_ms
+            ),
             received_ts_ms=(
                 self.NOW_MS if received_ts_ms is None else received_ts_ms
             ),
@@ -485,6 +495,183 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
         decision = await engine.on_signal(self.make_signal())
         self.assertTrue(decision.allowed)
         self.assertIn(MINT, engine.pending)
+        pending = engine.pending[MINT]
+        # Anchored on the card, not on Telegram delivery: eligible at card+5 s
+        # and expired at card+60 s exactly like the research convention.
+        self.assertEqual(
+            pending.eligible_at_ms, self.NOW_MS - 1_000 + 5_000
+        )
+        self.assertEqual(
+            pending.expires_at_ms, self.NOW_MS - 1_000 + 60_000
+        )
+
+    async def test_card_delivered_after_the_window_is_skipped(self) -> None:
+        engine = self.engine(max_delivery_lag_ms=0)
+        signal_ts = self.NOW_MS - 1_000
+        decision = await engine.on_signal(
+            self.make_signal(received_ts_ms=signal_ts + 60_500)
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["entry_window_passed"])
+        self.assertNotIn(MINT, engine.pending)
+
+    async def test_missed_eligible_print_is_skipped(self) -> None:
+        engine = self.engine()
+        signal_ts = self.NOW_MS - 1_000
+        engine.history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=signal_ts + 6_000,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+                token_amount=100.0,
+                quote_amount=2.0,
+            )
+        )
+        decision = await engine.on_signal(
+            self.make_signal(received_ts_ms=signal_ts + 20_000)
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["entry_missed_eligible_print"])
+        self.assertNotIn(MINT, engine.pending)
+
+    async def test_missed_dust_print_does_not_count_as_the_entry(self) -> None:
+        engine = self.engine(min_entry_quote_sol=0.01)
+        signal_ts = self.NOW_MS - 30_000
+        engine.history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=signal_ts + 6_000,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+                token_amount=0.005,
+                quote_amount=0.0001,
+                quote_mint="So11111111111111111111111111111111111111112",
+            )
+        )
+        decision = await engine.on_signal(
+            self.make_signal(
+                signal_ts_ms=signal_ts, received_ts_ms=self.NOW_MS - 5_000
+            )
+        )
+        self.assertTrue(decision.allowed)
+        self.assertIn(MINT, engine.pending)
+
+    async def test_dust_buy_print_is_not_an_entry_trigger(self) -> None:
+        engine = self.engine(min_entry_quote_sol=0.01)
+        decision = await engine.on_signal(
+            self.make_signal(signal_ts_ms=self.NOW_MS - 10_000)
+        )
+        self.assertTrue(decision.allowed)
+        pending = engine.pending[MINT]
+        await engine.on_trade(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=self.NOW_MS,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+                token_amount=0.005,
+                quote_amount=0.0001,
+                quote_mint="So11111111111111111111111111111111111111112",
+            )
+        )
+        self.assertEqual(pending.dust_prints, 1)
+        self.assertNotIn(MINT, engine.positions)
+        self.assertIn(MINT, engine.pending)
+        await engine.tick(now_ms=self.NOW_MS + 60_000)
+        self.assertNotIn(MINT, engine.pending)
+        self.assertEqual(engine.skips[-1].reason, "entry_dust_prints_only")
+        self.assertIn("dust_prints=1", engine.skips[-1].detail or "")
+
+    async def test_unverified_notional_is_not_an_entry_trigger(self) -> None:
+        engine = self.engine(min_entry_quote_sol=0.01)
+        await engine.on_signal(
+            self.make_signal(signal_ts_ms=self.NOW_MS - 10_000)
+        )
+        pending = engine.pending[MINT]
+        await engine.on_trade(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=self.NOW_MS,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+            )
+        )
+        self.assertEqual(pending.unverified_prints, 1)
+        self.assertIn(MINT, engine.pending)
+        self.assertNotIn(MINT, engine.positions)
+        await engine.tick(now_ms=self.NOW_MS + 60_000)
+        self.assertEqual(
+            engine.skips[-1].reason, "entry_unverified_quote_notional"
+        )
+
+    async def test_timer_mode_rejects_a_stale_reference_price(self) -> None:
+        engine = self.engine(
+            entry_mode="timer", max_reference_age_ms=10_000
+        )
+        pending = PendingEntry(
+            signal=self.make_signal(),
+            eligible_at_ms=self.NOW_MS - 1_000,
+            expires_at_ms=self.NOW_MS + 60_000,
+        )
+        engine.pending[MINT] = pending
+        engine.history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=self.NOW_MS - 60_000,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+                token_amount=100.0,
+                quote_amount=2.0,
+            )
+        )
+        await engine._timer_entry(pending)
+        self.assertNotIn(MINT, engine.pending)
+        self.assertEqual(engine.skips[-1].reason, "stale_reference_price")
+
+    def test_daily_pnl_is_restored_from_persisted_trades(self) -> None:
+        from datetime import UTC, datetime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperStore(Path(tmp))
+            day = datetime.fromtimestamp(self.NOW_MS / 1000, UTC).date().isoformat()
+            store.record_trade_payload(
+                {
+                    "exit_ts_ms": self.NOW_MS - 1_000,
+                    "pnl_sol": -0.25,
+                }
+            )
+            engine = self.engine(store=store)
+        self.assertAlmostEqual(engine._daily_pnl[day], -0.25)
+
+    def test_stale_mark_is_excluded_from_nav(self) -> None:
+        engine = self.engine(max_mark_age_ms=10_000)
+        wallet = engine.broker.wallet
+        assert wallet is not None
+        wallet.reserve_entry(MINT, 10.0, 0.1, 0.0)
+        engine.history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=self.NOW_MS - 60_000,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+                token_amount=100.0,
+                quote_amount=2.0,
+            )
+        )
+        snapshot = engine.wallet_snapshot()
+        assert snapshot is not None
+        # The stale mark is not current NAV: equity is cash only, while the
+        # optimistic view keeps the last known price.
+        self.assertAlmostEqual(snapshot["equity_sol"], 9.9)
+        self.assertAlmostEqual(snapshot["equity_all_marks_sol"], 10.1)
+        self.assertEqual(snapshot["stale_mark_count"], 1)
 
     async def test_concurrency_cap_counts_pending_entries(self) -> None:
         engine = self.engine(max_concurrent_positions=1)

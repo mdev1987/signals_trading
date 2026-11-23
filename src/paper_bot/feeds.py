@@ -82,6 +82,8 @@ def parse_pump_event(raw: str | bytes, event_index: int) -> TradeEvent | None:
         price_sol=price_sol,
         token_amount=_to_float(data.get("tokenAmount")),
         quote_amount=_to_float(data.get("quoteAmount")),
+        quote_mint=data.get("quoteMint") or data.get("quote_mint"),
+        quote_price_sol=_to_float(data.get("quotePriceSol")),
         tx_signer=(
             data.get("txSigner") or data.get("traderPublicKey") or data.get("user")
         ),

@@ -92,6 +92,13 @@ class PaperStore:
                     if position.entry_quote
                     else None
                 ),
+                "reference_price_sol": position.reference_price_sol,
+                "reference_ts_ms": position.reference_ts_ms,
+                "reference_age_ms": position.reference_age_ms,
+                "reference_source": position.reference_source,
+                "entry_reference_deviation_pct": (
+                    position.entry_reference_deviation_pct
+                ),
             },
         )
 
@@ -116,6 +123,43 @@ class PaperStore:
 
     def record_skip(self, skip: SkipRecord) -> None:
         self._append(self.skips_path, skip.to_dict())
+
+    def realized_pnl_by_day(self) -> dict[str, float]:
+        """Sum realized PnL per UTC day from the append-only trades file.
+
+        The engine keeps the same accumulator in memory for the optional daily
+        loss cap, but a restart would otherwise reset today's breaker. Reading
+        the file back is cheap (one row per closed trade) and keeps the file the
+        single source of truth.
+        """
+        totals: dict[str, float] = {}
+        if not self.trades_path.exists():
+            return totals
+        with self.trades_path.open("rb") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = orjson.loads(line)
+                except orjson.JSONDecodeError:
+                    # A torn final line after a crash is not a reason to drop
+                    # the whole day's history.
+                    continue
+                exit_ts = payload.get("exit_ts_ms")
+                pnl = payload.get("pnl_sol")
+                if exit_ts is None or pnl is None:
+                    continue
+                try:
+                    day = (
+                        datetime.fromtimestamp(int(exit_ts) / 1000, UTC)
+                        .date()
+                        .isoformat()
+                    )
+                    totals[day] = totals.get(day, 0.0) + float(pnl)
+                except (TypeError, ValueError, OverflowError, OSError):
+                    continue
+        return totals
 
     def finalize(self, *, extra: dict[str, Any] | None = None) -> Path | None:
         trades = self._trades
@@ -196,6 +240,27 @@ def summarize(run_dir: Path) -> dict[str, Any]:
     # ``write_offs`` (no_route / unsold), because a drained pool can still
     # return a tiny non-zero quote and fill instead of erroring.
     catastrophic = [value for value in returns if value <= -0.9]
+    # Non-overlapping loss buckets, reported next to the frozen catastrophic
+    # gate so an 89 % loss is visible instead of silently "normal".
+    severe = [value for value in returns if -0.75 < value <= -0.5]
+    extreme = [value for value in returns if -0.9 < value <= -0.75]
+    total_loss = [value for value in returns if value <= -0.995]
+    reference_ages = [
+        int(row["reference_age_ms"])
+        for row in trades
+        if row.get("reference_age_ms") is not None
+    ]
+    reference_deviations = [
+        abs(float(row["entry_reference_deviation_pct"]))
+        for row in trades
+        if row.get("entry_reference_deviation_pct") is not None
+    ]
+    reference_source_counts: dict[str, int] = {}
+    for row in trades:
+        source = str(row.get("reference_source") or "unknown")
+        reference_source_counts[source] = (
+            reference_source_counts.get(source, 0) + 1
+        )
     write_off_rows = [
         row
         for row in trades
@@ -248,6 +313,19 @@ def summarize(run_dir: Path) -> dict[str, Any]:
         "catastrophic_exit_rate": (
             len(catastrophic) / len(trades) if trades else None
         ),
+        "severe_loss_exits": len(severe),
+        "extreme_loss_exits": len(extreme),
+        "total_loss_exits": len(total_loss),
+        "reference_age_p50_ms": _percentile(reference_ages, 0.5),
+        "reference_age_p90_ms": _percentile(reference_ages, 0.9),
+        "reference_age_max_ms": max(reference_ages) if reference_ages else None,
+        "reference_deviation_p90_pct": _percentile(
+            reference_deviations, 0.9
+        ),
+        "entries_without_reference_price": sum(
+            1 for row in trades if row.get("reference_price_sol") is None
+        ),
+        "reference_source_counts": reference_source_counts,
         "write_offs": len(write_off_rows),
         "write_off_rate": (
             len(write_off_rows) / len(trades) if trades else None

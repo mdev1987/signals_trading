@@ -226,6 +226,7 @@ class EndOfDayFallbackTests(unittest.TestCase):
                         "priceSol": 1.0,
                         "timestamp": ALERT_TS + 1_000,
                         "quoteAmount": 1.0,
+                        "tokenAmount": 1.0,
                         "action": "buy",
                     },
                     {
@@ -233,6 +234,7 @@ class EndOfDayFallbackTests(unittest.TestCase):
                         "priceSol": 2.0,
                         "timestamp": ALERT_TS + 2_000,
                         "quoteAmount": 1.0,
+                        "tokenAmount": 0.5,
                         "action": "sell",
                     },
                 ],

@@ -157,6 +157,30 @@ def table(rows: list[dict]) -> pd.DataFrame:
     return frame
 
 
+def deployed_scanner_rule(frame: pd.DataFrame) -> pd.DataFrame:
+    """Filter to the deployed lane: AVE, first card, Pumpfunamm, 20-100k.
+
+    ``alert_outcomes.py`` prices every alert; the strategy itself trades only
+    the first card per mint and only inside the band. Keeping this in the
+    comparison tool makes the headline table reproducible with one flag.
+    """
+    if frame.empty:
+        return frame
+    block = frame[frame["channel"] == "@AveSolanaTokenScanner"].copy()
+    if block.empty:
+        return block
+    block = block.sort_values(["mint", "alert_ts_ms"]).drop_duplicates(
+        "mint", keep="first"
+    )
+    dex = block["dex"].astype(str).str.strip().str.lower()
+    liquidity = pd.to_numeric(block["liquidity_usd"], errors="coerce")
+    return block[
+        (dex == "pumpfunamm")
+        & (liquidity >= 20_000)
+        & (liquidity < 100_000)
+    ].copy()
+
+
 def channel_table(frame: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for channel, block in frame.groupby("channel"):
@@ -463,6 +487,14 @@ def main(argv: list[str] | None = None) -> int:
         default=2_000,
         help="Drop last-before fills whose print is older than this; 0 disables.",
     )
+    parser.add_argument(
+        "--scanner-rule",
+        action="store_true",
+        help=(
+            "Keep only the deployed lane: first @AveSolanaTokenScanner card "
+            "per mint, dex == Pumpfunamm, 20,000 <= liquidity_usd < 100,000."
+        ),
+    )
     args = parser.parse_args(argv)
 
     days = available(args.days, args.tag)
@@ -476,14 +508,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     if frame.empty:
         raise SystemExit("No priced alerts found; run alert_outcomes.py first.")
-    if "@AveSignalMonitor" not in set(frame["channel"]):
+    if args.scanner_rule:
+        frame = deployed_scanner_rule(frame)
+        if frame.empty:
+            raise SystemExit("No alerts match the deployed scanner rule.")
+    if not args.scanner_rule and "@AveSignalMonitor" not in set(frame["channel"]):
         ave = load_ave(days, args.horizon)
         if not ave.empty:
             frame = pd.concat([frame, ave], ignore_index=True)
 
     channels = channel_table(frame)
-    overlap = overlap_table(frame)
-    pairs = channel_pairs(frame)
+    if args.scanner_rule:
+        # One lane by construction: overlap and pair tables need two channels.
+        overlap = pd.DataFrame(columns=["mint", "channels"])
+        pairs = pd.DataFrame(columns=["pair", "mints"])
+    else:
+        overlap = overlap_table(frame)
+        pairs = channel_pairs(frame)
     features = [
         "liquidity_usd",
         "mcap_usd",

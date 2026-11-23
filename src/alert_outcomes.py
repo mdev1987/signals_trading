@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from paper_bot.models import canonical_quote_notional_sol
 
 REPLAY_ROOT = Path("/mnt/HDD/PumpAPI_Replay_Zst")
 CHANNEL_ROOT = Path("output/backtest/signals_channels")
@@ -49,7 +50,20 @@ MINT_BYTES_RE = re.compile(rb'"mint":"([^"]{20,64})"')
 PRICE_BYTES_RE = re.compile(rb'"priceSol":([0-9eE.+-]+)')
 TIMESTAMP_BYTES_RE = re.compile(rb'"timestamp":(\d{10,16})')
 QUOTE_BYTES_RE = re.compile(rb'"quoteAmount":([0-9eE.+-]+)')
+QUOTE_MINT_BYTES_RE = re.compile(rb'"quoteMint":"([^"]+)"')
+QUOTE_PRICE_BYTES_RE = re.compile(rb'"quotePriceSol":([0-9eE.+-]+)')
+TOKEN_BYTES_RE = re.compile(rb'"tokenAmount":([0-9eE.+-]+)')
 ACTION_BYTES_RE = re.compile(rb'"action":"([a-z]+)"')
+
+
+def _float_match(pattern: re.Pattern[bytes], line: bytes) -> float | None:
+    match = pattern.search(line)
+    if match is None:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 def iter_target_trades(
@@ -69,6 +83,11 @@ def iter_target_trades(
     occasionally produce impossible prices (1e-13 followed by 1e-4). On a pool
     with hundreds of SOL of liquidity those prints are not the executable mid,
     so a small floor removes the feed errors without removing real trades.
+
+    The floor is applied to the *canonical SOL notional*
+    (:func:`paper_bot.models.canonical_quote_notional_sol`), not the raw
+    ``quoteAmount``. A USDC-quoted print's raw amount is in dollars, so the old
+    filter dropped several-dollar trades and kept sub-cent ones.
     """
     import io
 
@@ -83,8 +102,8 @@ def iter_target_trades(
             mint_match = MINT_BYTES_RE.search(line)
             if mint_match is None or mint_match.group(1) not in targets:
                 continue
-            price_match = PRICE_BYTES_RE.search(line)
-            if price_match is None:
+            price = _float_match(PRICE_BYTES_RE, line)
+            if price is None or price <= 0:
                 continue
             stamp_match = TIMESTAMP_BYTES_RE.search(line)
             if stamp_match is None:
@@ -94,20 +113,21 @@ def iter_target_trades(
             if action != "any" and side != action:
                 continue
             if min_quote_sol > 0:
-                quote_match = QUOTE_BYTES_RE.search(line)
-                if quote_match is None:
+                quote_mint_match = QUOTE_MINT_BYTES_RE.search(line)
+                quote_mint = (
+                    quote_mint_match.group(1).decode()
+                    if quote_mint_match
+                    else None
+                )
+                notional_sol = canonical_quote_notional_sol(
+                    quote_amount=_float_match(QUOTE_BYTES_RE, line),
+                    quote_mint=quote_mint,
+                    quote_price_sol=_float_match(QUOTE_PRICE_BYTES_RE, line),
+                    token_amount=_float_match(TOKEN_BYTES_RE, line),
+                    price_sol=price,
+                )
+                if notional_sol is None or notional_sol < min_quote_sol:
                     continue
-                try:
-                    if float(quote_match.group(1)) < min_quote_sol:
-                        continue
-                except ValueError:
-                    continue
-            try:
-                price = float(price_match.group(1))
-            except ValueError:
-                continue
-            if price <= 0:
-                continue
             yield (
                 mint_match.group(1).decode(),
                 int(stamp_match.group(1)),
@@ -369,9 +389,11 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.01,
         help=(
-            "Ignore trades whose quoteAmount is below this many SOL. The "
+            "Ignore trades whose canonical SOL notional (quoteAmount x "
+            "quotePriceSol, or tokenAmount x priceSol) is below this. The "
             "default 0.01 drops sub-cent dust prints whose priceSol is an "
-            "impossible feed artifact rather than an executable price."
+            "impossible feed artifact rather than an executable price. The "
+            "live engine applies the same floor in --min-entry-quote-sol."
         ),
     )
     parser.add_argument(

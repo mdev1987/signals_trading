@@ -103,7 +103,7 @@ class SafetyConfig:
 @dataclass(slots=True)
 class EngineConfig:
     entry_delay_ms: int = 5_000
-    max_entry_delay_ms: int = 120_000
+    max_entry_delay_ms: int = 60_000
     # Skip a signal Telegram delivered more than this long after the channel
     # posted it. The research convention prices the first BUY at card + 5 s and
     # gives up at card + 60 s; a card that arrives minutes late would otherwise
@@ -116,6 +116,16 @@ class EngineConfig:
     # Optional daily loss circuit breaker, in SOL of realized PnL (UTC day).
     # 0 disables it. It is a risk control, not part of the backtested edge.
     max_daily_loss_sol: float = 0.0
+    # Reject a BUY print below this canonical SOL notional as an entry trigger.
+    # This is the same floor ``alert_outcomes.py --min-quote-sol`` applies, so a
+    # dust print cannot trigger a live entry the replay would have skipped.
+    min_entry_quote_sol: float = 0.01
+    # Timer mode quotes at a time, not on a print. Reject a reference price
+    # older than this (0 disables) instead of entering on a dead mark.
+    max_reference_age_ms: int = 30_000
+    # A mark older than this is excluded from NAV (0 disables); the conservative
+    # equity reports cash plus fresh marks only.
+    max_mark_age_ms: int = 120_000
     # "trade": wait for the first BUY print at/after the delay (historical
     # behaviour). "timer": quote at the delay regardless of prints, which is
     # what the research backtest assumes (entry at signal + ~5 s).
@@ -155,6 +165,12 @@ class EngineConfig:
             raise ValueError("max_concurrent_positions must be non-negative")
         if self.max_daily_loss_sol < 0:
             raise ValueError("max_daily_loss_sol must be non-negative")
+        if self.min_entry_quote_sol < 0:
+            raise ValueError("min_entry_quote_sol must be non-negative")
+        if self.max_reference_age_ms < 0:
+            raise ValueError("max_reference_age_ms must be non-negative")
+        if self.max_mark_age_ms < 0:
+            raise ValueError("max_mark_age_ms must be non-negative")
 
 
 def entry_backoff_active(
@@ -216,7 +232,20 @@ class PaperEngine:
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         # Realized PnL by UTC day, used only by the optional daily loss cap.
+        # Restored from the append-only trades file so a process restart does
+        # not reset today's breaker.
         self._daily_pnl: dict[str, float] = {}
+        loader = getattr(self.store, "realized_pnl_by_day", None)
+        if callable(loader):
+            try:
+                restored = loader()
+            except Exception:  # noqa: BLE001 - a corrupt tail must not stop the bot
+                LOGGER.exception("could not restore daily PnL from the store")
+            else:
+                if isinstance(restored, dict):
+                    self._daily_pnl = {
+                        str(key): float(value) for key, value in restored.items()
+                    }
 
     # ------------------------------------------------------------------
     # Helpers
@@ -232,22 +261,67 @@ class PaperEngine:
         return lock
 
     def wallet_snapshot(self) -> dict[str, Any] | None:
-        """Snapshot cash plus any open token balance at its last feed price.
+        """Snapshot cash plus open token inventory, with mark freshness.
 
         ``PaperWallet.equity_sol`` treats an unmarked token as zero, so calling
-        ``snapshot()`` while a position is open used to report cash only and
-        understate equity by the open notional. The history already holds the
-        last print for every watched mint, so mark the balances here.
+        ``snapshot()`` while a position is open used to report cash only. The
+        history holds the last print for every watched mint, but a mark can be
+        minutes old on a dead pool; reporting it as current NAV overstates the
+        portfolio. The returned ``equity_sol`` is therefore cash plus *fresh*
+        marks only. ``equity_all_marks_sol`` is the optimistic view, and the
+        per-mint detail makes staleness auditable.
         """
         wallet = getattr(self.broker, "wallet", None)
         if wallet is None:
             return None
+        now_ms = self._now()
         marks: dict[str, float] = {}
-        for mint in list(wallet.token_balances):
-            price, _ts = self.history.last_price(mint)
+        details: dict[str, dict[str, Any]] = {}
+        fresh_value = 0.0
+        all_value = 0.0
+        stale = 0
+        unmarked = 0
+        for mint, size in list(wallet.token_balances.items()):
+            price, ts_ms = self.history.last_price(mint)
+            age_ms = None if ts_ms is None else max(0, now_ms - int(ts_ms))
+            fresh = (
+                price is not None
+                and price > 0
+                and (
+                    self.config.max_mark_age_ms <= 0
+                    or (age_ms is not None and age_ms <= self.config.max_mark_age_ms)
+                )
+            )
             if price is not None and price > 0:
                 marks[mint] = price
-        return wallet.snapshot(marks)
+                all_value += size * price
+                if fresh:
+                    fresh_value += size * price
+                else:
+                    stale += 1
+            else:
+                unmarked += 1
+            details[mint] = {
+                "size": size,
+                "price_sol": price,
+                "mark_ts_ms": ts_ms,
+                "mark_age_ms": age_ms,
+                "fresh": fresh,
+            }
+        snapshot = wallet.snapshot(marks)
+        snapshot.update(
+            {
+                "cash_sol": wallet.sol_balance,
+                "equity_sol": wallet.sol_balance + fresh_value,
+                "equity_all_marks_sol": wallet.sol_balance + all_value,
+                "marked_token_sol": fresh_value,
+                "stale_mark_count": stale,
+                "unmarked_token_count": unmarked,
+                "mark_details": details,
+                "max_mark_age_ms": self.config.max_mark_age_ms,
+            }
+        )
+        return snapshot
 
     @staticmethod
     def _day_key(ts_ms: int) -> str:
@@ -333,6 +407,31 @@ class PaperEngine:
             return
         task.cancel()
 
+    def _entry_expiry(
+        self, pending: PendingEntry, default_reason: str
+    ) -> tuple[str, str | None]:
+        """Classify why an unfilled entry window closed.
+
+        A window that saw only dust or unclassifiable BUY prints must say so in
+        ``skips.jsonl``; otherwise the operator cannot distinguish "the token
+        never traded" from "the feed delivered sub-cent noise".
+        """
+        reason = default_reason
+        detail = quote_detail(pending.last_reason, pending.last_detail)
+        if pending.last_reason is not None:
+            reason = "entry_quote_failed"
+        elif pending.dust_prints and not pending.saw_buy:
+            reason = "entry_dust_prints_only"
+        elif pending.unverified_prints and not pending.saw_buy:
+            reason = "entry_unverified_quote_notional"
+        if pending.dust_prints or pending.unverified_prints:
+            counts = (
+                f"dust_prints={pending.dust_prints};"
+                f"unverified_prints={pending.unverified_prints}"
+            )
+            detail = f"{counts};{detail}" if detail else counts
+        return reason, detail
+
     def _skip_pending(
         self, pending: PendingEntry, reason: str, detail: str | None
     ) -> None:
@@ -394,6 +493,15 @@ class PaperEngine:
             rejection_detail = "missing_token_address"
 
         if rejection_reason is None:
+            # Both entry modes anchor on the card timestamp, exactly like the
+            # research convention (eligible at card + 5 s, expires at
+            # card + 60 s). Using ``max(signal, received)`` shifted the whole
+            # window forward by the Telegram lag, which made the live fill a
+            # different trade from the one the backtest measured.
+            base_ts = signal.signal_ts_ms
+            eligible_at_ms = base_ts + self.config.entry_delay_ms
+            expires_at_ms = base_ts + self.config.max_entry_delay_ms
+            received_ms = signal.received_ts_ms
             if mint in self.positions:
                 final = GateDecision(
                     allowed=False,
@@ -412,16 +520,14 @@ class PaperEngine:
                 rejection_reason = "duplicate_pending_signal"
             elif (
                 self.config.max_delivery_lag_ms > 0
-                and signal.received_ts_ms > 0
-                and signal.received_ts_ms - signal.signal_ts_ms
+                and received_ms > 0
+                and received_ms - signal.signal_ts_ms
                 > self.config.max_delivery_lag_ms
             ):
                 # The card itself is stale. Both entry modes anchor on the
-                # card (trade mode directly, timer mode at receipt + delay),
-                # so acting now would price a fill the research convention
-                # never measured. Applies to timer mode too: the deployed
-                # lane must not trade a card delivered minutes late.
-                lag_ms = signal.received_ts_ms - signal.signal_ts_ms
+                # card, so acting now would price a fill the research
+                # convention never measured.
+                lag_ms = received_ms - signal.signal_ts_ms
                 final = GateDecision(
                     allowed=False,
                     rule=decision.rule,
@@ -432,6 +538,49 @@ class PaperEngine:
                 rejection_detail = (
                     f"delivery_lag_ms={lag_ms};"
                     f"max={self.config.max_delivery_lag_ms}"
+                )
+            elif received_ms > 0 and received_ms >= expires_at_ms:
+                # Telegram delivered the card after the research entry window
+                # had already closed. Never open a fresh window in the present.
+                final = GateDecision(
+                    allowed=False,
+                    rule=decision.rule,
+                    reasons=["entry_window_passed"],
+                    features=decision.features,
+                )
+                rejection_reason = "entry_window_passed"
+                rejection_detail = (
+                    f"received_ts_ms={received_ms};"
+                    f"expires_at_ms={expires_at_ms}"
+                )
+            elif (
+                self.config.entry_mode == "trade"
+                and received_ms > eligible_at_ms
+                and (
+                    missed_ts := self.history.first_buy_between(
+                        mint,
+                        eligible_at_ms,
+                        min(received_ms, expires_at_ms),
+                        min_notional_sol=self.config.min_entry_quote_sol,
+                    )
+                )
+                is not None
+            ):
+                # The first BUY print at/after card + 5 s already happened
+                # before Telegram delivered the card. The research entry is
+                # that print, not a later one, and the bot cannot buy in the
+                # past, so the signal is not tradable under this convention.
+                final = GateDecision(
+                    allowed=False,
+                    rule=decision.rule,
+                    reasons=["entry_missed_eligible_print"],
+                    features=decision.features,
+                )
+                rejection_reason = "entry_missed_eligible_print"
+                rejection_detail = (
+                    f"first_print_ts_ms={missed_ts};"
+                    f"eligible_at_ms={eligible_at_ms};"
+                    f"received_ts_ms={received_ms}"
                 )
             elif (
                 self.config.max_concurrent_positions > 0
@@ -484,18 +633,10 @@ class PaperEngine:
                 message_id=signal.message_id,
             )
         else:
-            # Timer mode reproduces the research entry, which is anchored on
-            # the *signal* timestamp (~5 s after the message). Trade mode keeps
-            # the historical anchor: the later of signal and receipt, so it
-            # never acts on a signal that was already stale when it arrived.
-            if self.config.live and self.config.entry_mode != "timer":
-                base_ts = max(signal.signal_ts_ms, signal.received_ts_ms)
-            else:
-                base_ts = signal.signal_ts_ms
             self.pending[mint] = PendingEntry(
                 signal=signal,
-                eligible_at_ms=base_ts + self.config.entry_delay_ms,
-                expires_at_ms=base_ts + self.config.max_entry_delay_ms,
+                eligible_at_ms=eligible_at_ms,
+                expires_at_ms=expires_at_ms,
             )
             self.history.pin(mint)
             if self.on_watch is not None:
@@ -544,6 +685,22 @@ class PaperEngine:
             if event.timestamp_ms > pending.expires_at_ms:
                 self._skip_pending(pending, "entry_delay_exceeded", None)
                 return
+            if self.config.min_entry_quote_sol > 0:
+                # Mirror ``alert_outcomes.py --min-quote-sol`` exactly. The
+                # replay drops a sub-cent dust print whose priceSol is a feed
+                # artifact; if the live engine accepted it, the recorded entry
+                # would not be the trade the 97.2 % backtest measured. The
+                # notional is canonical (quote-mint aware), not raw
+                # quoteAmount, so USDC-quoted prints are compared as SOL.
+                notional_sol = event.quote_notional_sol
+                if notional_sol is None:
+                    # Cannot classify — not a usable trigger, but keep the
+                    # window open for a print whose notional is known.
+                    pending.unverified_prints += 1
+                    return
+                if notional_sol < self.config.min_entry_quote_sol:
+                    pending.dust_prints += 1
+                    return
             if entry_backoff_active(
                 pending,
                 event_ts_ms=event.timestamp_ms,
@@ -551,6 +708,10 @@ class PaperEngine:
             ):
                 return
             pending.saw_buy = True
+            pending.reference_price_sol = float(event.price_sol)
+            pending.reference_ts_ms = event.timestamp_ms
+            pending.reference_age_ms = 0
+            pending.reference_source = "trade"
             await self._trigger_entry(
                 pending,
                 trigger_ts_ms=event.timestamp_ms,
@@ -610,13 +771,24 @@ class PaperEngine:
                 if self.pending.get(pending.mint) is pending:
                     self._skip_pending(pending, "entry_delay_exceeded", None)
             return
-        price_sol, _ts_ms, decimals = self.history.last_trade(pending.mint)
+        price_sol, reference_ts_ms, decimals = self.history.last_trade(
+            pending.mint
+        )
+        reference_source = "history"
         if price_sol is None or price_sol <= 0:
             fallback = pending.signal.features.get("hist_last_price_sol")
+            fallback_ts = pending.signal.features.get("hist_last_ts_ms")
             try:
                 price_sol = float(fallback) if fallback is not None else None
             except (TypeError, ValueError):
                 price_sol = None
+            try:
+                reference_ts_ms = (
+                    int(fallback_ts) if fallback_ts is not None else None
+                )
+            except (TypeError, ValueError):
+                reference_ts_ms = None
+            reference_source = "signal_meta"
         if price_sol is None or price_sol <= 0:
             async with self._lock(pending.mint):
                 if self.pending.get(pending.mint) is pending:
@@ -624,6 +796,45 @@ class PaperEngine:
                         pending, "entry_no_reference_price", None
                     )
             return
+        reference_age_ms = (
+            None
+            if reference_ts_ms is None
+            else max(0, trigger_ts_ms - int(reference_ts_ms))
+        )
+        if self.config.max_reference_age_ms > 0 and reference_age_ms is None:
+            # A price without a timestamp cannot be proven current. Treat the
+            # unknown age as stale rather than as valid.
+            async with self._lock(pending.mint):
+                if self.pending.get(pending.mint) is pending:
+                    self._skip_pending(
+                        pending,
+                        "entry_reference_age_unknown",
+                        f"source={reference_source};"
+                        f"max={self.config.max_reference_age_ms}",
+                    )
+            return
+        if (
+            self.config.max_reference_age_ms > 0
+            and reference_age_ms is not None
+            and reference_age_ms > self.config.max_reference_age_ms
+        ):
+            # A dead pool still carries its last price in history. Quoting a
+            # 5-minute-old mark at the research delay is not the trade the
+            # replay measured, so refuse it.
+            async with self._lock(pending.mint):
+                if self.pending.get(pending.mint) is pending:
+                    self._skip_pending(
+                        pending,
+                        "stale_reference_price",
+                        f"reference_age_ms={reference_age_ms};"
+                        f"source={reference_source};"
+                        f"max={self.config.max_reference_age_ms}",
+                    )
+            return
+        pending.reference_price_sol = float(price_sol)
+        pending.reference_ts_ms = reference_ts_ms
+        pending.reference_age_ms = reference_age_ms
+        pending.reference_source = reference_source
         await self._trigger_entry(
             pending,
             trigger_ts_ms=trigger_ts_ms,
@@ -816,6 +1027,20 @@ class PaperEngine:
                         decimals=decimals,
                         entry_quote=quote,
                         entry_trigger_ts_ms=trigger_ts_ms,
+                        reference_price_sol=pending.reference_price_sol,
+                        reference_ts_ms=pending.reference_ts_ms,
+                        reference_age_ms=pending.reference_age_ms,
+                        reference_source=pending.reference_source,
+                        entry_reference_deviation_pct=(
+                            (
+                                (entry.entry_price_sol - pending.reference_price_sol)
+                                / pending.reference_price_sol
+                                * 100.0
+                            )
+                            if pending.reference_price_sol
+                            and pending.reference_price_sol > 0
+                            else None
+                        ),
                     )
                     self.positions[pending.mint] = position
                     if self.store is not None:
@@ -1208,6 +1433,13 @@ class PaperEngine:
                 0,
                 position.signal.received_ts_ms - position.signal.signal_ts_ms,
             ),
+            reference_price_sol=position.reference_price_sol,
+            reference_ts_ms=position.reference_ts_ms,
+            reference_age_ms=position.reference_age_ms,
+            reference_source=position.reference_source,
+            entry_reference_deviation_pct=(
+                position.entry_reference_deviation_pct
+            ),
         )
         self.closed.append(trade)
         day = self._day_key(trade.exit_ts_ms)
@@ -1235,16 +1467,10 @@ class PaperEngine:
             if pending.in_flight:
                 continue
             if now > pending.expires_at_ms:
-                reason = (
-                    "entry_quote_failed"
-                    if pending.saw_buy and pending.last_reason
-                    else "no_buy_trade_after_signal"
+                reason, detail = self._entry_expiry(
+                    pending, "no_buy_trade_after_signal"
                 )
-                self._skip_pending(
-                    pending,
-                    reason,
-                    quote_detail(pending.last_reason, pending.last_detail),
-                )
+                self._skip_pending(pending, reason, detail)
 
         for position in list(self.positions.values()):
             if position.exit_requested:
@@ -1294,17 +1520,13 @@ class PaperEngine:
         timeout_ms: int | None = None,
     ) -> None:
         for pending in list(self.pending.values()):
-            if pending.last_reason is not None:
-                reason = "entry_quote_failed"
-            elif self.config.entry_mode == "timer":
-                reason = "entry_timer_no_fill"
-            else:
-                reason = "no_buy_trade_after_signal"
-            self._skip_pending(
+            reason, detail = self._entry_expiry(
                 pending,
-                reason,
-                quote_detail(pending.last_reason, pending.last_detail),
+                "entry_timer_no_fill"
+                if self.config.entry_mode == "timer"
+                else "no_buy_trade_after_signal",
             )
+            self._skip_pending(pending, reason, detail)
 
         for position in list(self.positions.values()):
             if position.exit_requested:

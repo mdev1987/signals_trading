@@ -54,6 +54,9 @@ PYTHONPATH=src .venv/bin/python -m paper_bot live \
   --max-entry-delay-ms 60000 \
   --max-delivery-lag-ms 60000 \
   --max-concurrent-positions 10 \
+  --min-entry-quote-sol 0.01 \
+  --max-reference-age-ms 30000 \
+  --max-mark-age-ms 120000 \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --slippage-bps 50 \
@@ -154,10 +157,22 @@ What to watch in the first days:
 - `Jupiter ... needed N bps` warnings show how often the widening ladder rescued a trade.
 - `delivery_lag_exceeded` and `max_concurrent_positions` skips mean the bot
   refused a signal the backtest would have taken; keep them near zero.
-- `summary.json` now reports `catastrophic_exit_rate` (`return_pct <= -0.90`)
-  next to `write_off_rate`, plus entry-delay and delivery-lag percentiles.
+- `summary.json` reports `catastrophic_exit_rate` (`return_pct <= -0.90`)
+  next to `write_off_rate`, plus severe/extreme/total-loss buckets,
+  entry-delay, delivery-lag and reference-age percentiles.
   A near-zero `write_off_rate` with a high catastrophic rate is the drained-
   pool case: the token quoted a tiny amount instead of erroring.
+- Equity lines mark open tokens only when the mark is younger than
+  `--max-mark-age-ms`; `equity_all_marks_sol` and `mark_details` in the same
+  snapshot show the optimistic view and the age of each mark, so a dead pool
+  cannot inflate reported NAV.
+- `min_entry_quote_sol`, `entry_missed_eligible_print`,
+  `entry_window_passed` and `stale_reference_price` skips mean the live entry
+  convention refused a trade the backtest would not have taken under the same
+  `card + 5 s` rule. They are expected to be small; a growing count means the
+  feed or Telegram delivery, not the strategy, changed.
+- Evaluate the run with `src/forward_gates.py` (same frozen thresholds and
+  seeded cluster bootstrap) instead of eyeballing `summary.json`.
 - Compare the realized median and win rate with the deployed-convention
   backtest (first buy print at/after card + 5 s, exit +5 min): 97.2 % win,
   +22.0 % median over 1,818 trades. The exit is the fragile side: 16 % of the

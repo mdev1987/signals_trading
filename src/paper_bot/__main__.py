@@ -160,7 +160,7 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--entry-delay-ms", type=int, default=5_000)
-    parser.add_argument("--max-entry-delay-ms", type=int, default=120_000)
+    parser.add_argument("--max-entry-delay-ms", type=int, default=60_000)
     parser.add_argument(
         "--max-delivery-lag-ms",
         type=int,
@@ -195,6 +195,34 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
         help=(
             "Minimum gap between quote attempts for the same mint while "
             "waiting for its first routable BUY print."
+        ),
+    )
+    parser.add_argument(
+        "--min-entry-quote-sol",
+        type=float,
+        default=0.01,
+        help=(
+            "Reject a BUY print below this canonical SOL notional as an "
+            "entry trigger (0 disables). Mirrors alert_outcomes.py "
+            "--min-quote-sol so live entries match the backtest."
+        ),
+    )
+    parser.add_argument(
+        "--max-reference-age-ms",
+        type=int,
+        default=30_000,
+        help=(
+            "Timer mode only: refuse to quote from a reference price older "
+            "than this (0 disables)."
+        ),
+    )
+    parser.add_argument(
+        "--max-mark-age-ms",
+        type=int,
+        default=120_000,
+        help=(
+            "Exclude marks older than this from reported NAV (0 disables). "
+            "The optimistic view is still written as equity_all_marks_sol."
         ),
     )
     parser.add_argument("--safety-screen", action="store_true")
@@ -421,6 +449,9 @@ def main() -> int:
             max_concurrent_positions=args.max_concurrent_positions,
             max_daily_loss_sol=args.max_daily_loss_sol,
             entry_retry_backoff_ms=args.entry_retry_backoff_ms,
+            min_entry_quote_sol=args.min_entry_quote_sol,
+            max_reference_age_ms=args.max_reference_age_ms,
+            max_mark_age_ms=args.max_mark_age_ms,
             safety_screen=args.safety_screen,
             allow_candidate_address=args.allow_candidate_address,
             pumpapi_url=args.pumpapi_url,

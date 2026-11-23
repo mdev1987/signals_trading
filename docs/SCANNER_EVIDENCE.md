@@ -61,20 +61,71 @@ trade and timer entry modes. `compare_channels.py --fill-mode` filters on the
 `entry_fill_mode` column written by `alert_outcomes.py`, so rows priced with
 different conventions cannot be mixed.
 
+The live engine also anchors eligibility and expiry on the **card timestamp**
+(`signal_ts_ms`), never on receipt, so a slow Telegram delivery cannot shift
+the entry window:
+
+| event | research | live |
+| --- | --- | --- |
+| eligible | card + 5 s | card + 5 s |
+| expire | card + 60 s | card + 60 s |
+| card delivered after expiry | n/a | skipped (`entry_window_passed`) |
+| first eligible BUY already printed before delivery | n/a (fill is historical) | skipped (`entry_missed_eligible_print`) |
+| first eligible BUY is dust | skipped | skipped (`dust_prints`, `min_entry_quote_sol`) |
+
+`--min-entry-quote-sol` defaults to the same 0.01 SOL floor as the replay. The
+floor is applied to a canonical SOL notional
+(`quoteAmount × quotePriceSol`, or `tokenAmount × priceSol` when the quote
+metadata is missing), not to the raw `quoteAmount`: PumpAPI's `quoteAmount` is
+denominated in the quote mint, so a USDC-quoted print is worth ~0.0137 SOL per
+dollar. A print whose notional cannot be classified is counted
+(`unverified_prints`) and does not trigger an entry. Timer mode additionally
+refuses a reference mark older than `--max-reference-age-ms` (30 s) instead of
+quoting a dead pool.
+
+### Reproducing the gates
+
+`src/forward_gates.py` implements every gate with the frozen thresholds:
+
+```bash
+env PYTHONPATH=src .venv/bin/python src/forward_gates.py \
+  --run-dir output/paper/live_YYYYMMDD_HHMMSS --starting-sol 10
+```
+
+It reads `trades.jsonl`, `entries.jsonl`, `signals.jsonl` and `skips.jsonl`;
+exit code `2` means coverage is not met yet. The bootstrap is predeclared:
+
+- statistic: total realized PnL in SOL;
+- resampling unit: **mint (cluster)**, all trades of a mint move together;
+  alerts on the same launch are not independent;
+- 10,000 resamples, `numpy.random.default_rng(20261121)`;
+- lower bound: 5th percentile of resampled totals; gate floor
+  −0.05 × starting SOL;
+- the same seed and method must be used on every run. The 18.7 h snapshot's
+  −1.81 to +1.66 SOL interval was computed with this method; it is flat.
+
 Reproduce a day (≈4–5 min each, reads the replay archive):
 
 ```bash
 env PYTHONPATH=src .venv/bin/python src/alert_outcomes.py \
   --day 2026-11-20 --latency-ms 5000 --entry-fill-mode first-after \
   --entry-side buy --max-entry-age-ms 2000 --max-entry-delay-ms 60000 \
-  --min-quote-sol 0.01 --horizons 5 15 --tag fa5
+  --min-quote-sol 0.01 --horizons 5 15 --tag canon
 
 env PYTHONPATH=src .venv/bin/python src/compare_channels.py \
-  --tag fa5 --latency-ms 5000 --fill-mode first-after --horizon 5
+  --tag canon --latency-ms 5000 --fill-mode first-after --horizon 5 \
+  --scanner-rule
 ```
 
-Output lands in `output/backtest/signals_channels/<day>/alerts_priced_fa5.csv`
-and `output/backtest/channel_comparison_fa5/report.md` (both gitignored; the
+`--scanner-rule` applies the deployed lane exclusions (first AVE card per
+mint, `Pumpfunamm`, 20–100k) so the tool prints the 1,818-trade headline
+instead of every priced alert. The canonical notional filter changed **3 of
+2,225** scanner fills on 2026-11-20: the old raw `quoteAmount` check let through
+a few ~$0.30–0.46 USDT-quoted prints whose SOL value was ~0.006, below the
+0.01 floor. The four-day aggregate is unchanged.
+
+Output lands in `output/backtest/signals_channels/<day>/alerts_priced_canon.csv`
+and `output/backtest/channel_comparison_canon/report.md` (both gitignored; the
 commands above are the record). The aggregate below is committed as
 [`docs/scanner_evidence_summary.csv`](scanner_evidence_summary.csv) so the
 headline numbers can be checked without the replay archive.
@@ -240,10 +291,17 @@ Do not fund this lane until a forward paper run shows **all** of:
    A flat pool can fill a near-zero quote instead of erroring, so
    `exit_reason == "no_route"` alone understates the loss tail: the first
    forward run had **0** `no_route` exits and **17.6 %** catastrophic exits.
-5. **No systematic entry failure.** `entry_delay_exceeded` /
+5. **No systematic entry failure.** At least **80 %** of allowed signals must
+   fill (`entries.jsonl` / allowed `signals.jsonl`). `entry_delay_exceeded` /
    `entry_quote_failed` above ~10 % of in-band alerts means the bot is not
    taking the trades the backtest measured, regardless of the realized win
-   rate.
+   rate. `entry_dust_prints_only`, `entry_unverified_quote_notional`,
+   `entry_missed_eligible_print`, `entry_window_passed` and
+   `stale_reference_price` are fidelity skips (the live convention refused a
+   print the replay would not have used), not backtested trades.
+
+`src/forward_gates.py` evaluates gates 1–5 with these exact thresholds and
+exits `2` while coverage is short.
 
 If 2, 3 or 4 fails while 5 passes, the edge did not survive the move from
 replay to live and the lane should be retired, not retuned. Do not re-fit the

@@ -13,6 +13,43 @@ from typing import Any
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 
+def canonical_quote_notional_sol(
+    *,
+    quote_amount: float | None,
+    quote_mint: str | None,
+    quote_price_sol: float | None,
+    token_amount: float | None = None,
+    price_sol: float | None = None,
+) -> float | None:
+    """Return one PumpAPI trade's notional in SOL, or ``None`` if unknown.
+
+    ``quoteAmount`` is denominated in the trade's quote mint, not always SOL:
+    SOL-quoted events (the common case) scale 1:1, while USDC-quoted events
+    must be multiplied by ``quotePriceSol``. The replay research scripts used
+    the raw value as if it were SOL, so a 0.01 threshold dropped USDC prints
+    that were worth far more. This is the single canonical definition used by
+    both the live entry filter and ``alert_outcomes.py``.
+
+    When the quote-mint metadata is missing, fall back to the SOL mark
+    (``token_amount * price_sol``), which is what the research pipeline uses
+    for volume. Returning ``None`` means "cannot classify"; callers must not
+    silently treat that as passing or failing.
+    """
+    if quote_amount is not None and quote_amount > 0:
+        if quote_mint == WSOL_MINT:
+            return float(quote_amount)
+        if quote_price_sol is not None and quote_price_sol > 0:
+            return float(quote_amount) * float(quote_price_sol)
+    if (
+        token_amount is not None
+        and price_sol is not None
+        and token_amount > 0
+        and price_sol > 0
+    ):
+        return float(token_amount) * float(price_sol)
+    return None
+
+
 @dataclass(slots=True)
 class TradeEvent:
     """One normalized PumpAPI trade, in the same shape as ``market_replay``."""
@@ -24,6 +61,11 @@ class TradeEvent:
     price_sol: float | None = None
     token_amount: float | None = None
     quote_amount: float | None = None
+    # ``quoteAmount`` is in ``quote_mint`` units; ``quotePriceSol`` converts a
+    # non-SOL quote (e.g. USDC) into SOL. Both are needed for the canonical
+    # entry-size filter.
+    quote_mint: str | None = None
+    quote_price_sol: float | None = None
     tx_signer: str | None = None
     decimals: int | None = None
     signature: str | None = None
@@ -42,7 +84,8 @@ class TradeEvent:
         """Observed SOL notional, using ``token_amount * price_sol``.
 
         ``quote_amount`` is not consistently scaled in PumpAPI data, so the
-        research pipeline deliberately avoids it for volume.
+        research pipeline deliberately avoids it for volume. Use
+        :attr:`quote_notional_sol` when the quote-mint metadata is available.
         """
         if self.price_sol is None or self.token_amount is None:
             return 0.0
@@ -50,6 +93,16 @@ class TradeEvent:
         if not value > 0:
             return 0.0
         return value
+
+    @property
+    def quote_notional_sol(self) -> float | None:
+        return canonical_quote_notional_sol(
+            quote_amount=self.quote_amount,
+            quote_mint=self.quote_mint,
+            quote_price_sol=self.quote_price_sol,
+            token_amount=self.token_amount,
+            price_sol=self.price_sol,
+        )
 
     @property
     def price_valid(self) -> bool:
@@ -140,6 +193,15 @@ class PendingEntry:
     # skipped entry can be explained after the fact instead of only classified.
     last_detail: str | None = None
     trigger_ts_ms: int | None = None
+    # Entry-size / reference-price diagnostics. A dust BUY print is not a
+    # usable entry trigger; counting it lets the eventual skip say why the
+    # window closed without a fill instead of a generic "no buy".
+    dust_prints: int = 0
+    unverified_prints: int = 0
+    reference_price_sol: float | None = None
+    reference_ts_ms: int | None = None
+    reference_age_ms: int | None = None
+    reference_source: str | None = None
     # Set in timer mode so a skip/shutdown can cancel the pending quote task.
     timer_task: Any | None = None
 
@@ -175,6 +237,13 @@ class Position:
     last_quote_error: str | None = None
     entry_quote: FillQuote | None = None
     entry_trigger_ts_ms: int | None = None
+    # Reference price used for the entry decision (timer mode) and how stale
+    # it was; the deviation is the actual fill vs that reference.
+    reference_price_sol: float | None = None
+    reference_ts_ms: int | None = None
+    reference_age_ms: int | None = None
+    reference_source: str | None = None
+    entry_reference_deviation_pct: float | None = None
     # Partial-exit accumulator. ``size``/``entry_value_sol``/``entry_fee_sol``
     # above always describe what is still open.
     sold_size: float = 0.0
@@ -245,6 +314,12 @@ class ClosedTrade:
     # this separates "slow signal" from "slow engine".
     received_ts_ms: int = 0
     delivery_lag_ms: int = 0
+    # Reference price and mark freshness for the entry decision.
+    reference_price_sol: float | None = None
+    reference_ts_ms: int | None = None
+    reference_age_ms: int | None = None
+    reference_source: str | None = None
+    entry_reference_deviation_pct: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
