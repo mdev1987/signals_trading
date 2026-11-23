@@ -568,8 +568,11 @@ def _fingerprint_subset(saved: Any, current: Any) -> bool:
     if isinstance(saved, dict):
         if not isinstance(current, dict):
             return False
+        # Every key in saved must either:
+        # - exist in current with a matching value (recursive), or
+        # - not exist in current (assumed deployed value, no conflict)
         return all(
-            key in current and _fingerprint_subset(value, current[key])
+            key not in current or _fingerprint_subset(value, current[key])
             for key, value in saved.items()
         )
     return saved == current

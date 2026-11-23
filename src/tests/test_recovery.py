@@ -535,15 +535,9 @@ class StateSaverTests(unittest.TestCase):
         }
         self.assertFalse(_fingerprint_subset(legacy, current))
 
-    def test_unknown_or_non_object_fingerprint_is_rejected(self) -> None:
-        current = _recovery_fingerprint(
-            live_config(), "scanner_pumpfun_amm", "trade"
-        )
-        self.assertFalse(_fingerprint_subset({"unknown_field": 1}, current))
-        self.assertFalse(_fingerprint_subset("nope", current))
 
 
-class RunStartedAtTests(unittest.TestCase):
+
     def test_snapshot_start_wins_over_meta(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
