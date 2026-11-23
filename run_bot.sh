@@ -77,6 +77,9 @@ exec "$VENV" -m paper_bot live \
   --min-entry-quote-sol 0.01 \
   --max-reference-age-ms 30_000 \
   --max-mark-age-ms 120_000 \
+  --timer-late-tolerance-ms 1_000 \
+  --max-future-skew-ms 5_000 \
+  --risk-state-dir output/risk \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --starting-sol 10 \

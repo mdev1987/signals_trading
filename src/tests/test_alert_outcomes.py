@@ -19,7 +19,13 @@ SRC_DIR = Path(__file__).resolve().parents[1]
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from alert_outcomes import build_frame, main, select_entry, stream_day  # noqa: E402
+from alert_outcomes import (  # noqa: E402
+    build_frame,
+    iter_target_trades,
+    main,
+    select_entry,
+    stream_day,
+)
 
 ALERT_TS = 1_800_000_000_000
 LATENCY = 5_000
@@ -250,6 +256,109 @@ class EndOfDayFallbackTests(unittest.TestCase):
             )
             self.assertEqual(item["entry_px"], 1.0)
             self.assertEqual(item["entry_side"], "buy")
+
+
+class CompressedReplayParsingTests(unittest.TestCase):
+    """Exercise the zstd reader and the canonical notional gate together.
+
+    ``iter_target_trades`` parses the raw archive with regexes for speed. A
+    change to the canonical notional definition (or to the regex field names)
+    must not silently change which prints count as fills, so this test drives
+    the real compressed path rather than a dict fixture.
+    """
+
+    MINT = "TargetMint1111111111111111111111111111111111"
+    WSOL = "So11111111111111111111111111111111111111112"
+    USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+    def _write(self, root: Path, events: list[dict]) -> Path:
+        import zstandard
+
+        path = root / "0001.jsonl.zst"
+        payload = (
+            "\n".join(json.dumps(e, separators=(",", ":")) for e in events) + "\n"
+        ).encode()
+        path.write_bytes(zstandard.ZstdCompressor().compress(payload))
+        return path
+
+    def _event(self, **overrides: object) -> dict:
+        event = {
+            "mint": self.MINT,
+            "priceSol": 0.02,
+            "timestamp": ALERT_TS,
+            "action": "buy",
+            "tokenAmount": 100.0,
+            "quoteAmount": 2.0,
+            "quoteMint": self.WSOL,
+        }
+        event.update(overrides)
+        return event
+
+    def test_sol_quoted_event_is_read_from_the_compressed_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(Path(tmp), [self._event()])
+            found = list(iter_target_trades(path, {self.MINT.encode()}))
+        self.assertEqual(found, [(self.MINT, ALERT_TS, 0.02, "buy")])
+
+    def test_usdc_quote_below_one_dollar_is_dropped_after_conversion(self) -> None:
+        # 0.005 USDC at 0.01 SOL/USDC is 0.00005 SOL notional: dust.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp),
+                [
+                    self._event(
+                        quoteMint=self.USDC,
+                        quoteAmount=0.005,
+                        quotePriceSol=0.01,
+                    )
+                ],
+            )
+            found = list(iter_target_trades(path, {self.MINT.encode()}))
+        self.assertEqual(found, [])
+
+    def test_usdc_quote_worth_more_than_a_cent_is_kept(self) -> None:
+        # 5 USDC at 0.01 SOL/USDC is 0.05 SOL notional: a real trade. The raw
+        # quoteAmount alone would have looked like 5 "SOL" and passed anyway;
+        # the point is the conversion keeps it, not the raw number.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp),
+                [
+                    self._event(
+                        quoteMint=self.USDC,
+                        quoteAmount=5.0,
+                        quotePriceSol=0.01,
+                    )
+                ],
+            )
+            found = list(iter_target_trades(path, {self.MINT.encode()}))
+        self.assertEqual(len(found), 1)
+
+    def test_unclassifiable_notional_is_dropped(self) -> None:
+        # No usable quote metadata and no token fallback: cannot classify.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp),
+                [
+                    {
+                        "mint": self.MINT,
+                        "priceSol": 0.02,
+                        "timestamp": ALERT_TS,
+                        "action": "buy",
+                    }
+                ],
+            )
+            found = list(iter_target_trades(path, {self.MINT.encode()}))
+        self.assertEqual(found, [])
+
+    def test_other_mints_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp),
+                [self._event(mint="OtherMint222222222222222222222222222222222")],
+            )
+            found = list(iter_target_trades(path, {self.MINT.encode()}))
+        self.assertEqual(found, [])
 
 
 class ArgumentValidationTests(unittest.TestCase):

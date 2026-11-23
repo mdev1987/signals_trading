@@ -8,6 +8,7 @@ features, the live-execution guards, and the paper/live report wording.
 from __future__ import annotations
 
 import base64
+import json
 import sys
 import tempfile
 import unittest
@@ -28,8 +29,14 @@ from paper_bot.execution import (  # noqa: E402
     jupiter_error_reason,
     live_config_from_env,
 )
+from paper_bot.feeds import parse_pump_event  # noqa: E402
 from paper_bot.history import MarketHistory  # noqa: E402
-from paper_bot.models import PendingEntry, Signal, TradeEvent  # noqa: E402
+from paper_bot.models import (  # noqa: E402
+    PendingEntry,
+    Signal,
+    TradeEvent,
+    canonical_quote_notional_sol,
+)
 from paper_bot.notifier import (  # noqa: E402
     ReporterConfig,
     TelegramReporter,
@@ -161,6 +168,22 @@ class ScannerCardTests(unittest.TestCase):
         self.assertFalse(allowed(dex="Raydiumclmm", liquidity_usd=50_000.0))
         self.assertFalse(allowed(dex="Pumpfunamm", liquidity_usd=None))
 
+    def test_dex_match_ignores_case_and_padding_in_both_paths(self) -> None:
+        # The live card and the replay CSV go through the same normalizer, so
+        # "  pumpfunamm " must not mean a different venue than "Pumpfunamm".
+        from paper_bot.signals import normalize_dex
+
+        self.assertEqual(normalize_dex("  pumpfunamm "), normalize_dex("Pumpfunamm"))
+
+        def allowed(dex: object) -> bool:
+            candidate = signal({"dex": dex, "liquidity_usd": 50_000.0})
+            candidate.message_type = "scanner_pool_launch"
+            return evaluate_gate(candidate, GateConfig(rule=SCANNER_RULE)).allowed
+
+        self.assertTrue(allowed("Pumpfunamm"))
+        self.assertTrue(allowed("  pumpfunamm "))
+        self.assertFalse(allowed("pumpfun-amm"))
+
     def test_market_cap_and_symbol_are_mapped_for_the_gate(self) -> None:
         result = parse_signal_text(
             SCANNER_CARD,
@@ -194,6 +217,82 @@ class ScannerCardTests(unittest.TestCase):
         decision = evaluate_gate(result, GateConfig(rule=SCANNER_RULE))
         self.assertFalse(decision.allowed)
         self.assertIn("rule_liquidity_below_20000", decision.reasons)
+
+
+class PumpApiFeedParsingTests(unittest.TestCase):
+    """The live feed and the replay archive must agree on quote fields."""
+
+    MINT = "FeedMint111111111111111111111111111111111111"
+    WSOL = "So11111111111111111111111111111111111111112"
+    USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+    def test_sol_quoted_event_is_preserved(self) -> None:
+        event = parse_pump_event(
+            json.dumps(
+                {
+                    "action": "buy",
+                    "mint": self.MINT,
+                    "timestamp": 1_800_000_000_000,
+                    "priceSol": 0.02,
+                    "tokenAmount": 100.0,
+                    "quoteAmount": 2.0,
+                    "quoteMint": self.WSOL,
+                    "signature": "sig",
+                }
+            ),
+            0,
+        )
+        assert event is not None
+        self.assertEqual(event.mint, self.MINT)
+        self.assertEqual(event.quote_mint, self.WSOL)
+        self.assertEqual(event.quote_amount, 2.0)
+        self.assertEqual(event.quote_price_sol, None)
+        self.assertEqual(event.signature, "sig")
+
+    def test_usdc_quote_fields_survive_the_live_parser(self) -> None:
+        # A USDC-quoted print keeps the quote mint and the SOL conversion, so
+        # the live entry filter can price it exactly as the replay does.
+        event = parse_pump_event(
+            json.dumps(
+                {
+                    "action": "buy",
+                    "mint": self.MINT,
+                    "timestamp": 1_800_000_000_000,
+                    "priceSol": 0.013226,
+                    "tokenAmount": 46.0,
+                    "quoteAmount": 0.458,
+                    "quoteMint": self.USDC,
+                    "quotePriceSol": 0.013226,
+                }
+            ),
+            3,
+        )
+        assert event is not None
+        self.assertEqual(event.quote_mint, self.USDC)
+        self.assertAlmostEqual(event.quote_amount or 0.0, 0.458)
+        self.assertAlmostEqual(event.quote_price_sol or 0.0, 0.013226)
+        self.assertEqual(event.event_index, 3)
+        self.assertAlmostEqual(
+            canonical_quote_notional_sol(
+                quote_amount=event.quote_amount,
+                quote_mint=event.quote_mint,
+                quote_price_sol=event.quote_price_sol,
+                token_amount=event.token_amount,
+                price_sol=event.price_sol,
+            )
+            or 0.0,
+            0.458 * 0.013226,
+        )
+
+    def test_non_trade_and_invalid_events_are_dropped(self) -> None:
+        for payload in (
+            '{"action":"transfer","mint":"x","timestamp":1,"priceSol":1}',
+            '{"action":"buy","mint":"m","timestamp":1,"priceSol":0}',
+            '{"action":"buy","mint":"m","timestamp":1}',
+            "not json",
+            "[]",
+        ):
+            self.assertIsNone(parse_pump_event(payload, 0), payload)
 
 
 class HotMoneyGateTests(unittest.TestCase):
@@ -609,6 +708,60 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
             engine.skips[-1].reason, "entry_unverified_quote_notional"
         )
 
+    async def test_timer_card_received_after_scheduled_entry_is_skipped(self) -> None:
+        engine = self.engine(
+            entry_mode="timer",
+            timer_late_tolerance_ms=1_000,
+        )
+        # Card + 5 s was 5 s before receipt, well beyond scheduling jitter.
+        decision = await engine.on_signal(
+            self.make_signal(signal_ts_ms=self.NOW_MS - 10_000)
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["entry_timer_late"])
+        self.assertNotIn(MINT, engine.pending)
+
+    async def test_timer_task_refuses_to_quote_after_schedule(self) -> None:
+        engine = self.engine(entry_mode="timer", timer_late_tolerance_ms=1_000)
+        pending = PendingEntry(
+            signal=self.make_signal(),
+            eligible_at_ms=self.NOW_MS - 5_000,
+            expires_at_ms=self.NOW_MS + 60_000,
+        )
+        engine.pending[MINT] = pending
+        await engine._timer_entry(pending)
+        self.assertNotIn(MINT, engine.pending)
+        self.assertEqual(engine.skips[-1].reason, "entry_timer_late")
+
+    async def test_future_reference_price_is_rejected(self) -> None:
+        engine = self.engine(
+            entry_mode="timer",
+            max_reference_age_ms=30_000,
+            max_future_skew_ms=5_000,
+        )
+        pending = PendingEntry(
+            signal=self.make_signal(),
+            eligible_at_ms=self.NOW_MS - 1_000,
+            expires_at_ms=self.NOW_MS + 60_000,
+        )
+        engine.pending[MINT] = pending
+        engine.history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=self.NOW_MS + 60_000,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+                token_amount=100.0,
+                quote_amount=2.0,
+            )
+        )
+        await engine._timer_entry(pending)
+        self.assertNotIn(MINT, engine.pending)
+        self.assertEqual(
+            engine.skips[-1].reason, "reference_timestamp_in_future"
+        )
+
     async def test_timer_mode_rejects_a_stale_reference_price(self) -> None:
         engine = self.engine(
             entry_mode="timer", max_reference_age_ms=10_000
@@ -634,7 +787,7 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(MINT, engine.pending)
         self.assertEqual(engine.skips[-1].reason, "stale_reference_price")
 
-    def test_daily_pnl_is_restored_from_persisted_trades(self) -> None:
+    def test_daily_pnl_restores_from_persisted_trades(self) -> None:
         from datetime import UTC, datetime
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -648,6 +801,69 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
             )
             engine = self.engine(store=store)
         self.assertAlmostEqual(engine._daily_pnl[day], -0.25)
+
+    def test_daily_pnl_restores_across_run_directories(self) -> None:
+        from datetime import UTC, datetime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "risk" / "daily_pnl.json"
+            day = datetime.fromtimestamp(self.NOW_MS / 1000, UTC).date().isoformat()
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps({"version": 1, "days": {day: -0.4}}),
+                encoding="utf-8",
+            )
+            first = self.engine(
+                store=PaperStore(root / "run-first"), risk_state_path=path
+            )
+            second = self.engine(
+                store=PaperStore(root / "run-after-restart"),
+                risk_state_path=path,
+            )
+        self.assertAlmostEqual(first._daily_pnl[day], -0.4)
+        self.assertAlmostEqual(second._daily_pnl[day], -0.4)
+
+    def test_corrupt_risk_state_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "daily_pnl.json"
+            path.write_text("{not json", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                self.engine(risk_state_path=path, max_daily_loss_sol=0.5)
+
+    def test_unwritable_risk_state_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "not-a-directory"
+            blocker.write_text("x", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                self.engine(
+                    risk_state_path=blocker / "daily_pnl.json",
+                    max_daily_loss_sol=0.5,
+                )
+
+    def test_corrupt_risk_state_is_ignored_when_cap_is_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "daily_pnl.json"
+            path.write_text("{not json", encoding="utf-8")
+            engine = self.engine(risk_state_path=path, max_daily_loss_sol=0.0)
+        self.assertEqual(engine._daily_pnl, {})
+
+    def test_daily_pnl_is_persisted_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk" / "daily_pnl.json"
+            engine = self.engine(risk_state_path=path)
+            engine._daily_pnl["2026-11-23"] = -0.35
+            engine._persist_daily_pnl()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["days"]["2026-11-23"], -0.35)
+            self.assertFalse(path.with_name(path.name + ".tmp").exists())
+
+    async def test_risk_state_write_failure_blocks_new_entries(self) -> None:
+        engine = self.engine(max_daily_loss_sol=0.5)
+        engine._risk_state_error = "disk full"
+        decision = await engine.on_signal(self.make_signal())
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["risk_state_unavailable"])
 
     def test_stale_mark_is_excluded_from_nav(self) -> None:
         engine = self.engine(max_mark_age_ms=10_000)
@@ -749,6 +965,25 @@ class LiveGuardTests(unittest.TestCase):
                 {"LIVE_TRADING_ENABLED": "1"}, enabled=True, slippage_bps=50,
                 max_notional_sol=0.1,
             )
+
+    def test_risk_state_path_is_stable_and_lane_specific(self) -> None:
+        from paper_bot.live import LiveConfig, _risk_state_path
+
+        def config() -> LiveConfig:
+            return LiveConfig(
+                channels=["@test"],
+                config_path=Path("config.ini"),
+                run_dir=Path("output/paper/run"),
+            )
+
+        first = _risk_state_path(config(), "scanner_pumpfun_amm", "trade")
+        again = _risk_state_path(config(), "scanner_pumpfun_amm", "trade")
+        other = _risk_state_path(config(), "scanner_pumpfun_amm", "timer")
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, other)
+        self.assertEqual(first.parent, Path("output/risk"))
+        self.assertTrue(first.name.endswith(".json"))
+        self.assertNotIn(" ", first.name)
 
     def test_notional_cap_and_allowlist_are_enforced(self) -> None:
         executor = LiveSolanaExecutor(

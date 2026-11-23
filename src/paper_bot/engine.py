@@ -26,12 +26,15 @@ Robustness rules enforced here:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import os
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -126,6 +129,18 @@ class EngineConfig:
     # A mark older than this is excluded from NAV (0 disables); the conservative
     # equity reports cash plus fresh marks only.
     max_mark_age_ms: int = 120_000
+    # Timer mode schedules a quote at ``card + entry_delay``. If the card is
+    # delivered after that time, quoting at receipt is a late entry the replay
+    # never measured; allow only this much scheduling jitter.
+    timer_late_tolerance_ms: int = 1_000
+    # A feed timestamp this far in the future is a clock/data error, not a
+    # fresh mark. Historical ages are clamped to zero; excessive future skew is
+    # rejected instead of being reported as current.
+    max_future_skew_ms: int = 5_000
+    # Stable location for the daily realized-PnL state. Timestamped run
+    # directories change on every restart, so the circuit breaker must not
+    # depend on them. None keeps the legacy per-run store lookup.
+    risk_state_path: Path | None = None
     # "trade": wait for the first BUY print at/after the delay (historical
     # behaviour). "timer": quote at the delay regardless of prints, which is
     # what the research backtest assumes (entry at signal + ~5 s).
@@ -171,6 +186,10 @@ class EngineConfig:
             raise ValueError("max_reference_age_ms must be non-negative")
         if self.max_mark_age_ms < 0:
             raise ValueError("max_mark_age_ms must be non-negative")
+        if self.timer_late_tolerance_ms < 0:
+            raise ValueError("timer_late_tolerance_ms must be non-negative")
+        if self.max_future_skew_ms < 0:
+            raise ValueError("max_future_skew_ms must be non-negative")
 
 
 def entry_backoff_active(
@@ -232,20 +251,35 @@ class PaperEngine:
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         # Realized PnL by UTC day, used only by the optional daily loss cap.
-        # Restored from the append-only trades file so a process restart does
-        # not reset today's breaker.
+        # The stable risk-state file wins over the per-run store; the run
+        # directory changes on every restart, so it cannot be the only source.
         self._daily_pnl: dict[str, float] = {}
-        loader = getattr(self.store, "realized_pnl_by_day", None)
-        if callable(loader):
-            try:
-                restored = loader()
-            except Exception:  # noqa: BLE001 - a corrupt tail must not stop the bot
-                LOGGER.exception("could not restore daily PnL from the store")
+        self._risk_state_error: str | None = None
+        if self.config.risk_state_path is not None:
+            if self.config.max_daily_loss_sol > 0:
+                # Fail closed at startup: if the cap is enabled, a corrupt or
+                # unwritable state path means the breaker cannot be trusted
+                # after a restart, so refusing to start beats running naked.
+                self._daily_pnl = self._load_risk_state()
+                if not self._daily_pnl:
+                    self._daily_pnl = self._restore_daily_pnl_from_store()
+                self._persist_daily_pnl(raise_on_error=True)
             else:
-                if isinstance(restored, dict):
-                    self._daily_pnl = {
-                        str(key): float(value) for key, value in restored.items()
-                    }
+                # Cap disabled: best effort only. A missing/corrupt file or an
+                # unwritable directory must not stop a paper run that does not
+                # use the breaker.
+                try:
+                    self._daily_pnl = self._load_risk_state()
+                except RuntimeError:
+                    LOGGER.exception(
+                        "ignoring unreadable risk state; daily cap is disabled"
+                    )
+                    self._daily_pnl = {}
+                if not self._daily_pnl:
+                    self._daily_pnl = self._restore_daily_pnl_from_store()
+                self._persist_daily_pnl()
+        else:
+            self._daily_pnl = self._restore_daily_pnl_from_store()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -281,12 +315,18 @@ class PaperEngine:
         all_value = 0.0
         stale = 0
         unmarked = 0
+        future_marks = 0
         for mint, size in list(wallet.token_balances.items()):
             price, ts_ms = self.history.last_price(mint)
-            age_ms = None if ts_ms is None else max(0, now_ms - int(ts_ms))
+            age_ms = None if ts_ms is None else now_ms - int(ts_ms)
+            future = (
+                age_ms is not None
+                and age_ms < -self.config.max_future_skew_ms
+            )
             fresh = (
                 price is not None
                 and price > 0
+                and not future
                 and (
                     self.config.max_mark_age_ms <= 0
                     or (age_ms is not None and age_ms <= self.config.max_mark_age_ms)
@@ -299,6 +339,8 @@ class PaperEngine:
                     fresh_value += size * price
                 else:
                     stale += 1
+                    if future:
+                        future_marks += 1
             else:
                 unmarked += 1
             details[mint] = {
@@ -306,6 +348,7 @@ class PaperEngine:
                 "price_sol": price,
                 "mark_ts_ms": ts_ms,
                 "mark_age_ms": age_ms,
+                "future": future,
                 "fresh": fresh,
             }
         snapshot = wallet.snapshot(marks)
@@ -316,9 +359,11 @@ class PaperEngine:
                 "equity_all_marks_sol": wallet.sol_balance + all_value,
                 "marked_token_sol": fresh_value,
                 "stale_mark_count": stale,
+                "future_mark_count": future_marks,
                 "unmarked_token_count": unmarked,
                 "mark_details": details,
                 "max_mark_age_ms": self.config.max_mark_age_ms,
+                "max_future_skew_ms": self.config.max_future_skew_ms,
             }
         )
         return snapshot
@@ -329,6 +374,82 @@ class PaperEngine:
 
     def _day_pnl(self, ts_ms: int) -> float:
         return self._daily_pnl.get(self._day_key(ts_ms), 0.0)
+
+    def _restore_daily_pnl_from_store(self) -> dict[str, float]:
+        loader = getattr(self.store, "realized_pnl_by_day", None)
+        if not callable(loader):
+            return {}
+        try:
+            restored = loader()
+        except Exception:  # noqa: BLE001 - a corrupt tail must not stop the bot
+            LOGGER.exception("could not restore daily PnL from the store")
+            return {}
+        if not isinstance(restored, dict):
+            return {}
+        return {str(key): float(value) for key, value in restored.items()}
+
+    def _load_risk_state(self) -> dict[str, float]:
+        """Read the stable daily-PnL file, or start empty on first run.
+
+        A missing file is a legitimate first start. An unreadable, corrupt or
+        mistyped file is not: silently starting at zero would disable the
+        circuit breaker the operator asked for, so startup fails instead.
+        """
+        path = self.config.risk_state_path
+        assert path is not None
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot read daily risk state at {path}: {exc}"
+            ) from exc
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"daily risk state at {path} is not valid JSON: {exc}"
+            ) from exc
+        days = payload.get("days") if isinstance(payload, dict) else None
+        if not isinstance(days, dict):
+            raise RuntimeError(
+                f"daily risk state at {path} has no 'days' object"
+            )
+        restored: dict[str, float] = {}
+        for key, value in days.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise RuntimeError(
+                    f"daily risk state at {path} has a non-numeric value "
+                    f"for {key!r}"
+                )
+            restored[str(key)] = float(value)
+        return restored
+
+    def _persist_daily_pnl(self, *, raise_on_error: bool = False) -> None:
+        """Atomically write today's realized PnL to the stable risk state."""
+        path = self.config.risk_state_path
+        if path is None:
+            return
+        payload = {
+            "version": 1,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "days": dict(sorted(self._daily_pnl.items())),
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            self._risk_state_error = f"{type(exc).__name__}: {exc}"
+            LOGGER.exception("could not persist daily risk state to %s", path)
+            if raise_on_error:
+                raise RuntimeError(
+                    f"cannot persist daily risk state at {path}: {exc}"
+                ) from exc
+            return
+        self._risk_state_error = None
 
     @staticmethod
     def _emit(callback: Any, *args: Any) -> None:
@@ -554,6 +675,27 @@ class PaperEngine:
                     f"expires_at_ms={expires_at_ms}"
                 )
             elif (
+                self.config.entry_mode == "timer"
+                and received_ms > 0
+                and received_ms
+                > eligible_at_ms + self.config.timer_late_tolerance_ms
+            ):
+                # Timer mode must quote at card + 5 s. A card delivered after
+                # that time would be priced at receipt, a different (and
+                # systematically worse) fill than the research convention.
+                final = GateDecision(
+                    allowed=False,
+                    rule=decision.rule,
+                    reasons=["entry_timer_late"],
+                    features=decision.features,
+                )
+                rejection_reason = "entry_timer_late"
+                rejection_detail = (
+                    f"received_ts_ms={received_ms};"
+                    f"eligible_at_ms={eligible_at_ms};"
+                    f"tolerance_ms={self.config.timer_late_tolerance_ms}"
+                )
+            elif (
                 self.config.entry_mode == "trade"
                 and received_ms > eligible_at_ms
                 and (
@@ -600,6 +742,21 @@ class PaperEngine:
                     f"open={len(self.positions)};pending={len(self.pending)};"
                     f"max={self.config.max_concurrent_positions}"
                 )
+            elif (
+                self.config.max_daily_loss_sol > 0
+                and self._risk_state_error is not None
+            ):
+                # The breaker is enabled but its state cannot be persisted, so
+                # a restart could forget today's loss. Stop opening positions
+                # rather than running unprotected; exits still proceed.
+                final = GateDecision(
+                    allowed=False,
+                    rule=decision.rule,
+                    reasons=["risk_state_unavailable"],
+                    features=decision.features,
+                )
+                rejection_reason = "risk_state_unavailable"
+                rejection_detail = self._risk_state_error
             elif (
                 self.config.max_daily_loss_sol > 0
                 and self._day_pnl(self._now())
@@ -771,6 +928,23 @@ class PaperEngine:
                 if self.pending.get(pending.mint) is pending:
                     self._skip_pending(pending, "entry_delay_exceeded", None)
             return
+        if (
+            trigger_ts_ms
+            > pending.eligible_at_ms + self.config.timer_late_tolerance_ms
+        ):
+            # The timer woke after the scheduled entry, for example because
+            # the signal arrived late or the loop stalled. Quoting now would
+            # record a delayed entry as a timer entry.
+            async with self._lock(pending.mint):
+                if self.pending.get(pending.mint) is pending:
+                    self._skip_pending(
+                        pending,
+                        "entry_timer_late",
+                        f"trigger_ts_ms={trigger_ts_ms};"
+                        f"eligible_at_ms={pending.eligible_at_ms};"
+                        f"tolerance_ms={self.config.timer_late_tolerance_ms}",
+                    )
+            return
         price_sol, reference_ts_ms, decimals = self.history.last_trade(
             pending.mint
         )
@@ -799,8 +973,24 @@ class PaperEngine:
         reference_age_ms = (
             None
             if reference_ts_ms is None
-            else max(0, trigger_ts_ms - int(reference_ts_ms))
+            else trigger_ts_ms - int(reference_ts_ms)
         )
+        if (
+            reference_age_ms is not None
+            and reference_age_ms < -self.config.max_future_skew_ms
+        ):
+            # A reference mark dated far in the future is a clock/feed error;
+            # clamping its age to zero would present it as perfectly fresh.
+            async with self._lock(pending.mint):
+                if self.pending.get(pending.mint) is pending:
+                    self._skip_pending(
+                        pending,
+                        "reference_timestamp_in_future",
+                        f"reference_age_ms={reference_age_ms};"
+                        f"source={reference_source};"
+                        f"max_skew_ms={self.config.max_future_skew_ms}",
+                    )
+            return
         if self.config.max_reference_age_ms > 0 and reference_age_ms is None:
             # A price without a timestamp cannot be proven current. Treat the
             # unknown age as stale rather than as valid.
@@ -1444,6 +1634,7 @@ class PaperEngine:
         self.closed.append(trade)
         day = self._day_key(trade.exit_ts_ms)
         self._daily_pnl[day] = self._daily_pnl.get(day, 0.0) + trade.pnl_sol
+        self._persist_daily_pnl()
         if self.store is not None:
             self.store.record_trade(trade)
         self.positions.pop(position.mint, None)

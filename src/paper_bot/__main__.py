@@ -225,6 +225,32 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
             "The optimistic view is still written as equity_all_marks_sol."
         ),
     )
+    parser.add_argument(
+        "--timer-late-tolerance-ms",
+        type=int,
+        default=1_000,
+        help=(
+            "Timer mode: reject a card received later than the scheduled "
+            "entry time plus this tolerance instead of quoting at receipt."
+        ),
+    )
+    parser.add_argument(
+        "--max-future-skew-ms",
+        type=int,
+        default=5_000,
+        help=(
+            "Treat feed timestamps further in the future than this as clock/"
+            "data errors, not as fresh marks."
+        ),
+    )
+    parser.add_argument(
+        "--risk-state-dir",
+        default="output/risk",
+        help=(
+            "Stable directory for daily realized-PnL state. Must not be the "
+            "timestamped run directory, or a restart resets the loss cap."
+        ),
+    )
     parser.add_argument("--safety-screen", action="store_true")
     parser.add_argument("--allow-candidate-address", action="store_true")
     parser.add_argument("--pumpapi-url", default="wss://stream.pumpapi.io/")
@@ -452,6 +478,9 @@ def main() -> int:
             min_entry_quote_sol=args.min_entry_quote_sol,
             max_reference_age_ms=args.max_reference_age_ms,
             max_mark_age_ms=args.max_mark_age_ms,
+            timer_late_tolerance_ms=args.timer_late_tolerance_ms,
+            max_future_skew_ms=args.max_future_skew_ms,
+            risk_state_dir=args.risk_state_dir,
             safety_screen=args.safety_screen,
             allow_candidate_address=args.allow_candidate_address,
             pumpapi_url=args.pumpapi_url,

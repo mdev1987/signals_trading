@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import time
 from collections import OrderedDict
@@ -129,6 +130,16 @@ class LiveConfig:
     # Marks older than this are excluded from reported NAV. 0 disables the
     # freshness split (all marks are then treated as current).
     max_mark_age_ms: int = 120_000
+    # Timer mode: allow at most this much scheduling jitter after the
+    # scheduled card + entry_delay moment; a later card is rejected instead of
+    # being priced at receipt.
+    timer_late_tolerance_ms: int = 1_000
+    # Feed timestamps further in the future than this are treated as clock/data
+    # errors, not as fresh marks.
+    max_future_skew_ms: int = 5_000
+    # Stable directory for daily risk state, separate from the timestamped run
+    # directory so a restart does not reset the daily loss breaker.
+    risk_state_dir: str = "output/risk"
     safety_screen: bool = False
     allow_candidate_address: bool = False
     pumpapi_url: str = DEFAULT_PUMPAPI_URL
@@ -240,6 +251,12 @@ class LiveConfig:
             raise ValueError("max_reference_age_ms must be non-negative")
         if self.max_mark_age_ms < 0:
             raise ValueError("max_mark_age_ms must be non-negative")
+        if self.timer_late_tolerance_ms < 0:
+            raise ValueError("timer_late_tolerance_ms must be non-negative")
+        if self.max_future_skew_ms < 0:
+            raise ValueError("max_future_skew_ms must be non-negative")
+        if not self.risk_state_dir.strip():
+            raise ValueError("risk_state_dir must not be empty")
         if self.exit_quote_timeout_ms <= 0:
             raise ValueError("exit_quote_timeout_ms must be positive")
         if self.shutdown_timeout_ms <= 0:
@@ -389,6 +406,17 @@ class StrategyLane:
     wallet_snapshot: dict[str, Any] | None = None
 
 
+def _risk_state_path(config: LiveConfig, rule: str, entry_mode: str) -> Path:
+    """Stable per-lane daily-PnL file, independent of the run directory.
+
+    A/B lanes keep separate breakers; a shared file would let one lane's losses
+    stop the other. The name is derived from the rule and entry mode, so a
+    restart of the same lane restores its own state.
+    """
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{rule}_{entry_mode}").strip("._")
+    return Path(config.risk_state_dir) / f"{stem or 'lane'}.json"
+
+
 def _lane_meta(
     config: LiveConfig,
     *,
@@ -418,6 +446,10 @@ def _lane_meta(
         "min_entry_quote_sol": config.min_entry_quote_sol,
         "max_reference_age_ms": config.max_reference_age_ms,
         "max_mark_age_ms": config.max_mark_age_ms,
+        "timer_late_tolerance_ms": config.timer_late_tolerance_ms,
+        "max_future_skew_ms": config.max_future_skew_ms,
+        "risk_state_dir": config.risk_state_dir,
+        "risk_state_file": str(_risk_state_path(config, rule, entry_mode)),
         "tp_pct": config.tp_pct,
         "sl_pct": config.sl_pct,
         "fee": config.fee,
@@ -510,6 +542,9 @@ def _create_lane(
             min_entry_quote_sol=config.min_entry_quote_sol,
             max_reference_age_ms=config.max_reference_age_ms,
             max_mark_age_ms=config.max_mark_age_ms,
+            timer_late_tolerance_ms=config.timer_late_tolerance_ms,
+            max_future_skew_ms=config.max_future_skew_ms,
+            risk_state_path=_risk_state_path(config, rule, entry_mode),
             horizon_ms=int(config.horizon_min * 60_000),
             tp_pct=config.tp_pct,
             sl_pct=config.sl_pct,

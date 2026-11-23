@@ -57,6 +57,9 @@ PYTHONPATH=src .venv/bin/python -m paper_bot live \
   --min-entry-quote-sol 0.01 \
   --max-reference-age-ms 30000 \
   --max-mark-age-ms 120000 \
+  --timer-late-tolerance-ms 1000 \
+  --max-future-skew-ms 5000 \
+  --risk-state-dir output/risk \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --slippage-bps 50 \
@@ -171,6 +174,29 @@ What to watch in the first days:
   convention refused a trade the backtest would not have taken under the same
   `card + 5 s` rule. They are expected to be small; a growing count means the
   feed or Telegram delivery, not the strategy, changed.
+- `entry_timer_late` appears only in timer mode (`--entry-mode timer`): the
+  card reached the bot after the scheduled `card + 5 s` moment (plus
+  `--timer-late-tolerance-ms`), so quoting at receipt would be a late entry.
+  The deployed lane uses `--entry-mode trade` and does not schedule a timer.
+- `reference_timestamp_in_future` / a non-zero `future_mark_count` means the
+  feed or host clock is ahead by more than `--max-future-skew-ms`; the bot
+  refuses those marks instead of treating them as perfectly fresh.
+
+### Risk state and restarts
+
+- With `--max-daily-loss-sol` above 0, realized daily PnL is persisted to
+  `--risk-state-dir` (default `output/risk/<rule>_<entry-mode>.json`), which is
+  stable across the timestamped `live_*` run directories and separate per
+  lane. The deployed lane leaves the cap at 0 (disabled), so this file is
+  informative only unless enabled.
+- If the cap is enabled and the state file is corrupt or unwritable, startup
+  fails closed rather than silently starting the day at zero. A failed write
+  during the run also blocks new entries (`risk_state_unavailable`) while
+  exits continue.
+- Open positions and wallet/token balances are **not** restored across a
+  process restart: the broker starts from `--starting-sol`, so a restart
+  abandons the open book. Restart only during a flat window, or accept that
+  the interrupted positions are not carried forward.
 - Evaluate the run with `src/forward_gates.py` (same frozen thresholds and
   seeded cluster bootstrap) instead of eyeballing `summary.json`.
 - Compare the realized median and win rate with the deployed-convention

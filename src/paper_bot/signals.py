@@ -92,6 +92,18 @@ SCANNER_MIN_LIQUIDITY_USD = 20_000.0
 SCANNER_MAX_LIQUIDITY_USD = 100_000.0
 SCANNER_MESSAGE_TYPE = "scanner_pool_launch"
 
+
+def normalize_dex(value: object) -> str:
+    """Canonical DEX label for the scanner gate and the replay comparison.
+
+    The live card parser preserves the feed's spelling, while replay CSVs are
+    hand-edited and may carry different casing or padding. Both paths must
+    treat ``Pumpfunamm`` and ``pumpfunamm`` as the same venue; otherwise the
+    "reproduced" backtest filters a different set of cards than the bot.
+    """
+    return str(value or "").strip().casefold()
+
+
 MAX_PUMP_THRESHOLD = 1.0
 PRE_RET_THRESHOLD = 6.3
 
@@ -380,7 +392,7 @@ def _rule_decision(signal: Signal, rule: str) -> tuple[bool, str | None]:
 
     if rule == SCANNER_RULE:
         dex = signal.features.get("dex")
-        if dex != SCANNER_ALLOWED_DEX:
+        if normalize_dex(dex) != normalize_dex(SCANNER_ALLOWED_DEX):
             return False, f"rule_dex_not_{SCANNER_ALLOWED_DEX.lower()}"
         liquidity = _feature(signal, "liquidity_usd")
         if liquidity is None:

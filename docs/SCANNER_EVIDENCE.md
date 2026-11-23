@@ -70,6 +70,7 @@ the entry window:
 | eligible | card + 5 s | card + 5 s |
 | expire | card + 60 s | card + 60 s |
 | card delivered after expiry | n/a | skipped (`entry_window_passed`) |
+| timer card delivered after `card + 5 s` | n/a | skipped (`entry_timer_late`) |
 | first eligible BUY already printed before delivery | n/a (fill is historical) | skipped (`entry_missed_eligible_print`) |
 | first eligible BUY is dust | skipped | skipped (`dust_prints`, `min_entry_quote_sol`) |
 
@@ -80,8 +81,11 @@ metadata is missing), not to the raw `quoteAmount`: PumpAPI's `quoteAmount` is
 denominated in the quote mint, so a USDC-quoted print is worth ~0.0137 SOL per
 dollar. A print whose notional cannot be classified is counted
 (`unverified_prints`) and does not trigger an entry. Timer mode additionally
-refuses a reference mark older than `--max-reference-age-ms` (30 s) instead of
-quoting a dead pool.
+refuses a reference mark older than `--max-reference-age-ms` (30 s), or dated
+more than `--max-future-skew-ms` (5 s) in the future, instead of quoting a
+dead pool or treating a clock error as perfectly fresh. In timer mode a card
+that reaches the bot more than `--timer-late-tolerance-ms` (1 s) after the
+scheduled `card + 5 s` moment is rejected rather than priced at receipt.
 
 ### Reproducing the gates
 
@@ -292,13 +296,16 @@ Do not fund this lane until a forward paper run shows **all** of:
    `exit_reason == "no_route"` alone understates the loss tail: the first
    forward run had **0** `no_route` exits and **17.6 %** catastrophic exits.
 5. **No systematic entry failure.** At least **80 %** of allowed signals must
-   fill (`entries.jsonl` / allowed `signals.jsonl`). `entry_delay_exceeded` /
-   `entry_quote_failed` above ~10 % of in-band alerts means the bot is not
-   taking the trades the backtest measured, regardless of the realized win
-   rate. `entry_dust_prints_only`, `entry_unverified_quote_notional`,
-   `entry_missed_eligible_print`, `entry_window_passed` and
-   `stale_reference_price` are fidelity skips (the live convention refused a
-   print the replay would not have used), not backtested trades.
+   fill (`entries.jsonl` / allowed `signals.jsonl`), **and**
+   `entry_delay_exceeded + entry_quote_failed` must stay below **10 %** of
+   allowed signals. The fill rate alone can look healthy while a separate
+   tenth of the cards is abandoned by quote or timing failures; either one
+   means the bot is not taking the trades the backtest measured, regardless of
+   the realized win rate. `entry_dust_prints_only`,
+   `entry_unverified_quote_notional`, `entry_missed_eligible_print`,
+   `entry_window_passed`, `entry_timer_late` and `stale_reference_price` are
+   fidelity skips (the live convention refused a print the replay would not
+   have used), not backtested trades.
 
 `src/forward_gates.py` evaluates gates 1–5 with these exact thresholds and
 exits `2` while coverage is short.

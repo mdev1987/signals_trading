@@ -212,5 +212,43 @@ class ForwardGateTests(unittest.TestCase):
         self.assertFalse(result["passed"])
 
 
+    def test_entry_failures_fail_execution_even_when_fill_rate_passes(self) -> None:
+        # Fill rate counts entries / allowed signals; a run can fill 80 %+ of
+        # allowed cards yet lose another 10 % to delayed or unfilled quotes.
+        # The documented gate caps those failures at 10 %, so this must fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=300, days=5, pnl=0.01)
+            with (root / "skips.jsonl").open("w", encoding="utf-8") as handle:
+                for _ in range(36):
+                    handle.write(
+                        json.dumps({"reason": "entry_delay_exceeded"}) + "\n"
+                    )
+                for _ in range(4):
+                    handle.write(
+                        json.dumps({"reason": "entry_quote_failed"}) + "\n"
+                    )
+            result = evaluate(root)
+        execution = result["gates"]["execution"]
+        self.assertGreaterEqual(execution["entry_fill_rate"], 0.80)
+        self.assertGreaterEqual(execution["entry_failure_rate"], 0.10)
+        self.assertFalse(execution["passed"])
+        self.assertFalse(result["passed"])
+
+    def test_entry_failures_under_the_cap_still_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=300, days=5, pnl=0.01)
+            with (root / "skips.jsonl").open("w", encoding="utf-8") as handle:
+                for _ in range(29):
+                    handle.write(
+                        json.dumps({"reason": "entry_quote_failed"}) + "\n"
+                    )
+            result = evaluate(root)
+        execution = result["gates"]["execution"]
+        self.assertLess(execution["entry_failure_rate"], 0.10)
+        self.assertTrue(execution["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()

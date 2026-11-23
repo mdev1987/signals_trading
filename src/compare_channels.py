@@ -25,6 +25,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from paper_bot.signals import normalize_dex
+
 ROOT = Path("output/backtest/signals_channels")
 OUTPUT = Path("output/backtest/channel_comparison")
 STAKE_SOL = 0.10
@@ -172,10 +174,10 @@ def deployed_scanner_rule(frame: pd.DataFrame) -> pd.DataFrame:
     block = block.sort_values(["mint", "alert_ts_ms"]).drop_duplicates(
         "mint", keep="first"
     )
-    dex = block["dex"].astype(str).str.strip().str.lower()
+    dex = block["dex"].map(normalize_dex)
     liquidity = pd.to_numeric(block["liquidity_usd"], errors="coerce")
     return block[
-        (dex == "pumpfunamm")
+        (dex == normalize_dex("Pumpfunamm"))
         & (liquidity >= 20_000)
         & (liquidity < 100_000)
     ].copy()

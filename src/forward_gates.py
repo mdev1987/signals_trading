@@ -35,6 +35,7 @@ MIN_MEDIAN_RETURN = 0.10
 MAX_CATASTROPHIC_RATE = 0.16
 MAX_WRITE_OFF_RATE = 0.16
 MIN_ENTRY_FILL_RATE = 0.80
+MAX_ENTRY_FAILURE_RATE = 0.10
 BOOTSTRAP_LOWER_QUANTILE = 0.05
 BOOTSTRAP_LOSS_ALLOWANCE = 0.05
 
@@ -182,13 +183,27 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         "detail": f"{catastrophic}/{len(trades)} <= {MAX_CATASTROPHIC_RATE}",
     }
 
+    skip_counts: dict[str, int] = defaultdict(int)
+    for row in skips:
+        skip_counts[str(row.get("reason") or "unknown")] += 1
+    entry_delay_failures = skip_counts.get("entry_delay_exceeded", 0)
+    quote_failures = skip_counts.get("entry_quote_failed", 0)
+    entry_failure_rate = (
+        (entry_delay_failures + quote_failures) / allowed if allowed else None
+    )
+
     write_off_rate = (write_offs / len(trades)) if trades else None
     entry_ok = fill_rate is not None and fill_rate >= MIN_ENTRY_FILL_RATE
+    failure_ok = (
+        entry_failure_rate is not None
+        and entry_failure_rate <= MAX_ENTRY_FAILURE_RATE
+    )
     gates["execution"] = {
         "passed": (
             write_off_rate is not None
             and write_off_rate <= MAX_WRITE_OFF_RATE
             and entry_ok
+            and failure_ok
         ),
         "write_offs": write_offs,
         "write_off_rate": write_off_rate,
@@ -196,15 +211,17 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         "signals_allowed": allowed,
         "entry_fill_rate": fill_rate,
         "required_entry_fill_rate": MIN_ENTRY_FILL_RATE,
+        "entry_delay_exceeded": entry_delay_failures,
+        "entry_quote_failed": quote_failures,
+        "entry_failure_rate": entry_failure_rate,
+        "required_max_entry_failure_rate": MAX_ENTRY_FAILURE_RATE,
         "detail": (
             f"write_offs={write_offs}/{len(trades)}; "
-            f"fill_rate={fill_rate!s}"
+            f"fill_rate={fill_rate!s}; "
+            f"entry_failures={entry_delay_failures + quote_failures}"
+            f"/{allowed} ({entry_failure_rate!s})"
         ),
     }
-
-    skip_counts: dict[str, int] = defaultdict(int)
-    for row in skips:
-        skip_counts[str(row.get("reason") or "unknown")] += 1
 
     passed = all(gate["passed"] for gate in gates.values())
     return {
