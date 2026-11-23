@@ -71,6 +71,9 @@ exec "$VENV" -m paper_bot live \
   --entry-mode trade \
   --entry-delay-ms 5_000 \
   --max-entry-delay-ms 60_000 \
+  --max-delivery-lag-ms 60_000 \
+  --max-concurrent-positions 10 \
+  --entry-retry-backoff-ms 1_000 \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --starting-sol 10 \

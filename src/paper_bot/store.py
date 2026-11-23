@@ -58,6 +58,11 @@ class PaperStore:
                 "channel": position.signal.channel,
                 "message_id": position.signal.message_id,
                 "signal_ts_ms": position.signal.signal_ts_ms,
+                "received_ts_ms": position.signal.received_ts_ms,
+                "delivery_lag_ms": max(
+                    0,
+                    position.signal.received_ts_ms - position.signal.signal_ts_ms,
+                ),
                 "entry_ts_ms": position.entry_ts_ms,
                 "entry_trigger_ts_ms": position.entry_trigger_ts_ms,
                 "entry_price_sol": position.entry_price_sol,
@@ -164,6 +169,12 @@ def max_drawdown_sol(pnls: list[float]) -> float:
     return float((equity - running_peak).min())
 
 
+def _percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    return float(np.quantile(np.asarray(values, dtype=float), q))
+
+
 def summarize(run_dir: Path) -> dict[str, Any]:
     trades = _read_jsonl(run_dir / "trades.jsonl")
     skips = _read_jsonl(run_dir / "skips.jsonl")
@@ -173,8 +184,24 @@ def summarize(run_dir: Path) -> dict[str, Any]:
     returns = [float(row.get("return_pct") or 0.0) for row in trades]
     holds = [int(row.get("hold_ms") or 0) for row in trades]
     entry_delays = [int(row.get("entry_delay_ms") or 0) for row in trades]
+    delivery_lags = [
+        int(row.get("delivery_lag_ms") or 0)
+        for row in trades
+        if row.get("received_ts_ms")
+    ]
     wins = [value for value in pnl if value > 0]
     losses = [value for value in pnl if value < 0]
+    # A "catastrophic" exit is one that returned at most -90 %: the rug tail
+    # that drives this lane's PnL. It is deliberately separate from
+    # ``write_offs`` (no_route / unsold), because a drained pool can still
+    # return a tiny non-zero quote and fill instead of erroring.
+    catastrophic = [value for value in returns if value <= -0.9]
+    write_off_rows = [
+        row
+        for row in trades
+        if str(row.get("exit_status") or "") == "no_route"
+        or float(row.get("unsold_size") or 0.0) > 0.0
+    ]
     status_counts: dict[str, int] = {}
     source_counts: dict[str, int] = {}
     skip_counts: dict[str, int] = {}
@@ -211,10 +238,30 @@ def summarize(run_dir: Path) -> dict[str, Any]:
         "expectancy_sol": (sum(pnl) / len(pnl)) if pnl else None,
         "best_pnl_sol": max(pnl) if pnl else None,
         "worst_pnl_sol": min(pnl) if pnl else None,
+        # ``return_pct`` is a fraction (0.1618 = +16.18 %), matching the
+        # engine/broker and the notifier's fmt_pct().
         "avg_return_pct": (sum(returns) / len(returns)) if returns else None,
+        "median_return_pct": _percentile(returns, 0.5),
+        "p10_return_pct": _percentile(returns, 0.10),
+        "p90_return_pct": _percentile(returns, 0.90),
+        "catastrophic_exits": len(catastrophic),
+        "catastrophic_exit_rate": (
+            len(catastrophic) / len(trades) if trades else None
+        ),
+        "write_offs": len(write_off_rows),
+        "write_off_rate": (
+            len(write_off_rows) / len(trades) if trades else None
+        ),
         "avg_hold_ms": (sum(holds) / len(holds)) if holds else None,
         "avg_entry_delay_ms": (
             sum(entry_delays) / len(entry_delays) if entry_delays else None
+        ),
+        "entry_delay_p50_ms": _percentile(entry_delays, 0.5),
+        "entry_delay_p90_ms": _percentile(entry_delays, 0.9),
+        "delivery_lag_p50_ms": _percentile(delivery_lags, 0.5),
+        "delivery_lag_p90_ms": _percentile(delivery_lags, 0.9),
+        "entries_delivered_after_60s": sum(
+            1 for value in delivery_lags if value > 60_000
         ),
         "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else None,
         "max_drawdown_sol": max_drawdown_sol(pnl) if pnl else 0.0,

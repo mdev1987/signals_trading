@@ -16,7 +16,9 @@ SRC_DIR = Path(__file__).resolve().parents[1]
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from paper_bot.engine import entry_backoff_active  # noqa: E402
+from paper_bot.broker import BrokerConfig, PaperBroker  # noqa: E402
+from paper_bot.engine import EngineConfig, PaperEngine, entry_backoff_active  # noqa: E402
+from paper_bot.wallet import PaperWallet, WalletConfig  # noqa: E402
 from paper_bot.execution import (  # noqa: E402
     LiveExecutionConfig,
     LiveExecutionError,
@@ -27,7 +29,11 @@ from paper_bot.execution import (  # noqa: E402
 )
 from paper_bot.history import MarketHistory  # noqa: E402
 from paper_bot.models import PendingEntry, Signal, TradeEvent  # noqa: E402
-from paper_bot.notifier import format_startup  # noqa: E402
+from paper_bot.notifier import (  # noqa: E402
+    ReporterConfig,
+    TelegramReporter,
+    format_startup,
+)
 from paper_bot.quotes import (  # noqa: E402
     QuoteError,
     JupiterQuoteProvider,
@@ -423,6 +429,125 @@ class EntryBackoffTests(unittest.TestCase):
         )
 
 
+class EngineGateTests(unittest.IsolatedAsyncioTestCase):
+    """Intake guards that protect the deployed convention."""
+
+    NOW_MS = 1_800_000_000_000
+
+    def engine(self, **overrides: object) -> PaperEngine:
+        wallet = PaperWallet(WalletConfig(starting_sol=10.0))
+        broker = PaperBroker(BrokerConfig(notional_sol=0.1), wallet=wallet)
+        config = EngineConfig(
+            entry_delay_ms=5_000,
+            max_entry_delay_ms=60_000,
+            live=True,
+            **overrides,  # type: ignore[arg-type]
+        )
+        return PaperEngine(
+            config=config,
+            broker=broker,
+            quotes=object(),
+            history=MarketHistory(),
+            gate=GateConfig(rule="baseline"),
+            clock=lambda: self.NOW_MS,
+        )
+
+    def make_signal(self, *, received_ts_ms: int | None = None) -> Signal:
+        return Signal(
+            token_address=MINT,
+            signal_ts_ms=self.NOW_MS - 1_000,
+            received_ts_ms=(
+                self.NOW_MS if received_ts_ms is None else received_ts_ms
+            ),
+            channel="@test",
+            message_id=1,
+            network="solana",
+            address_status="confirmed",
+            address_type="mint",
+            message_type="buy",
+            is_buy_signal=True,
+            is_confirmed_buy_signal=True,
+            features={},
+        )
+
+    async def test_late_card_is_not_traded(self) -> None:
+        engine = self.engine(max_delivery_lag_ms=60_000)
+        decision = await engine.on_signal(
+            self.make_signal(received_ts_ms=self.NOW_MS + 120_000)
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["delivery_lag_exceeded"])
+        self.assertEqual(engine.skips[-1].reason, "delivery_lag_exceeded")
+        self.assertNotIn(MINT, engine.pending)
+
+    async def test_card_within_the_lag_window_is_traded(self) -> None:
+        engine = self.engine(max_delivery_lag_ms=60_000)
+        decision = await engine.on_signal(self.make_signal())
+        self.assertTrue(decision.allowed)
+        self.assertIn(MINT, engine.pending)
+
+    async def test_concurrency_cap_counts_pending_entries(self) -> None:
+        engine = self.engine(max_concurrent_positions=1)
+        engine.pending["other-mint"] = object()  # type: ignore[assignment]
+        decision = await engine.on_signal(self.make_signal())
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["max_concurrent_positions"])
+
+    async def test_daily_loss_limit_stops_new_entries(self) -> None:
+        from datetime import UTC, datetime
+
+        engine = self.engine(max_daily_loss_sol=0.4)
+        day = datetime.fromtimestamp(self.NOW_MS / 1000, UTC).date().isoformat()
+        engine._daily_pnl[day] = -0.5
+        decision = await engine.on_signal(self.make_signal())
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["daily_loss_limit"])
+
+    def test_wallet_snapshot_marks_open_tokens(self) -> None:
+        engine = self.engine()
+        wallet = engine.broker.wallet
+        assert wallet is not None
+        wallet.reserve_entry(MINT, 10.0, 0.1, 0.0)
+        engine.history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=self.NOW_MS,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+                token_amount=100.0,
+                quote_amount=2.0,
+            )
+        )
+        snapshot = engine.wallet_snapshot()
+        assert snapshot is not None
+        # Cash plus 10 tokens marked at 0.02 SOL; the old snapshot reported
+        # cash only and understated equity by the open position.
+        self.assertAlmostEqual(snapshot["equity_sol"], 9.9 + 0.2)
+
+    def test_reporter_snapshot_uses_the_marked_engine_view(self) -> None:
+        engine = self.engine()
+        wallet = engine.broker.wallet
+        assert wallet is not None
+        wallet.reserve_entry(MINT, 10.0, 0.1, 0.0)
+        engine.history.add(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=self.NOW_MS,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+                token_amount=100.0,
+                quote_amount=2.0,
+            )
+        )
+        reporter = TelegramReporter(ReporterConfig(enabled=False))
+        reporter.bind(engine=engine, wallet=wallet)
+        snapshot = reporter.wallet_snapshot()
+        assert snapshot is not None
+        self.assertAlmostEqual(snapshot["equity_sol"], 9.9 + 0.2)
+
+
 class LiveGuardTests(unittest.TestCase):
     def test_live_config_fails_closed_without_opt_in(self) -> None:
         config = live_config_from_env(
@@ -773,6 +898,52 @@ class QuoteRobustnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_transient_quote_error("quote_bad_request"))
         self.assertTrue(is_terminal_exit_error("quote_no_route"))
         self.assertFalse(is_terminal_exit_error("quote_server_error"))
+
+    def test_zero_out_is_retried_then_terminal_for_an_exit(self) -> None:
+        # A seconds-old pool can quote zero once and route on the next print,
+        # but a zero sell after the exit timeout means there is nothing there.
+        self.assertTrue(is_transient_quote_error("quote_zero_out"))
+        self.assertFalse(is_terminal_exit_error("quote_missing_out_amount"))
+        self.assertTrue(is_terminal_exit_error("quote_zero_out"))
+
+    async def test_not_ready_is_not_burst_retried_inside_one_call(self) -> None:
+        responses = []
+        for _ in range(3):
+            response = _FakeResponse(400)
+            response.text = "pool not indexed"
+            responses.append(response)
+        client = _FakeHttpClient(responses)
+        provider = JupiterQuoteProvider(
+            api_key=None,
+            retries=3,
+            backoff_s=0.0,
+            slippage_bps=50,
+            max_slippage_bps=1000,
+            client=client,  # type: ignore[arg-type]
+        )
+        with self.assertRaises(QuoteError) as caught:
+            await provider._order({"inputMint": "a"}, action="entry")
+        self.assertEqual(caught.exception.reason, "quote_not_ready")
+        # One attempt per BUY print: the engine retries with a backoff.
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_bad_request_does_not_widen_the_ladder(self) -> None:
+        response = _FakeResponse(400)
+        response.text = "invalid amount"
+        client = _FakeHttpClient([response, response, response])
+        provider = JupiterQuoteProvider(
+            api_key=None,
+            retries=1,
+            slippage_bps=50,
+            max_slippage_bps=1000,
+            client=client,  # type: ignore[arg-type]
+        )
+        with self.assertRaises(QuoteError) as caught:
+            await provider._order_with_escalation(
+                {"inputMint": "a"}, action="exit"
+            )
+        self.assertEqual(caught.exception.reason, "quote_bad_request")
+        self.assertEqual(len(client.calls), 1)
 
     async def test_entry_quote_widens_slippage_until_routed(self) -> None:
         client = _FakeHttpClient(

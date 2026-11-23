@@ -48,6 +48,7 @@ def load(
     tag: str = "",
     max_entry_delay_ms: int = 60_000,
     max_entry_age_ms: int = 2_000,
+    fill_mode: str | None = None,
 ) -> pd.DataFrame:
     suffix = f"_{tag}" if tag else ""
     frames = []
@@ -57,6 +58,10 @@ def load(
             continue
         frame = pd.read_csv(path)
         frame["day"] = day
+        if fill_mode is not None and "entry_fill_mode" in frame:
+            # The pricing tool records the convention it used; never mix
+            # last-before and first-after rows in one comparison.
+            frame = frame[frame["entry_fill_mode"] == fill_mode]
         frame["return"] = frame[f"net_{horizon}m_return"]
         keep = (
             frame["entry_px"].notna()
@@ -437,7 +442,11 @@ def main(argv: list[str] | None = None) -> int:
         "--fill-mode",
         choices=("last-before", "first-after"),
         default="last-before",
-        help="Entry convention used when pricing (report label only).",
+        help=(
+            "Entry convention recorded by alert_outcomes.py. Rows priced with "
+            "the other convention are dropped (the column is written by newer "
+            "priced files; older files keep every row)."
+        ),
     )
     parser.add_argument(
         "--max-entry-delay-ms",
@@ -463,6 +472,7 @@ def main(argv: list[str] | None = None) -> int:
         args.tag,
         args.max_entry_delay_ms,
         args.max_entry_age_ms,
+        args.fill_mode,
     )
     if frame.empty:
         raise SystemExit("No priced alerts found; run alert_outcomes.py first.")

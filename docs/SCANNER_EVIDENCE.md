@@ -50,7 +50,16 @@ Two entry conventions are supported by `src/alert_outcomes.py`:
 
 `--min-quote-sol` defaults to 0.01 so a dust print cannot become a win. The
 same ceiling applies to the entry delay (`--max-entry-delay-ms`, default
-60,000) because the live bot gives up at 60 s.
+60,000) because the live bot gives up at 60 s. `--action` and `--entry-side`
+must not select disjoint prints (`--action sell --entry-side buy` is
+rejected instead of silently producing zero fills), and the day-end
+`last-before` fallback only uses a print of the requested entry side.
+
+The live engine applies the same timing rule: a card Telegram delivered more
+than `--max-delivery-lag-ms` (60 s) after it was posted is skipped, in both
+trade and timer entry modes. `compare_channels.py --fill-mode` filters on the
+`entry_fill_mode` column written by `alert_outcomes.py`, so rows priced with
+different conventions cannot be mixed.
 
 Reproduce a day (≈4–5 min each, reads the replay archive):
 
@@ -215,22 +224,40 @@ Do not fund this lane until a forward paper run shows **all** of:
 
 1. **≥300 trades over at least 5 days** (the feed produces ~450 in-band
    alerts/day, so this is a time-coverage gate as much as a sample-size one).
-2. **Realized win rate ≥80 %.** On actual fills, not marks. The backtest is
-   97.2 % marked and 82.7 % with stale exits written off; below 80 % the edge
-   is gone.
+2. **Positive realized edge.** Total realized net SOL > 0, and the 95 %
+   bootstrap lower bound on total PnL is not below −5 % of starting capital
+   (0.5 SOL at 10 SOL). A raw win-rate gate is not sufficient: at 80 % win,
+   +21.9 % average win and 20 % rugs, expectancy is −2.5 % per trade, so a
+   run can clear an 80 % gate and still lose money. Realized PnL and
+   expectancy are in `summary.json` (`pnl_sol`, `expectancy_sol`,
+   `win_rate`); bootstrap the `pnl_sol` column of `trades.jsonl`.
 3. **Realized median net return ≥+10 %.** Backtest +22.0 % marked, +19.1 %
    with stale exits written off.
-4. **Under 20 % of exits written off.** Count `trades.jsonl` rows whose
-   `exit_reason` is `no_route` (or `wallet.write_offs` in `summary.json`); the
-   backtest write-off rate is 15.9 %.
+4. **Tail risk under the backtest bound.** Catastrophic exits
+   (`return_pct <= -0.90`) must stay under **16 %** of closed trades; the
+   backtest's stale-exit write-off rate is 15.9 %. Count `no_route` /
+   `unsold_size` write-offs separately and require those under 16 % too.
+   A flat pool can fill a near-zero quote instead of erroring, so
+   `exit_reason == "no_route"` alone understates the loss tail: the first
+   forward run had **0** `no_route` exits and **17.6 %** catastrophic exits.
 5. **No systematic entry failure.** `entry_delay_exceeded` /
    `entry_quote_failed` above ~10 % of in-band alerts means the bot is not
    taking the trades the backtest measured, regardless of the realized win
    rate.
 
-If 2 or 3 fails while 5 passes, the edge did not survive the move from replay
-to live and the lane should be retired, not retuned. Do not re-fit the rule on
-the forward sample: that turns the gate into a second in-sample fit.
+If 2, 3 or 4 fails while 5 passes, the edge did not survive the move from
+replay to live and the lane should be retired, not retuned. Do not re-fit the
+rule on the forward sample: that turns the gate into a second in-sample fit.
+
+### First forward snapshot (2026-11-22, not a pass)
+
+18 h 40 m, 335 closed trades: **−0.042 SOL**, 79.7 % win, +16.7 % median,
+17.6 % catastrophic exits, zero `no_route` write-offs, all 337 entries filled.
+It fails the time-coverage gate and the tail gate, and its win rate is
+statistically indistinguishable from 80 %. The bootstrap 95 % CI for total PnL
+is −1.81 to +1.66 SOL with P(>0) = 0.49: flat, not evidence of an edge in
+either direction. Keep the lane paper-only until a full 5-day sample clears
+gates 1–5.
 
 ## Known limitations
 

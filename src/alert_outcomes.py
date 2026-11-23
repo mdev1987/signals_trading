@@ -249,18 +249,21 @@ def stream_day(
 
     # Fill targets whose decision timestamp is after the last trade of the day.
     # ``first-after`` has nothing to buy once the tape stops, so it stays
-    # unpriced there; ``last-before`` falls back to the final print. Exits are
-    # backfilled either way.
+    # unpriced there; ``last-before`` falls back to the final eligible print.
+    # The fallback uses ``last_entry`` (already filtered to ``entry_side``), not
+    # the unfiltered ``last`` print: with ``--entry-side buy`` falling back to a
+    # closing SELL would price a buy the deployed engine could never take.
     for mint, mint_targets in by_mint.items():
         previous = last.get(mint)
         if previous is None:
             continue
         timestamp, price = previous
-        entry_fill = last_entry.get(mint, (timestamp, price, ""))
+        entry_fill = last_entry.get(mint)
         for target in mint_targets:
             if (
                 entry_fill_mode == "last-before"
                 and target["entry_px"] is None
+                and entry_fill is not None
                 and entry_fill[0] <= target["entry_target"]
             ):
                 target["entry_ts"], target["entry_px"] = entry_fill[:2]
@@ -283,12 +286,14 @@ def build_frame(
     *,
     max_entry_age_ms: int = 0,
     max_entry_delay_ms: int = 60_000,
+    entry_fill_mode: str = "last-before",
 ) -> pd.DataFrame:
     rows = []
     for target in targets:
         row = dict(target["row"])
         alert_ts = target["alert_ts"]
         row["latency_ms"] = latency_ms
+        row["entry_fill_mode"] = entry_fill_mode
         row["entry_ts"] = target["entry_ts"]
         row["entry_px"] = target["entry_px"]
         # Negative for ``first-after``: the fill happens after the decision.
@@ -317,6 +322,7 @@ def build_frame(
             # Drop the entry so the row is excluded from returns.
             row["entry_ts"] = None
             row["entry_px"] = None
+            row["entry_side"] = None
             row["entry_price_age_ms"] = None
             row["entry_delay_ms"] = None
         row["first_trade_ts"] = target["first_trade_ts"]
@@ -424,6 +430,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if (
+        args.action != "any"
+        and args.entry_side != "any"
+        and args.action != args.entry_side
+    ):
+        # Every print is filtered by --action, then the entry needs a print of
+        # --entry-side. Disjoint sides silently yield zero priced entries.
+        parser.error(
+            f"--action {args.action!r} and --entry-side {args.entry_side!r} "
+            "select disjoint prints; set --entry-side to the same side or "
+            "'any'"
+        )
+
     horizons = sorted(set(args.horizons))
     targets = load_targets(args.day, args.latency_ms, horizons)
     print(f"{args.day}: {len(targets)} alerts over {len({t['row']['mint'] for t in targets})} mints")
@@ -444,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         args.fee_rate,
         max_entry_age_ms=args.max_entry_age_ms,
         max_entry_delay_ms=args.max_entry_delay_ms,
+        entry_fill_mode=args.entry_fill_mode,
     )
 
     suffix = f"_{args.tag}" if args.tag else ""

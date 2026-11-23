@@ -161,6 +161,42 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--entry-delay-ms", type=int, default=5_000)
     parser.add_argument("--max-entry-delay-ms", type=int, default=120_000)
+    parser.add_argument(
+        "--max-delivery-lag-ms",
+        type=int,
+        default=60_000,
+        help=(
+            "Skip a card Telegram delivered later than this after it was "
+            "posted (0 disables). The research convention gives up at 60 s."
+        ),
+    )
+    parser.add_argument(
+        "--max-concurrent-positions",
+        type=int,
+        default=10,
+        help=(
+            "Cap open positions plus pending entries; the scanner backtest "
+            "assumed at most 10 at once (0 = unlimited)."
+        ),
+    )
+    parser.add_argument(
+        "--max-daily-loss-sol",
+        type=float,
+        default=0.0,
+        help=(
+            "Stop opening positions after this much realized loss in the UTC "
+            "day (0 disables). A risk control, not part of the edge."
+        ),
+    )
+    parser.add_argument(
+        "--entry-retry-backoff-ms",
+        type=int,
+        default=1_000,
+        help=(
+            "Minimum gap between quote attempts for the same mint while "
+            "waiting for its first routable BUY print."
+        ),
+    )
     parser.add_argument("--safety-screen", action="store_true")
     parser.add_argument("--allow-candidate-address", action="store_true")
     parser.add_argument("--pumpapi-url", default="wss://stream.pumpapi.io/")
@@ -381,6 +417,10 @@ def main() -> int:
             jito_tip_lamports=args.jito_tip_lamports,
             entry_delay_ms=args.entry_delay_ms,
             max_entry_delay_ms=args.max_entry_delay_ms,
+            max_delivery_lag_ms=args.max_delivery_lag_ms,
+            max_concurrent_positions=args.max_concurrent_positions,
+            max_daily_loss_sol=args.max_daily_loss_sol,
+            entry_retry_backoff_ms=args.entry_retry_backoff_ms,
             safety_screen=args.safety_screen,
             allow_candidate_address=args.allow_candidate_address,
             pumpapi_url=args.pumpapi_url,

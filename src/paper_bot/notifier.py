@@ -824,6 +824,21 @@ class TelegramReporter:
         if rule is not None:
             self.rule = rule
 
+    def wallet_snapshot(self) -> dict[str, Any] | None:
+        """Cash plus open token balances marked at the last feed price.
+
+        ``PaperWallet.equity_sol`` counts an unmarked token as zero, so calling
+        ``wallet.snapshot()`` with positions open reported cash only. The
+        engine already holds the market history; ask it for the marked view.
+        """
+        if self.engine is not None:
+            snapshot = getattr(self.engine, "wallet_snapshot", None)
+            if callable(snapshot):
+                marked = snapshot()
+                if marked is not None:
+                    return marked
+        return self.wallet.snapshot() if self.wallet is not None else None
+
     # -- lifecycle ------------------------------------------------------
     async def start(self) -> bool:
         if not self.enabled or self._started:
@@ -1086,7 +1101,7 @@ class TelegramReporter:
         await self.send_markdown(
             format_status(
                 stats=self.stats or ReporterStats(starting_sol=0.0),
-                wallet=self.wallet.snapshot() if self.wallet is not None else None,
+                wallet=self.wallet_snapshot(),
                 positions=positions,
                 pending=pending,
                 rule=self.rule,
@@ -1141,7 +1156,7 @@ class TelegramReporter:
             wait_s = max(60.0, (next_midnight - now).total_seconds())
             await asyncio.sleep(wait_s)
             if self.stats is not None:
-                wallet = self.wallet.snapshot() if self.wallet is not None else None
+                wallet = self.wallet_snapshot()
                 await self.send_markdown(format_daily_summary(self.stats, wallet))
 
 

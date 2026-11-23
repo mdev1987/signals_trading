@@ -75,10 +75,6 @@ _MEMORY: dict[str, float] = {"peak_mb": 0.0}
 # arriving a median ~16 s late; this distinguishes "the process was busy" from
 # "Telegram delivered late" without shelling into the host.
 _LOOP_LAG: dict[str, float] = {"max_ms": 0.0, "last_ms": 0.0}
-# Scanner feed telemetry: the channel posts each pool ~3x, and only the first
-# card is traded. Counted so skips.jsonl does not have to guess why two thirds
-# of the cards produced no signal.
-_SCANNER: dict[str, int] = {"cards": 0, "duplicates": 0}
 
 
 @dataclass(slots=True)
@@ -111,6 +107,20 @@ class LiveConfig:
     jito_tip_lamports: int | None = None
     entry_delay_ms: int = 5_000
     max_entry_delay_ms: int = 120_000
+    # Skip a signal Telegram delivered later than this after the card was
+    # posted. The research convention prices card + 5 s and gives up at
+    # card + 60 s, so a card that arrives minutes late is not a measured trade.
+    # 0 disables the check (replay/testing only).
+    max_delivery_lag_ms: int = 60_000
+    # The scanner backtest assumed at most 10 concurrent positions; this bound
+    # also counts pending entries. 0 means unlimited.
+    max_concurrent_positions: int = 10
+    # Optional UTC-day realized-loss circuit breaker in SOL. 0 disables it. It
+    # is a risk control, not part of the backtested edge.
+    max_daily_loss_sol: float = 0.0
+    # Minimum gap between quote attempts for the same mint while waiting for
+    # its first routable BUY print.
+    entry_retry_backoff_ms: int = 1_000
     safety_screen: bool = False
     allow_candidate_address: bool = False
     pumpapi_url: str = DEFAULT_PUMPAPI_URL
@@ -208,6 +218,14 @@ class LiveConfig:
             raise ValueError("entry_delay_ms must be non-negative")
         if self.max_entry_delay_ms < self.entry_delay_ms:
             raise ValueError("max_entry_delay_ms must be >= entry_delay_ms")
+        if self.max_delivery_lag_ms < 0:
+            raise ValueError("max_delivery_lag_ms must be non-negative")
+        if self.max_concurrent_positions < 0:
+            raise ValueError("max_concurrent_positions must be non-negative")
+        if self.max_daily_loss_sol < 0:
+            raise ValueError("max_daily_loss_sol must be non-negative")
+        if self.entry_retry_backoff_ms < 0:
+            raise ValueError("entry_retry_backoff_ms must be non-negative")
         if self.exit_quote_timeout_ms <= 0:
             raise ValueError("exit_quote_timeout_ms must be positive")
         if self.shutdown_timeout_ms <= 0:
@@ -379,6 +397,10 @@ def _lane_meta(
         "horizon_min": config.horizon_min,
         "entry_delay_ms": config.entry_delay_ms,
         "max_entry_delay_ms": config.max_entry_delay_ms,
+        "max_delivery_lag_ms": config.max_delivery_lag_ms,
+        "max_concurrent_positions": config.max_concurrent_positions,
+        "max_daily_loss_sol": config.max_daily_loss_sol,
+        "entry_retry_backoff_ms": config.entry_retry_backoff_ms,
         "tp_pct": config.tp_pct,
         "sl_pct": config.sl_pct,
         "fee": config.fee,
@@ -464,6 +486,10 @@ def _create_lane(
             entry_delay_ms=config.entry_delay_ms,
             entry_mode=entry_mode,
             max_entry_delay_ms=config.max_entry_delay_ms,
+            max_delivery_lag_ms=config.max_delivery_lag_ms,
+            max_concurrent_positions=config.max_concurrent_positions,
+            max_daily_loss_sol=config.max_daily_loss_sol,
+            entry_retry_backoff_ms=config.entry_retry_backoff_ms,
             horizon_ms=int(config.horizon_min * 60_000),
             tp_pct=config.tp_pct,
             sl_pct=config.sl_pct,
@@ -695,6 +721,15 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
     # ignore the repeats (bounded like ``seen``).
     scanner_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
 
+    # Scanner feed telemetry, local to this run: the channel posts each pool
+    # ~3x, and only the first card is traded. Keyed by (channel, mint) so an
+    # A/B run with two scanner lanes counts each card once, not once per lane.
+    scanner_stats: dict[str, int] = {"cards": 0, "duplicates": 0}
+    scanner_lane = next(
+        (lane for lane in lanes if lane.rule == SCANNER_RULE), None
+    )
+    scanner_counted: OrderedDict[tuple[str, str], None] = OrderedDict()
+
     async def on_message(
         *,
         channel: str,
@@ -718,19 +753,29 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             )
             signal.features["strategy_tag"] = lane.name
             if (
+                lane is scanner_lane
+                and signal.message_type == SCANNER_MESSAGE_TYPE
+            ):
+                count_key = (channel, signal.token_address)
+                if count_key in scanner_counted:
+                    scanner_stats["duplicates"] += 1
+                else:
+                    scanner_stats["cards"] += 1
+                    scanner_counted[count_key] = None
+                    if len(scanner_counted) > config.message_dedup_window:
+                        scanner_counted.popitem(last=False)
+            if (
                 lane.rule == SCANNER_RULE
                 and signal.message_type == SCANNER_MESSAGE_TYPE
             ):
                 scanner_key = (lane.name, signal.token_address)
                 if scanner_key in scanner_seen:
-                    _SCANNER["duplicates"] += 1
                     LOGGER.debug(
                         "scanner duplicate card lane=%s %s",
                         lane.name,
                         signal.token_address,
                     )
                     continue
-                _SCANNER["cards"] += 1
                 scanner_seen[scanner_key] = None
                 if len(scanner_seen) > config.message_dedup_window:
                     scanner_seen.popitem(last=False)
@@ -920,8 +965,8 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         "pending_entries": len(lane.engine.pending),
                         "wallet": lane.wallet_snapshot,
                         "shutdown_reason": shutdown_reason,
-                        "scanner_cards": _SCANNER["cards"],
-                        "scanner_duplicates": _SCANNER["duplicates"],
+                        "scanner_cards": scanner_stats["cards"],
+                        "scanner_duplicates": scanner_stats["duplicates"],
                         "stopped_at": datetime.now(UTC).isoformat(),
                     }
                 )

@@ -52,6 +52,8 @@ PYTHONPATH=src .venv/bin/python -m paper_bot live \
   --channel @AveSolanaTokenScanner \
   --entry-mode trade \
   --max-entry-delay-ms 60000 \
+  --max-delivery-lag-ms 60000 \
+  --max-concurrent-positions 10 \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --slippage-bps 50 \
@@ -150,6 +152,12 @@ What to watch in the first days:
 - `gate_rejected` reasons `rule_dex_not_pumpfunamm` and `rule_liquidity_*` are normal: the channel posts ~2,800 pools a day and only ~465 are in the band.
 - `skip` reasons on entries that do pass: `entry_delay_exceeded`, `entry_quote_failed`, `no_quote` are the real risk. A lane that cannot fill never had the backtested edge.
 - `Jupiter ... needed N bps` warnings show how often the widening ladder rescued a trade.
+- `delivery_lag_exceeded` and `max_concurrent_positions` skips mean the bot
+  refused a signal the backtest would have taken; keep them near zero.
+- `summary.json` now reports `catastrophic_exit_rate` (`return_pct <= -0.90`)
+  next to `write_off_rate`, plus entry-delay and delivery-lag percentiles.
+  A near-zero `write_off_rate` with a high catastrophic rate is the drained-
+  pool case: the token quoted a tiny amount instead of erroring.
 - Compare the realized median and win rate with the deployed-convention
   backtest (first buy print at/after card + 5 s, exit +5 min): 97.2 % win,
   +22.0 % median over 1,818 trades. The exit is the fragile side: 16 % of the
@@ -168,5 +176,7 @@ What to watch in the first days:
 - Do **not** modify `execution_simulator.py`.
 - Do **not** commit `.env`, `config.ini`, or `*.session` — all gitignored.
 - Fund the strategy only after the forward paper run passes the gates in
-  `docs/SCANNER_EVIDENCE.md`: ≥300 trades, realized win ≥80 %, realized
-  median ≥+10 %, and under 20 % of exits written off.
+  `docs/SCANNER_EVIDENCE.md`: ≥300 trades over ≥5 days, positive realized PnL
+  with a bootstrap lower bound above −5 % of starting capital, realized
+  median ≥+10 %, catastrophic exits (`return_pct <= −0.90`) under 16 %, and
+  `no_route` write-offs under 16 %.

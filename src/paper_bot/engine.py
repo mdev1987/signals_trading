@@ -31,6 +31,7 @@ import math
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -103,6 +104,18 @@ class SafetyConfig:
 class EngineConfig:
     entry_delay_ms: int = 5_000
     max_entry_delay_ms: int = 120_000
+    # Skip a signal Telegram delivered more than this long after the channel
+    # posted it. The research convention prices the first BUY at card + 5 s and
+    # gives up at card + 60 s; a card that arrives minutes late would otherwise
+    # be traded at a fill the backtest never measured. 0 disables the check.
+    max_delivery_lag_ms: int = 60_000
+    # Cap simultaneous positions and pending entries. The scanner backtest
+    # assumed at most 10 concurrent; the live engine had no cap, so a burst
+    # could open more than the evidence covers. 0 means unlimited.
+    max_concurrent_positions: int = 10
+    # Optional daily loss circuit breaker, in SOL of realized PnL (UTC day).
+    # 0 disables it. It is a risk control, not part of the backtested edge.
+    max_daily_loss_sol: float = 0.0
     # "trade": wait for the first BUY print at/after the delay (historical
     # behaviour). "timer": quote at the delay regardless of prints, which is
     # what the research backtest assumes (entry at signal + ~5 s).
@@ -132,6 +145,16 @@ class EngineConfig:
             )
         if self.entry_mode == "timer" and not self.live:
             raise ValueError("entry_mode='timer' requires live=True")
+        if self.entry_delay_ms < 0 or self.max_entry_delay_ms < 0:
+            raise ValueError("entry delays must be non-negative")
+        if self.max_entry_delay_ms < self.entry_delay_ms:
+            raise ValueError("max_entry_delay_ms must be >= entry_delay_ms")
+        if self.max_delivery_lag_ms < 0:
+            raise ValueError("max_delivery_lag_ms must be non-negative")
+        if self.max_concurrent_positions < 0:
+            raise ValueError("max_concurrent_positions must be non-negative")
+        if self.max_daily_loss_sol < 0:
+            raise ValueError("max_daily_loss_sol must be non-negative")
 
 
 def entry_backoff_active(
@@ -192,6 +215,8 @@ class PaperEngine:
         self.signal_log: list[tuple[Signal, GateDecision]] = []
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
+        # Realized PnL by UTC day, used only by the optional daily loss cap.
+        self._daily_pnl: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -206,9 +231,30 @@ class PaperEngine:
             self._locks[mint] = lock
         return lock
 
-    def _wallet_snapshot(self) -> dict[str, Any] | None:
+    def wallet_snapshot(self) -> dict[str, Any] | None:
+        """Snapshot cash plus any open token balance at its last feed price.
+
+        ``PaperWallet.equity_sol`` treats an unmarked token as zero, so calling
+        ``snapshot()`` while a position is open used to report cash only and
+        understate equity by the open notional. The history already holds the
+        last print for every watched mint, so mark the balances here.
+        """
         wallet = getattr(self.broker, "wallet", None)
-        return wallet.snapshot() if wallet is not None else None
+        if wallet is None:
+            return None
+        marks: dict[str, float] = {}
+        for mint in list(wallet.token_balances):
+            price, _ts = self.history.last_price(mint)
+            if price is not None and price > 0:
+                marks[mint] = price
+        return wallet.snapshot(marks)
+
+    @staticmethod
+    def _day_key(ts_ms: int) -> str:
+        return datetime.fromtimestamp(ts_ms / 1000, UTC).date().isoformat()
+
+    def _day_pnl(self, ts_ms: int) -> float:
+        return self._daily_pnl.get(self._day_key(ts_ms), 0.0)
 
     @staticmethod
     def _emit(callback: Any, *args: Any) -> None:
@@ -364,6 +410,66 @@ class PaperEngine:
                     features=decision.features,
                 )
                 rejection_reason = "duplicate_pending_signal"
+            elif (
+                self.config.max_delivery_lag_ms > 0
+                and signal.received_ts_ms > 0
+                and signal.received_ts_ms - signal.signal_ts_ms
+                > self.config.max_delivery_lag_ms
+            ):
+                # The card itself is stale. Both entry modes anchor on the
+                # card (trade mode directly, timer mode at receipt + delay),
+                # so acting now would price a fill the research convention
+                # never measured. Applies to timer mode too: the deployed
+                # lane must not trade a card delivered minutes late.
+                lag_ms = signal.received_ts_ms - signal.signal_ts_ms
+                final = GateDecision(
+                    allowed=False,
+                    rule=decision.rule,
+                    reasons=["delivery_lag_exceeded"],
+                    features=decision.features,
+                )
+                rejection_reason = "delivery_lag_exceeded"
+                rejection_detail = (
+                    f"delivery_lag_ms={lag_ms};"
+                    f"max={self.config.max_delivery_lag_ms}"
+                )
+            elif (
+                self.config.max_concurrent_positions > 0
+                and len(self.positions) + len(self.pending)
+                >= self.config.max_concurrent_positions
+            ):
+                # Count pending entries too: they will become positions, and
+                # the backtest only covers the configured number at once.
+                final = GateDecision(
+                    allowed=False,
+                    rule=decision.rule,
+                    reasons=["max_concurrent_positions"],
+                    features=decision.features,
+                )
+                rejection_reason = "max_concurrent_positions"
+                rejection_detail = (
+                    f"open={len(self.positions)};pending={len(self.pending)};"
+                    f"max={self.config.max_concurrent_positions}"
+                )
+            elif (
+                self.config.max_daily_loss_sol > 0
+                and self._day_pnl(self._now())
+                <= -self.config.max_daily_loss_sol
+            ):
+                # A risk control, not part of the backtested edge: stop opening
+                # new positions once the UTC day's realized loss hits the cap.
+                final = GateDecision(
+                    allowed=False,
+                    rule=decision.rule,
+                    reasons=["daily_loss_limit"],
+                    features=decision.features,
+                )
+                rejection_reason = "daily_loss_limit"
+                rejection_detail = (
+                    f"day={self._day_key(self._now())};"
+                    f"pnl={self._day_pnl(self._now()):.6f};"
+                    f"limit=-{self.config.max_daily_loss_sol:.6f}"
+                )
 
         if rejection_reason is not None:
             if final.features is not decision.features:
@@ -671,7 +777,7 @@ class PaperEngine:
                 async with self._lock(pending.mint):
                     if self.pending.get(pending.mint) is not pending:
                         return
-                    wallet_before = self._wallet_snapshot()
+                    wallet_before = self.wallet_snapshot()
                     try:
                         self.broker.reserve(entry, pending.mint)
                     except QuoteError as exc:
@@ -680,7 +786,7 @@ class PaperEngine:
                             pending, "entry_insufficient_sol", exc.reason
                         )
                         return
-                    wallet_after = self._wallet_snapshot()
+                    wallet_after = self.wallet_snapshot()
                     del self.pending[pending.mint]
                     pending.timer_task = None
                     tp_level = (
@@ -818,7 +924,7 @@ class PaperEngine:
     ) -> None:
         if position.exit_requested:
             return
-        position.wallet_before_exit = self._wallet_snapshot()
+        position.wallet_before_exit = self.wallet_snapshot()
         position.exit_requested = True
         position.exit_reason = reason
         position.exit_status = status
@@ -1097,8 +1203,15 @@ class PaperEngine:
             features=dict(position.signal.features),
             exit_fill_count=position.exit_fill_count,
             unsold_size=position.unsold_size,
+            received_ts_ms=position.signal.received_ts_ms,
+            delivery_lag_ms=max(
+                0,
+                position.signal.received_ts_ms - position.signal.signal_ts_ms,
+            ),
         )
         self.closed.append(trade)
+        day = self._day_key(trade.exit_ts_ms)
+        self._daily_pnl[day] = self._daily_pnl.get(day, 0.0) + trade.pnl_sol
         if self.store is not None:
             self.store.record_trade(trade)
         self.positions.pop(position.mint, None)
@@ -1106,7 +1219,7 @@ class PaperEngine:
             self.on_close,
             trade,
             position.wallet_before_exit,
-            self._wallet_snapshot(),
+            self.wallet_snapshot(),
         )
         self._release_mint(position.mint)
 

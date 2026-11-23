@@ -62,9 +62,16 @@ version = 1
 #   trades.jsonl   entry_delay_ms plus realized exits; exit_reason ==
 #                  "no_route" is a write-off, not a mark
 #   skips.jsonl    why a signal did not become a trade
-# A forward run passes only with >=300 trades over >=5 days, realized win
-# >=80 %, realized median >=+10 %, <20 % exits written off, and entry
-# failures under ~10 % of in-band alerts (details in the evidence doc).
+# A forward run passes only with >=300 trades over >=5 days, positive realized
+# PnL with a bootstrap lower bound above -5 % of starting capital, realized
+# median >=+10 %, catastrophic exits (return_pct <= -0.90) under 16 %, and
+# no_route write-offs under 16 % (details in the evidence doc). Entry guards:
+# a card delivered more than --max-delivery-lag-ms after it was posted is
+# skipped, and positions+pending entries are capped at
+# --max-concurrent-positions. Leave --max-daily-loss-sol at 0 in paper: a cap
+# would censor the forward sample the gates are measured on. For a funded run,
+# a 1.0 SOL UTC-day cap (10 % of the 10 SOL bankroll) is a sensible backstop;
+# it is a risk control, not part of the backtested edge.
 #
 # One-time setup:
 #   cd /home/mdev/Programming/signals_trading
@@ -83,7 +90,7 @@ name = "paper-bot"
 # The package lives under `src/`, so PYTHONPATH is set here instead of
 # installing the research repo as a wheel. `--no-sync` is unnecessary because
 # this runs the venv directly, so a restart never touches the network.
-command = "env PYTHONPATH=/home/mdev/Programming/signals_trading/src /home/mdev/Programming/signals_trading/.venv/bin/python -m paper_bot live --mode paper --rule scanner_pumpfun_amm --channel @AveSolanaTokenScanner --entry-mode trade --entry-delay-ms 5000 --max-entry-delay-ms 60000 --horizon-min 5 --notional-sol 0.1 --starting-sol 10 --slippage-bps 50 --max-slippage-bps 1000 --priority-fee-lamports 2000 --jito-tip-lamports 10000 --fee 0.0125 --history-horizon-min 10 --history-max-mints 10000 --history-max-events-per-mint 3000 --history-max-total-events 150000 --tick-interval 1.0 --dex-interval 2.0 --memory-limit-mb 550 --memory-report-s 300 --shutdown-timeout-ms 25000"
+command = "env PYTHONPATH=/home/mdev/Programming/signals_trading/src /home/mdev/Programming/signals_trading/.venv/bin/python -m paper_bot live --mode paper --rule scanner_pumpfun_amm --channel @AveSolanaTokenScanner --entry-mode trade --entry-delay-ms 5000 --max-entry-delay-ms 60000 --max-delivery-lag-ms 60000 --max-concurrent-positions 10 --entry-retry-backoff-ms 1000 --horizon-min 5 --notional-sol 0.1 --starting-sol 10 --slippage-bps 50 --max-slippage-bps 1000 --priority-fee-lamports 2000 --jito-tip-lamports 10000 --fee 0.0125 --history-horizon-min 10 --history-max-mints 10000 --history-max-events-per-mint 3000 --history-max-total-events 150000 --tick-interval 1.0 --dex-interval 2.0 --memory-limit-mb 550 --memory-report-s 300 --shutdown-timeout-ms 25000"
 cwd = "/home/mdev/Programming/signals_trading"
 restart_policy = "always"
 max_restarts = 100

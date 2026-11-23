@@ -240,6 +240,11 @@ class ClosedTrade:
     features: dict[str, Any] = field(default_factory=dict)
     exit_fill_count: int = 1
     unsold_size: float = 0.0
+    # Telegram delivery lag (received - posted) and the lag at which the trade
+    # actually entered. ``entry_delay_ms`` above is measured from the card, so
+    # this separates "slow signal" from "slow engine".
+    received_ts_ms: int = 0
+    delivery_lag_ms: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

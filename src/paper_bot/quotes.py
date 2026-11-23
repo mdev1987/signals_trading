@@ -41,7 +41,6 @@ class QuoteError(RuntimeError):
 PERMANENT_QUOTE_ERRORS = frozenset(
     {
         "quote_bad_request",
-        "quote_zero_out",
         "quote_zero_amount",
         "quote_zero_price",
         "invalid_fill_price",
@@ -52,6 +51,12 @@ PERMANENT_QUOTE_ERRORS = frozenset(
         "unknown_decimals",
     }
 )
+# ``quote_zero_out`` (a zero outAmount) is not in the set above on purpose.
+# A seconds-old pool can quote zero once and route on the next print, so for an
+# entry it is a *time* problem like ``quote_not_ready``. For an exit, however,
+# a zero output after the exit timeout means there is nothing to sell into and
+# the position is written off; ``is_terminal_exit_error`` keeps that asymmetry.
+
 
 # Reasons where a wider slippage tolerance can turn a miss into a route. A new
 # Pumpfun AMM pool frequently quotes at 100-500 bps while failing at 50.
@@ -66,6 +71,12 @@ ESCALATABLE_QUOTE_ERRORS = frozenset(
         "quote_missing_out_amount",
     }
 )
+
+# Reasons where repeating the identical request inside one call is pointless:
+# the pool is not indexed yet and the engine retries on the next BUY print
+# (with ``entry_retry_backoff_ms`` between attempts). ``_order`` therefore
+# stops after the first such failure instead of spending ``retries`` requests.
+RETRY_ON_NEXT_PRINT_QUOTE_ERRORS = frozenset({"quote_not_ready"})
 
 # 10 % is the ceiling: beyond it an "exit" is worse than marking the position
 # and letting the operator see it, and a buy at that tolerance is no longer the
@@ -116,9 +127,14 @@ def is_terminal_exit_error(reason: str | None) -> bool:
     """Return whether a failed sale means the tokens are unsellable.
 
     A missing route is terminal for an exit (nothing to sell into) but not for
-    an entry, which is why it needs its own predicate.
+    an entry, which is why it needs its own predicate. A zero output is also
+    terminal for an exit after the exit timeout: it is the drained-pool case
+    that would otherwise be marked at a feed price the market refuses to pay.
     """
-    return reason in PERMANENT_QUOTE_ERRORS or reason == "quote_no_route"
+    return (
+        reason in PERMANENT_QUOTE_ERRORS
+        or reason in {"quote_no_route", "quote_zero_out"}
+    )
 
 
 class TokenMetadataResolver:
@@ -358,10 +374,13 @@ class JupiterQuoteProvider:
 
             if last_error is not None and (
                 last_error.reason in ESCALATABLE_QUOTE_ERRORS
+                or last_error.reason in RETRY_ON_NEXT_PRINT_QUOTE_ERRORS
             ):
                 # Widen the tolerance instead of repeating the identical
                 # request: a pool created seconds ago rarely becomes routable
-                # at the same slippage on the next attempt.
+                # at the same slippage on the next attempt. ``quote_not_ready``
+                # is the other case: no tolerance helps, and the engine will
+                # retry on a later print, so do not burst requests here.
                 break
             if attempt + 1 < self.retries:
                 await asyncio.sleep(self.backoff_s * (2**attempt))
