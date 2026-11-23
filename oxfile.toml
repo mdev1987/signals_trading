@@ -73,6 +73,16 @@ version = 1
 # a 1.0 SOL UTC-day cap (10 % of the 10 SOL bankroll) is a sensible backstop;
 # it is a risk control, not part of the backtested edge.
 #
+# Restart continuity (paper only): every paper start writes
+# output/recovery/scanner_pumpfun_amm_trade.json with the wallet and open
+# positions. Adding `--resume` to the command below makes an oxmgr restart
+# continue the same run directory instead of opening a new timestamped one.
+# The flag is fail-closed: if the saved state is missing (the very first start
+# of a run), corrupt, or written for a different strategy/entry configuration,
+# the bot refuses to start rather than silently beginning a new sample. Start
+# once without `--resume` to seed the file, then add the flag. Live mode never
+# restores local state; its balances come from the chain.
+#
 # One-time setup:
 #   cd /home/mdev/Programming/signals_trading
 #   uv sync                              # .venv with bot dependencies

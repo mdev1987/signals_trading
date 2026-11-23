@@ -20,6 +20,10 @@
 #   SOLANA_RPC_URL         — required only for live mode
 #   LIVE_TRADING_ENABLED=1 — required only for live mode (fails closed otherwise)
 #   LIVE_MAX_SLIPPAGE_BPS  — optional ceiling for the quote widening ladder (default 1000)
+#   DAILY_LOSS_SOL         — live-mode daily realized-loss cap in SOL (default 1.0; 0 disables)
+#   RESUME=1               — paper only: continue the saved wallet, open positions and
+#                            original run directory after a restart (fail-closed if the
+#                            saved state is missing or from another configuration)
 #   TELEGRAM_BOT_TOKEN     — required for Telegram reports
 #   TELEGRAM_CHAT_ID       — required for Telegram reports
 set -euo pipefail
@@ -40,6 +44,23 @@ if [[ "$MODE" != "paper" && "$MODE" != "live" ]]; then
   exit 1
 fi
 
+# Paper stays uncensored so the forward sample measures the raw strategy.
+# Live uses the documented 1 SOL daily realized-loss cap unless overridden.
+if [[ "$MODE" == "live" ]]; then
+  DAILY_LOSS_SOL="${DAILY_LOSS_SOL:-1.0}"
+else
+  DAILY_LOSS_SOL=0
+fi
+
+# Restart recovery is paper-only. Every paper start records a snapshot in
+# output/recovery/; RESUME=1 restores it instead of opening a new run dir, so a
+# crash or redeploy does not split the forward sample. The first start of a run
+# must not set RESUME (there is nothing to restore yet).
+RECOVERY_ARGS=()
+if [[ "$MODE" == "paper" && "${RESUME:-0}" == "1" ]]; then
+  RECOVERY_ARGS=(--resume)
+fi
+
 # Safety: refuse to start live mode unless the env opt-in is present.
 if [[ "$MODE" == "live" ]]; then
   if ! grep -q "^LIVE_TRADING_ENABLED=1$" .env 2>/dev/null && [[ "${LIVE_TRADING_ENABLED:-}" != "1" ]]; then
@@ -56,6 +77,8 @@ fi
 echo ">>> Starting paper_bot in $MODE mode"
 echo ">>> CWD: $SCRIPT_DIR"
 echo ">>> Strategy: scanner_pumpfun_amm on @AveSolanaTokenScanner (5 min hold)"
+echo ">>> Daily loss cap: ${DAILY_LOSS_SOL} SOL (0 disables)"
+echo ">>> Restart recovery: ${RESUME:-0} (paper state: output/recovery/scanner_pumpfun_amm_trade.json)"
 echo ">>> Logs: output/paper/bot_$(date +%Y%m%d).log  (Ctrl-C to stop; systemd restarts on crash)"
 
 mkdir -p output/paper
@@ -65,6 +88,7 @@ mkdir -p output/paper
 # ``--entry-mode trade`` fills on the first buy print after the card, which is
 # how the 4-day backtest priced the entry.
 exec "$VENV" -m paper_bot live \
+  "${RECOVERY_ARGS[@]+"${RECOVERY_ARGS[@]}"}" \
   --mode "$MODE" \
   --rule scanner_pumpfun_amm \
   --channel @AveSolanaTokenScanner \
@@ -80,6 +104,7 @@ exec "$VENV" -m paper_bot live \
   --timer-late-tolerance-ms 1_000 \
   --max-future-skew-ms 5_000 \
   --risk-state-dir output/risk \
+  --max-daily-loss-sol "$DAILY_LOSS_SOL" \
   --horizon-min 5 \
   --notional-sol 0.1 \
   --starting-sol 10 \

@@ -66,6 +66,24 @@ from .wallet import DUST_SIZE
 
 LOGGER = logging.getLogger(__name__)
 
+# Version 1 is the only supported on-disk daily-risk schema. Bump it when the
+# format changes so an older binary refuses to guess at a newer file.
+RISK_STATE_VERSION = 1
+
+
+def _reject_json_constant(value: str) -> None:
+    """``json.loads`` hook that refuses NaN/Infinity instead of accepting it."""
+    raise ValueError(f"non-finite JSON constant {value!r}")
+
+
+def _is_utc_day(value: str) -> bool:
+    """True only for a canonical ``YYYY-MM-DD`` calendar date."""
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return False
+    return parsed.strftime("%Y-%m-%d") == value
+
 
 def quote_detail(reason: str | None, detail: str | None) -> str | None:
     """Combine a machine quote reason with its upstream body for the record.
@@ -209,6 +227,51 @@ def entry_backoff_active(
     )
 
 
+# Monetary/quantity fields that must stay finite in a restored snapshot; a
+# NaN here would silently break the exit totals or the horizon mark.
+_RESTORED_POSITION_NUMBERS = (
+    "entry_price_sol",
+    "size",
+    "entry_value_sol",
+    "entry_fee_sol",
+    "entry_impact",
+    "sold_size",
+    "exit_price_acc",
+    "exit_value_acc",
+    "exit_fee_acc",
+    "pnl_acc",
+    "entry_basis_acc",
+    "entry_fee_acc",
+    "unsold_size",
+)
+
+
+def _validate_restored_position(position: Position) -> None:
+    """Reject a restored position whose numbers cannot be trusted."""
+    for name in _RESTORED_POSITION_NUMBERS:
+        value = getattr(position, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(
+                f"recovery state has a non-numeric {name} for {position.mint}"
+            )
+        if not math.isfinite(value):
+            raise RuntimeError(
+                f"recovery state has a non-finite {name} for {position.mint}"
+            )
+    if position.entry_price_sol <= 0:
+        raise RuntimeError(
+            f"recovery state has a non-positive entry price for {position.mint}"
+        )
+    if position.size < 0:
+        raise RuntimeError(
+            f"recovery state has a negative size for {position.mint}"
+        )
+    if position.horizon_ts_ms < position.entry_ts_ms:
+        raise RuntimeError(
+            f"recovery state has a horizon before entry for {position.mint}"
+        )
+
+
 class PaperEngine:
     def __init__(
         self,
@@ -230,6 +293,7 @@ class PaperEngine:
             [ClosedTrade, dict[str, Any] | None, dict[str, Any] | None], None
         ]
         | None = None,
+        on_state_change: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.config = config
         self.broker = broker
@@ -242,6 +306,7 @@ class PaperEngine:
         self.on_watch = on_watch
         self.on_entry = on_entry
         self.on_close = on_close
+        self.on_state_change = on_state_change
 
         self.pending: dict[str, PendingEntry] = {}
         self.positions: dict[str, Position] = {}
@@ -257,13 +322,11 @@ class PaperEngine:
         self._risk_state_error: str | None = None
         if self.config.risk_state_path is not None:
             if self.config.max_daily_loss_sol > 0:
-                # Fail closed at startup: if the cap is enabled, a corrupt or
-                # unwritable state path means the breaker cannot be trusted
-                # after a restart, so refusing to start beats running naked.
-                self._daily_pnl = self._load_risk_state()
-                if not self._daily_pnl:
-                    self._daily_pnl = self._restore_daily_pnl_from_store()
-                self._persist_daily_pnl(raise_on_error=True)
+                # Fail closed at startup. A corrupt or unwritable state path,
+                # or a state file that vanished after a previous initialization,
+                # means the breaker cannot be trusted after a restart, so
+                # refusing to start beats running naked.
+                self._initialize_risk_state_strict()
             else:
                 # Cap disabled: best effort only. A missing/corrupt file or an
                 # unwritable directory must not stop a paper run that does not
@@ -368,6 +431,136 @@ class PaperEngine:
         )
         return snapshot
 
+    # ------------------------------------------------------------------
+    # Restart recovery (paper mode)
+    # ------------------------------------------------------------------
+    def export_state(self) -> dict[str, Any]:
+        """Return the restartable wallet/position snapshot.
+
+        Pending entries are deliberately omitted: they live for at most the
+        60 s entry window and cannot be re-created with their original market
+        prints after a restart.
+        """
+        wallet = getattr(self.broker, "wallet", None)
+        wallet_state: dict[str, Any] = {}
+        token_balances: dict[str, float] = {}
+        if wallet is not None:
+            wallet_state = {
+                "sol_balance": float(wallet.sol_balance),
+                "fees_paid_sol": float(wallet.fees_paid_sol),
+                "entries": int(wallet.entries),
+                "exits": int(wallet.exits),
+                "write_offs": int(wallet.write_offs),
+            }
+            token_balances = {
+                str(mint): float(size)
+                for mint, size in wallet.token_balances.items()
+            }
+        return {
+            "wallet": wallet_state,
+            "token_balances": token_balances,
+            "positions": [
+                position.to_state_dict()
+                for position in self.positions.values()
+            ],
+        }
+
+    def restore_state(self, payload: dict[str, Any]) -> None:
+        """Apply a snapshot produced by :meth:`export_state`.
+
+        Positions already closed in ``trades.jsonl`` are dropped, which makes
+        a crash between the trade write and the snapshot write safe: the
+        position is not closed a second time.
+        """
+        wallet = getattr(self.broker, "wallet", None)
+        if wallet is None:
+            raise RuntimeError("cannot restore state without a paper wallet")
+        wallet_state = payload.get("wallet")
+        if not isinstance(wallet_state, dict):
+            raise RuntimeError("recovery state has no wallet object")
+        balances = payload.get("token_balances")
+        if not isinstance(balances, dict):
+            raise RuntimeError("recovery state has no token balances")
+        positions = payload.get("positions")
+        if not isinstance(positions, list):
+            raise RuntimeError("recovery state has no position list")
+
+        try:
+            sol_balance = float(wallet_state["sol_balance"])
+            fees_paid = float(wallet_state.get("fees_paid_sol", 0.0))
+            entries = int(wallet_state.get("entries", 0))
+            exits = int(wallet_state.get("exits", 0))
+            write_offs = int(wallet_state.get("write_offs", 0))
+            restored_balances = {
+                str(mint): float(size) for mint, size in balances.items()
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"recovery state has malformed wallet data: {exc}"
+            ) from exc
+        for label, value in (
+            ("sol_balance", sol_balance),
+            ("fees_paid_sol", fees_paid),
+            *((f"token balance {mint}", size) for mint, size in restored_balances.items()),
+        ):
+            if not math.isfinite(value):
+                raise RuntimeError(
+                    f"recovery state has a non-finite {label}"
+                )
+
+        closed: set[tuple[str, int]] = set()
+        loader = getattr(self.store, "closed_position_keys", None)
+        if callable(loader):
+            try:
+                closed = set(loader())
+            except Exception:  # noqa: BLE001 - do not abort a restart for this
+                LOGGER.exception("could not read closed positions for recovery")
+
+        restored: dict[str, Position] = {}
+        for item in positions:
+            try:
+                position = Position.from_state_dict(item)
+                key = (position.mint, int(position.entry_ts_ms))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"recovery state has a malformed position: {exc}"
+                ) from exc
+            _validate_restored_position(position)
+            # A crash cannot leave a quote in flight: reset the guard so the
+            # ticker may retry the exit instead of waiting forever.
+            position.exit_in_flight = False
+            if key in closed:
+                LOGGER.warning(
+                    "recovery skipped already-closed position %s @ %s",
+                    position.mint,
+                    position.entry_ts_ms,
+                )
+                continue
+            restored[position.mint] = position
+
+        wallet.sol_balance = sol_balance
+        wallet.fees_paid_sol = fees_paid
+        wallet.entries = entries
+        wallet.exits = exits
+        wallet.write_offs = write_offs
+        wallet.token_balances = restored_balances
+        # Update in place: the ticker and shutdown hooks may hold this dict.
+        self.positions.clear()
+        self.positions.update(restored)
+
+    def persist_state(self) -> None:
+        """Write a recovery snapshot now (no-op without a state callback)."""
+        self._notify_state_change()
+
+    def _notify_state_change(self) -> None:
+        """Persist a recovery snapshot after an entry, partial or close."""
+        if self.on_state_change is None:
+            return
+        try:
+            self.on_state_change(self.export_state())
+        except Exception:  # noqa: BLE001 - never wedge trading on a snapshot
+            LOGGER.exception("could not persist restart state")
+
     @staticmethod
     def _day_key(ts_ms: int) -> str:
         return datetime.fromtimestamp(ts_ms / 1000, UTC).date().isoformat()
@@ -375,24 +568,86 @@ class PaperEngine:
     def _day_pnl(self, ts_ms: int) -> float:
         return self._daily_pnl.get(self._day_key(ts_ms), 0.0)
 
-    def _restore_daily_pnl_from_store(self) -> dict[str, float]:
+    def _risk_marker_path(self) -> Path | None:
+        """Marker that distinguishes a first install from a deleted state file."""
+        path = self.config.risk_state_path
+        if path is None:
+            return None
+        return path.with_name(path.name + ".initialized")
+
+    def _initialize_risk_state_strict(self) -> None:
+        """Load or bootstrap the breaker state, failing closed on any doubt.
+
+        Called only when ``max_daily_loss_sol`` is enabled. A missing state
+        file is legitimate on the very first start, but not after the marker
+        file has recorded an earlier initialization: silently starting at zero
+        would reset the breaker.
+        """
+        path = self.config.risk_state_path
+        marker = self._risk_marker_path()
+        assert path is not None and marker is not None
+        if path.exists():
+            self._daily_pnl = self._load_risk_state()
+        elif marker.exists():
+            raise RuntimeError(
+                f"daily risk state at {path} is missing although {marker} "
+                "records a previous initialization; refusing to reset the "
+                "loss breaker"
+            )
+        else:
+            # First initialization for this lane. Recover today's PnL from
+            # this run's trade log if one exists. A missing log is a normal
+            # fresh start; an unreadable one fails closed.
+            self._daily_pnl = self._restore_daily_pnl_from_store(strict=True)
+        self._persist_daily_pnl(raise_on_error=True)
+        self._write_risk_marker(raise_on_error=True)
+
+    def _restore_daily_pnl_from_store(
+        self, *, strict: bool = False
+    ) -> dict[str, float]:
         loader = getattr(self.store, "realized_pnl_by_day", None)
         if not callable(loader):
             return {}
         try:
             restored = loader()
-        except Exception:  # noqa: BLE001 - a corrupt tail must not stop the bot
+        except Exception as exc:  # noqa: BLE001 - a corrupt tail must not stop the bot
             LOGGER.exception("could not restore daily PnL from the store")
+            if strict:
+                raise RuntimeError(
+                    "cannot recover daily PnL from the trade history while "
+                    "the daily loss cap is enabled"
+                ) from exc
             return {}
         if not isinstance(restored, dict):
+            if strict:
+                raise RuntimeError(
+                    "trade history returned a non-dict daily PnL payload"
+                )
             return {}
-        return {str(key): float(value) for key, value in restored.items()}
+        result: dict[str, float] = {}
+        for key, value in restored.items():
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                if strict:
+                    raise RuntimeError(
+                        f"trade history has a non-numeric daily PnL for {key!r}"
+                    ) from None
+                continue
+            if not math.isfinite(number):
+                if strict:
+                    raise RuntimeError(
+                        f"trade history has a non-finite daily PnL for {key!r}"
+                    )
+                continue
+            result[str(key)] = number
+        return result
 
     def _load_risk_state(self) -> dict[str, float]:
-        """Read the stable daily-PnL file, or start empty on first run.
+        """Read the stable daily-PnL file, or start empty if it is absent.
 
-        A missing file is a legitimate first start. An unreadable, corrupt or
-        mistyped file is not: silently starting at zero would disable the
+        An unreadable, corrupt, mistyped, non-finite or version-mismatched file
+        is not a fresh start: silently resetting to zero would disable the
         circuit breaker the operator asked for, so startup fails instead.
         """
         path = self.config.risk_state_path
@@ -406,33 +661,89 @@ class PaperEngine:
                 f"cannot read daily risk state at {path}: {exc}"
             ) from exc
         try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
+            payload = json.loads(raw, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError(
                 f"daily risk state at {path} is not valid JSON: {exc}"
             ) from exc
-        days = payload.get("days") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"daily risk state at {path} is not a JSON object"
+            )
+        version = payload.get("version")
+        if version != RISK_STATE_VERSION:
+            raise RuntimeError(
+                f"daily risk state at {path} has unsupported version "
+                f"{version!r}; expected {RISK_STATE_VERSION}"
+            )
+        days = payload.get("days")
         if not isinstance(days, dict):
             raise RuntimeError(
                 f"daily risk state at {path} has no 'days' object"
             )
         restored: dict[str, float] = {}
         for key, value in days.items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if not isinstance(key, str) or not _is_utc_day(key):
                 raise RuntimeError(
-                    f"daily risk state at {path} has a non-numeric value "
-                    f"for {key!r}"
+                    f"daily risk state at {path} has an invalid UTC day "
+                    f"{key!r}"
                 )
-            restored[str(key)] = float(value)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise RuntimeError(
+                    f"daily risk state at {path} has a non-finite or "
+                    f"non-numeric value for {key!r}"
+                )
+            restored[key] = float(value)
         return restored
+
+    def _write_risk_marker(self, *, raise_on_error: bool = False) -> None:
+        """Record that this lane has initialized its risk state once."""
+        marker = self._risk_marker_path()
+        if marker is None:
+            return
+        payload = {
+            "version": RISK_STATE_VERSION,
+            "initialized_at": datetime.now(UTC).isoformat(),
+        }
+        tmp = marker.with_name(marker.name + ".tmp")
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp, marker)
+        except OSError as exc:
+            self._risk_state_error = f"{type(exc).__name__}: {exc}"
+            LOGGER.exception("could not write risk-state marker %s", marker)
+            if raise_on_error:
+                raise RuntimeError(
+                    f"cannot write risk-state marker at {marker}: {exc}"
+                ) from exc
+            return
+        self._risk_state_error = None
 
     def _persist_daily_pnl(self, *, raise_on_error: bool = False) -> None:
         """Atomically write today's realized PnL to the stable risk state."""
         path = self.config.risk_state_path
         if path is None:
             return
+        for key, value in self._daily_pnl.items():
+            if not math.isfinite(value):
+                self._risk_state_error = (
+                    f"non-finite daily PnL for {key!r}"
+                )
+                LOGGER.error(
+                    "refusing to persist non-finite daily PnL for %s", key
+                )
+                if raise_on_error:
+                    raise RuntimeError(
+                        f"cannot persist non-finite daily PnL for {key!r}"
+                    )
+                return
         payload = {
-            "version": 1,
+            "version": RISK_STATE_VERSION,
             "updated_at": datetime.now(UTC).isoformat(),
             "days": dict(sorted(self._daily_pnl.items())),
         }
@@ -1236,6 +1547,7 @@ class PaperEngine:
                     if self.store is not None:
                         self.store.record_entry(position)
                     self._emit(self.on_entry, position, wallet_before, wallet_after)
+                    self._notify_state_change()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - a task must never wedge
@@ -1466,6 +1778,7 @@ class PaperEngine:
             0.0, position.entry_fee_sol - fill.entry_fee_sol
         )
         position.exit_fill_count += 1
+        self._notify_state_change()
 
     def _finalize_unsold(self, position: Position) -> None:
         """Write off tokens that could not be sold at any tested size.
@@ -1638,6 +1951,7 @@ class PaperEngine:
         if self.store is not None:
             self.store.record_trade(trade)
         self.positions.pop(position.mint, None)
+        self._notify_state_change()
         self._emit(
             self.on_close,
             trade,

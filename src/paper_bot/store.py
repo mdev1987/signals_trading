@@ -32,7 +32,29 @@ class PaperStore:
                 json.dumps(meta, indent=2, sort_keys=True, default=str),
                 encoding="utf-8",
             )
+        # Trades are read back from the append-only file when needed (finalize,
+        # summary, restart dedupe) instead of being mirrored in memory for the
+        # whole run: a five-day run appends a few thousand rows, and the replay
+        # harness can append far more.
         self._trades: list[dict[str, Any]] = []
+
+    def closed_position_keys(self) -> set[tuple[str, int]]:
+        """``(mint, entry_ts_ms)`` for every trade already on disk.
+
+        Restart recovery uses this to avoid closing a position twice when the
+        process died between appending the trade and saving the snapshot.
+        """
+        keys: set[tuple[str, int]] = set()
+        for payload in _read_jsonl(self.trades_path):
+            mint = payload.get("mint")
+            entry_ts = payload.get("entry_ts_ms")
+            if mint is None or entry_ts is None:
+                continue
+            try:
+                keys.add((str(mint), int(entry_ts)))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return keys
 
     @staticmethod
     def _append(path: Path, payload: dict[str, Any]) -> None:
@@ -162,9 +184,13 @@ class PaperStore:
         return totals
 
     def finalize(self, *, extra: dict[str, Any] | None = None) -> Path | None:
-        trades = self._trades
-        if not trades and self.trades_path.exists():
-            trades = _read_jsonl(self.trades_path)
+        # Read the append-only file so a resumed run's parquet contains the
+        # earlier process's trades as well as this one's.
+        trades = (
+            _read_jsonl(self.trades_path)
+            if self.trades_path.exists()
+            else list(self._trades)
+        )
         parquet_path = None
         if trades:
             frame = pl.DataFrame(trades, infer_schema_length=None)

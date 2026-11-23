@@ -30,6 +30,7 @@ Copy `deploy/env.example` to `.env` and set at minimum:
 | `SOLANA_RPC_URL` | live only | Your Solana RPC endpoint |
 | `LIVE_TRADING_ENABLED=1` | live only | Double opt-in; without it live fails closed |
 | `LIVE_MAX_SLIPPAGE_BPS` | optional | Ceiling for the quote-widening ladder (default 1000 = 10 %) |
+| `DAILY_LOSS_SOL` | optional, live | Daily realized-loss cap used by `run_bot.sh live` (default 1.0; 0 disables). Paper always runs with 0 |
 | `TELEGRAM_BOT_TOKEN` | reports | For /status, /stats, BUY/SELL notifications |
 | `TELEGRAM_CHAT_ID` | reports | Where the bot posts |
 
@@ -118,6 +119,14 @@ edit the `ExecStart` line in the service to `run_bot.sh live`, set
 `LIVE_TRADING_ENABLED=1` and `SOLANA_PRIVATE_KEY` in `.env`, then
 `daemon-reload` + `restart`.
 
+For a continuous forward sample across service restarts, start once without
+recovery (that seeds `output/recovery/<rule>_<entry-mode>.json`), then set
+`Environment=RESUME=1` in `deploy/paper-bot.service` (or prefix the `nohup`
+command with `RESUME=1`) so every later start continues the same run
+directory. This is deliberately fail-closed: if the snapshot is missing or
+belongs to a different strategy configuration, the bot refuses to start rather
+than silently beginning a new sample.
+
 ### Option B: nohup / tmux / screen
 
 ```bash
@@ -187,16 +196,33 @@ What to watch in the first days:
 - With `--max-daily-loss-sol` above 0, realized daily PnL is persisted to
   `--risk-state-dir` (default `output/risk/<rule>_<entry-mode>.json`), which is
   stable across the timestamped `live_*` run directories and separate per
-  lane. The deployed lane leaves the cap at 0 (disabled), so this file is
-  informative only unless enabled.
-- If the cap is enabled and the state file is corrupt or unwritable, startup
-  fails closed rather than silently starting the day at zero. A failed write
-  during the run also blocks new entries (`risk_state_unavailable`) while
-  exits continue.
-- Open positions and wallet/token balances are **not** restored across a
-  process restart: the broker starts from `--starting-sol`, so a restart
-  abandons the open book. Restart only during a flat window, or accept that
-  the interrupted positions are not carried forward.
+  lane. Paper mode leaves the cap at 0 (disabled) so the forward sample is
+  uncensored; `./run_bot.sh live` defaults to the recommended 1 SOL cap and
+  accepts `DAILY_LOSS_SOL` (e.g. `DAILY_LOSS_SOL=0.5 ./run_bot.sh live`; set it
+  to 0 to disable).
+- The first cap-enabled start creates the state file plus a
+  `<state>.initialized` marker. If the state file is later deleted while the
+  marker remains, startup **fails closed** instead of resetting the breaker.
+  Corrupt JSON, a non-finite (NaN/Infinity) value, an unsupported schema
+  version or an unreadable trade history also fail closed; all of these matter
+  only while the cap is enabled.
+- A failed write during the run blocks new entries (`risk_state_unavailable`)
+  while exits continue.
+- **Restart recovery (paper only).** Every single-lane paper start writes
+  `output/recovery/<rule>_<entry-mode>.json` (one atomically replaced JSON
+  file) with the wallet, token balances, open positions, the original run
+  directory and a strategy fingerprint. Start with `--resume` (or
+  `RESUME=1 ./run_bot.sh paper`) to continue that run instead of opening a new
+  timestamped directory. Recovery is fail-closed: a missing file, corrupt JSON,
+  unsupported version, non-finite number, or a fingerprint mismatch (rule,
+  entry mode, sizing, fee, horizon) refuses to start. Positions already present
+  in `trades.jsonl` are not closed twice, and open positions are re-subscribed
+  for marks and retried exits. Live mode never restores local state: its
+  balances come from the chain.
+- Without `--resume`, a restart still starts a fresh wallet from
+  `--starting-sol` in a new run directory. For the five-day gate, either run
+  uninterrupted or run with `RESUME=1` so restarts continue the same
+  `trades.jsonl`.
 - Evaluate the run with `src/forward_gates.py` (same frozen thresholds and
   seeded cluster bootstrap) instead of eyeballing `summary.json`.
 - Compare the realized median and win rate with the deployed-convention

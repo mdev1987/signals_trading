@@ -212,6 +212,42 @@ class ForwardGateTests(unittest.TestCase):
         self.assertFalse(result["passed"])
 
 
+    def _write_boundary_run(self, root: Path, failures: int) -> None:
+        # 300 trades satisfy coverage; 1000 allowed signals and entries make
+        # the fill rate 100 % while the failure ratio is exactly failures/1000.
+        self._write_run(root, trades=300, days=5, pnl=0.01)
+        (root / "signals.jsonl").write_text(
+            "\n".join(
+                json.dumps({"decision": {"allowed": True}})
+                for _ in range(1000)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / "entries.jsonl").write_text("{}\n" * 1000, encoding="utf-8")
+        (root / "skips.jsonl").write_text(
+            "".join(
+                json.dumps({"reason": "entry_delay_exceeded"}) + "\n"
+                for _ in range(failures)
+            ),
+            encoding="utf-8",
+        )
+
+    def test_entry_failure_boundary_is_strictly_below_ten_percent(self) -> None:
+        # The frozen criterion says "below 10 %": 9.9 % passes, 10.0 % and
+        # 10.1 % fail even though the fill rate is 100 % in every case.
+        for failures, expected in ((99, True), (100, False), (101, False)):
+            with self.subTest(failures=failures):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._write_boundary_run(root, failures)
+                    result = evaluate(root)
+                execution = result["gates"]["execution"]
+                self.assertEqual(execution["entry_fill_rate"], 1.0)
+                self.assertEqual(
+                    execution["passed"], expected, execution["detail"]
+                )
+
     def test_entry_failures_fail_execution_even_when_fill_rate_passes(self) -> None:
         # Fill rate counts entries / allowed signals; a run can fill 80 %+ of
         # allowed cards yet lose another 10 % to delayed or unfilled quotes.

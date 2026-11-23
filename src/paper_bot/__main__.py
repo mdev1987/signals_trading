@@ -14,6 +14,7 @@ from pathlib import Path
 from .live import LiveConfig, _load_env, _read_channels, run_live
 from .paths import channels_file, config_file, data_home, env_file
 from .quotes import DEFAULT_MAX_SLIPPAGE_BPS
+from .recovery import default_state_db
 from .signals import DEFAULT_RULE
 
 BOT_TOKEN_RE = re.compile(r"(?i)\b(bot\d+:)[A-Za-z0-9_-]{20,}")
@@ -251,6 +252,24 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
             "timestamped run directory, or a restart resets the loss cap."
         ),
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "paper only: resume the wallet, open positions and run directory "
+            "saved by the previous process, so a restart continues the same "
+            "forward sample instead of starting a new one"
+        ),
+    )
+    parser.add_argument(
+        "--state-db",
+        type=Path,
+        default=None,
+        help=(
+            "paper restart-recovery file used with --resume "
+            "(default output/recovery/<rule>_<entry-mode>.json)"
+        ),
+    )
     parser.add_argument("--safety-screen", action="store_true")
     parser.add_argument("--allow-candidate-address", action="store_true")
     parser.add_argument("--pumpapi-url", default="wss://stream.pumpapi.io/")
@@ -446,6 +465,14 @@ def main() -> int:
             / "paper"
             / f"live_{datetime.now(UTC):%Y%m%d_%H%M%S}"
         )
+        # Every single-lane paper run records a restart snapshot, so an
+        # unexpected crash can be resumed. A/B and live runs do not.
+        paper_lane = args.mode == "paper" and (
+            args.ab_rule is None and args.ab_entry_mode is None
+        )
+        state_db: Path | None = args.state_db
+        if paper_lane:
+            state_db = state_db or default_state_db(args.rule, args.entry_mode)
         config = LiveConfig(
             channels=channels,
             config_path=args.config,
@@ -481,6 +508,8 @@ def main() -> int:
             timer_late_tolerance_ms=args.timer_late_tolerance_ms,
             max_future_skew_ms=args.max_future_skew_ms,
             risk_state_dir=args.risk_state_dir,
+            resume=args.resume,
+            state_db=state_db,
             safety_screen=args.safety_screen,
             allow_candidate_address=args.allow_candidate_address,
             pumpapi_url=args.pumpapi_url,

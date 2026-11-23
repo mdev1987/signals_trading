@@ -20,6 +20,13 @@ ExecStart=/home/mdev/Programming/signals_trading/run_bot.sh paper
 # For live trading, change the ExecStart line to:
 #   ExecStart=/home/mdev/Programming/signals_trading/run_bot.sh live
 # and set LIVE_TRADING_ENABLED=1 + SOLANA_PRIVATE_KEY in .env.
+#
+# Restart continuity (paper): the first start seeds
+# output/recovery/scanner_pumpfun_amm_trade.json. After that, uncomment the
+# line below so a restart continues the same run instead of opening a new
+# timestamped directory. It is fail-closed: a missing or mismatched snapshot
+# stops the service (and StartLimitBurst keeps it from hot-looping).
+# Environment=RESUME=1
 
 # Restart policy: always restart, with a backoff to avoid tight loops on
 # persistent misconfiguration (e.g. bad API key).

@@ -54,6 +54,7 @@ from .history import MarketHistory
 from .notifier import ReporterStats, TelegramReporter
 from .paths import env_file
 from .quotes import DEFAULT_MAX_SLIPPAGE_BPS, JupiterQuoteProvider
+from .recovery import RecoveryStore
 from .signals import (
     DEFAULT_RULE,
     RULE_DESCRIPTIONS,
@@ -85,6 +86,11 @@ class LiveConfig:
     run_dir: Path
     mode: str = "paper"
     rule: str = DEFAULT_RULE
+    # Paper-mode restart recovery. ``state_db`` holds the wallet/position
+    # snapshot and the original run directory so a restarted process continues
+    # the same forward sample instead of starting a new one.
+    resume: bool = False
+    state_db: Path | None = None
     # Optional second lane. ``ab_rule`` varies the rule and ``ab_entry_mode``
     # varies the execution; either alone (or both) starts an A/B run.
     ab_rule: str | None = None
@@ -210,6 +216,20 @@ class LiveConfig:
                 )
         if self.ab_rule is None and self.ab_entry_mode == self.entry_mode:
             raise ValueError("the A/B lanes must differ in rule or entry_mode")
+        if self.resume or self.state_db is not None:
+            if self.mode != "paper":
+                raise ValueError(
+                    "restart recovery is paper-only; live balances come from "
+                    "the chain"
+                )
+            if self.ab_rule is not None or self.ab_entry_mode is not None:
+                raise ValueError(
+                    "restart recovery supports a single lane, not A/B"
+                )
+            if self.state_db is None:
+                raise ValueError(
+                    "restart recovery requires a state_db path"
+                )
         if not 0 <= self.fee < 1:
             raise ValueError("fee must be in [0, 1)")
         if not 0 <= self.slippage < 1:
@@ -417,6 +437,50 @@ def _risk_state_path(config: LiveConfig, rule: str, entry_mode: str) -> Path:
     return Path(config.risk_state_dir) / f"{stem or 'lane'}.json"
 
 
+def _recovery_fingerprint(
+    config: LiveConfig, rule: str, entry_mode: str
+) -> dict[str, Any]:
+    """Configuration that must not change while resuming a forward run."""
+    return {
+        "mode": config.mode,
+        "rule": rule,
+        "entry_mode": entry_mode,
+        "starting_sol": config.starting_sol,
+        "notional_sol": config.notional_sol,
+        "fee": config.fee,
+        "slippage": config.slippage,
+        "horizon_min": config.horizon_min,
+        "entry_delay_ms": config.entry_delay_ms,
+        "max_entry_delay_ms": config.max_entry_delay_ms,
+    }
+
+
+def _state_saver(
+    store: RecoveryStore,
+    lane: StrategyLane,
+    fingerprint: dict[str, Any],
+) -> Callable[[dict[str, Any]], None]:
+    """Return a callback that persists one lane's restart snapshot.
+
+    The run directory and configuration fingerprint travel with the snapshot so
+    a later ``--resume`` cannot attach a different lane or a changed strategy
+    to an existing five-day sample.
+    """
+
+    def save(state: dict[str, Any]) -> None:
+        store.save(
+            {
+                "run_dir": str(lane.run_dir),
+                "fingerprint": fingerprint,
+                "wallet": state["wallet"],
+                "token_balances": state["token_balances"],
+                "positions": state["positions"],
+            }
+        )
+
+    return save
+
+
 def _lane_meta(
     config: LiveConfig,
     *,
@@ -450,6 +514,10 @@ def _lane_meta(
         "max_future_skew_ms": config.max_future_skew_ms,
         "risk_state_dir": config.risk_state_dir,
         "risk_state_file": str(_risk_state_path(config, rule, entry_mode)),
+        "resume": config.resume,
+        "recovery_state_db": (
+            str(config.state_db) if config.state_db is not None else None
+        ),
         "tp_pct": config.tp_pct,
         "sl_pct": config.sl_pct,
         "fee": config.fee,
@@ -649,6 +717,45 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             )
         )
 
+    # Paper restart recovery: keep the wallet, open positions and run directory
+    # consistent across process restarts. The snapshot is written for every
+    # single-lane paper run, so an unexpected crash can be resumed with
+    # ``--resume``; anything inconsistent fails closed instead of silently
+    # starting a new forward sample.
+    recovery: RecoveryStore | None = None
+    recovered: dict[str, Any] | None = None
+    fingerprint: dict[str, Any] | None = None
+    if config.state_db is not None:
+        recovery = RecoveryStore(config.state_db)
+        fingerprint = _recovery_fingerprint(
+            config, config.rule, config.entry_mode
+        )
+        if config.resume:
+            recovered = recovery.load()
+            if recovered is None:
+                raise RuntimeError(
+                    f"--resume was given but {config.state_db} holds no "
+                    "saved state; start once without --resume to create it"
+                )
+            if recovered["fingerprint"] != fingerprint:
+                raise RuntimeError(
+                    "recovery state was written for a different "
+                    f"configuration: saved={recovered['fingerprint']} "
+                    f"current={fingerprint}"
+                )
+            config.run_dir = Path(recovered["run_dir"])
+            LOGGER.warning(
+                "resuming run %s from %s (open positions=%d)",
+                config.run_dir,
+                config.state_db,
+                len(recovered["positions"]),
+            )
+        else:
+            LOGGER.info(
+                "restart recovery state will be written to %s",
+                config.state_db,
+            )
+
     history = MarketHistory(
         max_events_per_mint=config.history_max_events_per_mint,
         max_mints=config.history_max_mints,
@@ -713,20 +820,35 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
     lanes: list[StrategyLane] = []
     for index, (name, rule, entry_mode) in enumerate(specs):
         lane_dir = config.run_dir / name if is_ab else config.run_dir
-        lanes.append(
-            _create_lane(
-                config,
-                name=name,
-                rule=rule,
-                entry_mode=entry_mode,
-                run_dir=lane_dir,
-                history=history,
-                quotes=quotes,
-                env=env,
-                primary=index == 0,
-                is_ab=is_ab,
-            )
+        lane = _create_lane(
+            config,
+            name=name,
+            rule=rule,
+            entry_mode=entry_mode,
+            run_dir=lane_dir,
+            history=history,
+            quotes=quotes,
+            env=env,
+            primary=index == 0,
+            is_ab=is_ab,
         )
+        if recovery is not None and fingerprint is not None:
+            lane.engine.on_state_change = _state_saver(
+                recovery, lane, fingerprint
+            )
+            if recovered is not None:
+                lane.engine.restore_state(recovered)
+                LOGGER.warning(
+                    "restored lane %s: cash=%.6f SOL, token_balances=%d",
+                    lane.name,
+                    lane.wallet.sol_balance,
+                    len(lane.wallet.token_balances),
+                )
+            else:
+                # Write the snapshot immediately: a crash before the first
+                # trade should still be resumable into this same run.
+                lane.engine.persist_state()
+        lanes.append(lane)
     primary = lanes[0]
     reporter = primary.reporter
 
@@ -765,6 +887,10 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
 
     for lane in lanes:
         lane.engine.on_watch = watch
+        # A resumed lane holds positions opened before the restart; subscribe
+        # them again so marks and exit prices keep flowing.
+        for mint in list(lane.engine.positions):
+            watch(mint)
 
     listener: TelegramListener | None = None
     telegram_task: asyncio.Task[Any] | None = None

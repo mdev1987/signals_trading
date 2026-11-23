@@ -841,6 +841,122 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
                     max_daily_loss_sol=0.5,
                 )
 
+    def test_first_run_creates_state_and_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk" / "daily_pnl.json"
+            self.engine(risk_state_path=path, max_daily_loss_sol=0.5)
+            self.assertTrue(path.exists())
+            self.assertTrue(
+                path.with_name(path.name + ".initialized").exists()
+            )
+
+    def test_missing_state_after_marker_fails_closed(self) -> None:
+        # The lane initialized once, then the state file was deleted. Starting
+        # at zero would silently reset the breaker, so refuse to start.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk" / "daily_pnl.json"
+            path.parent.mkdir(parents=True)
+            path.with_name(path.name + ".initialized").write_text(
+                json.dumps({"version": 1}), encoding="utf-8"
+            )
+            with self.assertRaises(RuntimeError):
+                self.engine(risk_state_path=path, max_daily_loss_sol=0.5)
+
+    def test_nan_risk_state_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "daily_pnl.json"
+            path.write_text(
+                '{"version": 1, "days": {"2026-11-23": NaN}}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                self.engine(risk_state_path=path, max_daily_loss_sol=0.5)
+
+    def test_infinite_risk_state_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "daily_pnl.json"
+            path.write_text(
+                '{"version": 1, "days": {"2026-11-23": Infinity}}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                self.engine(risk_state_path=path, max_daily_loss_sol=0.5)
+
+    def test_unsupported_risk_state_version_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "daily_pnl.json"
+            path.write_text(
+                json.dumps({"version": 2, "days": {"2026-11-23": -0.1}}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                self.engine(risk_state_path=path, max_daily_loss_sol=0.5)
+
+    def test_invalid_day_key_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "daily_pnl.json"
+            path.write_text(
+                json.dumps({"version": 1, "days": {"2026-13-40": -0.1}}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                self.engine(risk_state_path=path, max_daily_loss_sol=0.5)
+
+    def test_unreadable_trade_history_fails_closed_on_first_init(self) -> None:
+        class BrokenStore:
+            def realized_pnl_by_day(self) -> dict[str, float]:
+                raise OSError("history unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk" / "daily_pnl.json"
+            with self.assertRaises(RuntimeError):
+                self.engine(
+                    store=BrokenStore(),  # type: ignore[arg-type]
+                    risk_state_path=path,
+                    max_daily_loss_sol=0.5,
+                )
+
+    async def test_negative_daily_pnl_survives_restart_and_blocks_entry(
+        self,
+    ) -> None:
+        from datetime import UTC, datetime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "risk" / "daily_pnl.json"
+            day = (
+                datetime.fromtimestamp(self.NOW_MS / 1000, UTC)
+                .date()
+                .isoformat()
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps({"version": 1, "days": {day: -0.8}}),
+                encoding="utf-8",
+            )
+            path.with_name(path.name + ".initialized").write_text(
+                json.dumps({"version": 1}), encoding="utf-8"
+            )
+            engine = self.engine(
+                store=PaperStore(root / "run-after-restart"),
+                risk_state_path=path,
+                max_daily_loss_sol=0.5,
+            )
+            decision = await engine.on_signal(self.make_signal())
+        self.assertAlmostEqual(engine._day_pnl(self.NOW_MS), -0.8)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["daily_loss_limit"])
+
+    def test_non_finite_daily_pnl_is_not_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "daily_pnl.json"
+            engine = self.engine(risk_state_path=path)
+            path.unlink()
+            engine._daily_pnl["2026-11-23"] = float("nan")
+            engine._persist_daily_pnl()
+            self.assertFalse(path.exists())
+            self.assertIsNotNone(engine._risk_state_error)
+
     def test_corrupt_risk_state_is_ignored_when_cap_is_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "daily_pnl.json"

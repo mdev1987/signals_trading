@@ -261,6 +261,28 @@ class Position:
     def is_open(self) -> bool:
         return self.exit_status is None
 
+    def to_state_dict(self) -> dict[str, Any]:
+        """Serialize for restart recovery (plain JSON-compatible values)."""
+        return asdict(self)
+
+    @classmethod
+    def from_state_dict(cls, payload: dict[str, Any]) -> Position:
+        """Rebuild a position from :meth:`to_state_dict` output."""
+        data = dict(payload)
+        signal_payload = data.pop("signal", None)
+        if not isinstance(signal_payload, dict):
+            raise ValueError("persisted position has no signal object")
+        quote_payload = data.pop("entry_quote", None)
+        return cls(
+            signal=Signal(**signal_payload),
+            entry_quote=(
+                FillQuote(**quote_payload)
+                if isinstance(quote_payload, dict)
+                else None
+            ),
+            **data,
+        )
+
 
 @dataclass(slots=True)
 class ClosedTrade:

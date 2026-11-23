@@ -297,15 +297,15 @@ Do not fund this lane until a forward paper run shows **all** of:
    forward run had **0** `no_route` exits and **17.6 %** catastrophic exits.
 5. **No systematic entry failure.** At least **80 %** of allowed signals must
    fill (`entries.jsonl` / allowed `signals.jsonl`), **and**
-   `entry_delay_exceeded + entry_quote_failed` must stay below **10 %** of
-   allowed signals. The fill rate alone can look healthy while a separate
-   tenth of the cards is abandoned by quote or timing failures; either one
-   means the bot is not taking the trades the backtest measured, regardless of
-   the realized win rate. `entry_dust_prints_only`,
-   `entry_unverified_quote_notional`, `entry_missed_eligible_print`,
-   `entry_window_passed`, `entry_timer_late` and `stale_reference_price` are
-   fidelity skips (the live convention refused a print the replay would not
-   have used), not backtested trades.
+   `entry_delay_exceeded + entry_quote_failed` must stay strictly below
+   **10 %** of allowed signals (exactly 10 % fails). The fill rate alone can
+   look healthy while a separate tenth of the cards is abandoned by quote or
+   timing failures; either one means the bot is not taking the trades the
+   backtest measured, regardless of the realized win rate.
+   `entry_dust_prints_only`, `entry_unverified_quote_notional`,
+   `entry_missed_eligible_print`, `entry_window_passed`, `entry_timer_late`
+   and `stale_reference_price` are fidelity skips (the live convention refused
+   a print the replay would not have used), not backtested trades.
 
 `src/forward_gates.py` evaluates gates 1–5 with these exact thresholds and
 exits `2` while coverage is short.
