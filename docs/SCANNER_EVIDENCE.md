@@ -303,12 +303,27 @@ Do not fund this lane until a forward paper run shows **all** of:
    timing failures; either one means the bot is not taking the trades the
    backtest measured, regardless of the realized win rate.
    `entry_dust_prints_only`, `entry_unverified_quote_notional`,
-   `entry_missed_eligible_print`, `entry_window_passed`, `entry_timer_late`
-   and `stale_reference_price` are fidelity skips (the live convention refused
-   a print the replay would not have used), not backtested trades.
+   `entry_missed_eligible_print`, `entry_window_passed`, `entry_timer_late`,
+   `signal_timestamp_in_future` and `stale_reference_price` are fidelity skips
+   (the live convention refused a print the replay would not have used), not
+   backtested trades. `signal_timestamp_in_future` specifically means the host
+   clock is behind Telegram's server time; fix the clock rather than relaxing
+   the guard.
 
 `src/forward_gates.py` evaluates gates 1–5 with these exact thresholds and
 exits `2` while coverage is short.
+
+The execution report also exposes context the frozen thresholds do not grade:
+`scanner_cards` (scanner cards in `signals.jsonl`), `scanner_cards_allowed`
+(those that reached the entry gate), `censor_share` (the fraction never offered
+to it) and `rejection_reason_counts` (per reason). Fidelity guards — late
+delivery, missed eligible print, timer lateness, the concurrency cap — reject a
+card before it counts as `allowed`, so they are invisible to the fill-rate
+gate. `censor_share` is reported so a high fill rate on a thin slice of the
+scanner population cannot be mistaken for full participation; it changes no
+threshold. Separately, `input_integrity` fails the run when a `*.jsonl` row
+cannot be parsed or a trade lacks a finite `pnl_sol`/`return_pct`, rather than
+silently dropping it. Neither addition retunes the strategy.
 
 If 2, 3 or 4 fails while 5 passes, the edge did not survive the move from
 replay to live and the lane should be retired, not retuned. Do not re-fit the
@@ -333,7 +348,9 @@ gates 1–5.
   bound, not a footnote.
 - The scanner channel re-posts each pool ~3×. Only the first card is traded
   (`scanner_cards` / `scanner_duplicates` in `summary.json`), which is what
-  the backtest assumes.
+  the backtest assumes. Those counters are cumulative for the run, not for the
+  current process: they are persisted in the recovery store so a restart does
+  not reset the participation picture.
 - Replay archives stop at 2026-11-20, so there is no forward out-of-sample
   day in the archive. The forward paper run is the only OOS test.
 - Live mode has not been exercised against a funded wallet; the Jupiter

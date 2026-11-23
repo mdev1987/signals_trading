@@ -126,6 +126,9 @@ class PumpApiFeed:
     def watch(self, mint: str) -> None:
         self.watched.add(mint)
 
+    def unwatch(self, mint: str) -> None:
+        self.watched.discard(mint)
+
     def stop(self) -> None:
         self._stopped = True
 

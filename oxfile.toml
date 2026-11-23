@@ -74,14 +74,26 @@ version = 1
 # it is a risk control, not part of the backtested edge.
 #
 # Restart continuity (paper only): every paper start writes
-# output/recovery/scanner_pumpfun_amm_trade.json with the wallet and open
-# positions. Adding `--resume` to the command below makes an oxmgr restart
-# continue the same run directory instead of opening a new timestamped one.
-# The flag is fail-closed: if the saved state is missing (the very first start
-# of a run), corrupt, or written for a different strategy/entry configuration,
-# the bot refuses to start rather than silently beginning a new sample. Start
-# once without `--resume` to seed the file, then add the flag. Live mode never
-# restores local state; its balances come from the chain.
+# output/recovery/scanner_pumpfun_amm_trade.sqlite3 (SQLite, WAL,
+# synchronous=FULL) with the wallet, open positions, the original run
+# directory, the run's original started_at, durable scanner counters and the
+# set of processed Telegram/scanner ids (so a redelivered message or a reposted
+# pool is not traded twice after a restart). A legacy `.json` snapshot from an
+# older build is imported once and archived as `*.json.imported`.
+# The command below ends with `--resume`, so an oxmgr restart (or a crash
+# restart) continues the same run directory and keeps started_at, instead of
+# opening a new timestamped sample. The flag is fail-closed: if the saved state
+# is missing, corrupt, or written for a different strategy/guard configuration
+# (execution convention, guards, exit settings, history bounds), the bot
+# refuses to start rather than silently beginning a new sample.
+#
+# First install of a new sample: the snapshot does not exist yet, so `--resume`
+# would refuse to start. Seed it by removing `--resume` for one start (or run
+# `run_bot.sh` once without RESUME=1), let the bot write its first snapshot,
+# then restore `--resume`. To start a *new* sample after the five-day gates are
+# evaluated, stop the app and delete output/recovery/scanner_pumpfun_amm_trade.sqlite3
+# (and the old risk state if a different day should start clean). Never delete
+# the snapshot unless you intend to end the current sample.
 #
 # One-time setup:
 #   cd /home/mdev/Programming/signals_trading
@@ -100,7 +112,7 @@ name = "paper-bot"
 # The package lives under `src/`, so PYTHONPATH is set here instead of
 # installing the research repo as a wheel. `--no-sync` is unnecessary because
 # this runs the venv directly, so a restart never touches the network.
-command = "env PYTHONPATH=/home/mdev/Programming/signals_trading/src /home/mdev/Programming/signals_trading/.venv/bin/python -m paper_bot live --mode paper --rule scanner_pumpfun_amm --channel @AveSolanaTokenScanner --entry-mode trade --entry-delay-ms 5000 --max-entry-delay-ms 60000 --max-delivery-lag-ms 60000 --max-concurrent-positions 10 --entry-retry-backoff-ms 1000 --min-entry-quote-sol 0.01 --max-reference-age-ms 30000 --max-mark-age-ms 120000 --timer-late-tolerance-ms 1000 --max-future-skew-ms 5000 --risk-state-dir output/risk --horizon-min 5 --notional-sol 0.1 --starting-sol 10 --slippage-bps 50 --max-slippage-bps 1000 --priority-fee-lamports 2000 --jito-tip-lamports 10000 --fee 0.0125 --history-horizon-min 10 --history-max-mints 10000 --history-max-events-per-mint 3000 --history-max-total-events 150000 --tick-interval 1.0 --dex-interval 2.0 --memory-limit-mb 550 --memory-report-s 300 --shutdown-timeout-ms 25000"
+command = "env PYTHONPATH=/home/mdev/Programming/signals_trading/src /home/mdev/Programming/signals_trading/.venv/bin/python -m paper_bot live --mode paper --rule scanner_pumpfun_amm --channel @AveSolanaTokenScanner --entry-mode trade --entry-delay-ms 5000 --max-entry-delay-ms 60000 --max-delivery-lag-ms 60000 --max-concurrent-positions 10 --entry-retry-backoff-ms 1000 --min-entry-quote-sol 0.01 --max-reference-age-ms 30000 --max-mark-age-ms 120000 --timer-late-tolerance-ms 1000 --max-future-skew-ms 5000 --risk-state-dir output/risk --horizon-min 5 --notional-sol 0.1 --starting-sol 10 --slippage-bps 50 --max-slippage-bps 1000 --priority-fee-lamports 2000 --jito-tip-lamports 10000 --fee 0.0125 --history-horizon-min 10 --history-max-mints 10000 --history-max-events-per-mint 3000 --history-max-total-events 150000 --tick-interval 1.0 --dex-interval 2.0 --memory-limit-mb 550 --memory-report-s 300 --shutdown-timeout-ms 25000 --resume"
 cwd = "/home/mdev/Programming/signals_trading"
 restart_policy = "always"
 max_restarts = 100

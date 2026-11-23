@@ -178,6 +178,10 @@ class LiveConfig:
     # before the host's OOM killer does, but normal running never restarts.
     memory_limit_mb: int = 550
     memory_report_s: float = 300.0
+    # Diagnostic only: start tracemalloc and log the top allocation growth
+    # between memory reports. Off by default because tracing has real CPU and
+    # memory overhead; enable it to locate a leak, not for a production run.
+    memory_trace: bool = False
     message_dedup_window: int = 10_000
     shutdown_timeout_ms: int = 25_000
 
@@ -325,18 +329,46 @@ def _read_channels(path: Path) -> list[str]:
     return list(dict.fromkeys(channels))
 
 
+def _count_scanner_cards(run_dir: Path) -> int:
+    """Count scanner cards already recorded in a run's ``signals.jsonl``.
+
+    Used when resuming a run whose scanner counters predate their persistence
+    (the legacy JSON snapshot): the summary is per run, not per process.
+    """
+    path = run_dir / "signals.jsonl"
+    if not path.exists():
+        return 0
+    total = 0
+    with path.open("rb") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            signal = row.get("signal") if isinstance(row, dict) else None
+            if (
+                isinstance(signal, dict)
+                and signal.get("message_type") == SCANNER_MESSAGE_TYPE
+            ):
+                total += 1
+    return total
+
+
 async def _ticker(
     engines: list[PaperEngine],
     dex: DexscreenerPoller,
     *,
     interval_s: float,
     history: MarketHistory | None = None,
+    feed: PumpApiFeed | None = None,
     memory_limit_mb: int = 0,
     report_s: float = 300.0,
+    memory_trace: bool = False,
     on_memory_limit: Callable[[float], None] | None = None,
 ) -> None:
     next_report = time.monotonic() + report_s
     guard_tripped = False
+    trace_previous: Any = None
     while True:
         before_sleep = time.monotonic()
         await asyncio.sleep(interval_s)
@@ -354,6 +386,15 @@ async def _ticker(
         for mint in list(dex.watched):
             if mint not in active:
                 dex.unwatch(mint)
+        # The PumpAPI feed keeps the same per-card watch set purely for
+        # introspection; without this it would hold one dead mint per card for
+        # the life of the process.
+        if feed is not None:
+            for mint in active:
+                feed.watch(mint)
+            for mint in list(feed.watched):
+                if mint not in active:
+                    feed.unwatch(mint)
         await asyncio.gather(*(engine.tick(now) for engine in engines))
 
         rss = _rss_mb()
@@ -373,14 +414,41 @@ async def _ticker(
             next_report = time.monotonic() + report_s
             LOGGER.info(
                 "memory rss_mb=%.0f peak_mb=%.0f loop_lag_max_ms=%.0f "
-                "history_mints=%s history_events=%s",
+                "history_mints=%s history_events=%s locks=%d "
+                "feed_watched=%d dex_watched=%d",
                 rss,
                 _MEMORY["peak_mb"],
                 _LOOP_LAG["max_ms"],
                 history.mint_count if history is not None else "-",
                 history.total_events if history is not None else "-",
+                sum(len(engine._locks) for engine in engines),
+                len(feed.watched) if feed is not None else -1,
+                len(dex.watched),
             )
             _LOOP_LAG["max_ms"] = 0.0
+            if memory_trace:
+                import tracemalloc
+
+                if tracemalloc.is_tracing():
+                    current, peak = tracemalloc.get_traced_memory()
+                    snapshot = tracemalloc.take_snapshot()
+                    growth = ""
+                    if trace_previous is not None:
+                        growth = "; ".join(
+                            f"{stat.traceback.format()[-1].strip()} "
+                            f"{stat.size_diff / 1024:+.0f}KB"
+                            for stat in snapshot.compare_to(
+                                trace_previous, "lineno"
+                            )[:5]
+                        )
+                    trace_previous = snapshot
+                    LOGGER.info(
+                        "tracemalloc traced_mb=%.1f peak_mb=%.1f "
+                        "growth_since_last_report=[%s]",
+                        current / (1024 * 1024),
+                        peak / (1024 * 1024),
+                        growth,
+                    )
 
 
 def _rss_mb() -> float | None:
@@ -440,7 +508,13 @@ def _risk_state_path(config: LiveConfig, rule: str, entry_mode: str) -> Path:
 def _recovery_fingerprint(
     config: LiveConfig, rule: str, entry_mode: str
 ) -> dict[str, Any]:
-    """Configuration that must not change while resuming a forward run."""
+    """Configuration that must not change while resuming a forward run.
+
+    Anything that changes which prints become trades, how they are priced or
+    when they are closed belongs here. A run resumed under a different guard is
+    a different experiment, even if the wallet and positions restore cleanly,
+    so the resumed sample would no longer be gate-eligible as one run.
+    """
     return {
         "mode": config.mode,
         "rule": rule,
@@ -449,34 +523,129 @@ def _recovery_fingerprint(
         "notional_sol": config.notional_sol,
         "fee": config.fee,
         "slippage": config.slippage,
+        "slippage_bps": config.slippage_bps,
+        "max_slippage_bps": config.max_slippage_bps,
+        # Exit convention.
         "horizon_min": config.horizon_min,
+        "horizon_settle_ms": config.horizon_settle_ms,
+        "tp_pct": config.tp_pct,
+        "sl_pct": config.sl_pct,
+        "exit_quote_timeout_ms": config.exit_quote_timeout_ms,
+        "preflight_exit_route": config.preflight_exit_route,
+        "exit_fallback_feed": config.exit_fallback_feed,
+        # Entry convention and fidelity guards.
         "entry_delay_ms": config.entry_delay_ms,
         "max_entry_delay_ms": config.max_entry_delay_ms,
+        "max_delivery_lag_ms": config.max_delivery_lag_ms,
+        "entry_retry_backoff_ms": config.entry_retry_backoff_ms,
+        "min_entry_quote_sol": config.min_entry_quote_sol,
+        "max_reference_age_ms": config.max_reference_age_ms,
+        "max_mark_age_ms": config.max_mark_age_ms,
+        "max_concurrent_positions": config.max_concurrent_positions,
+        "max_daily_loss_sol": config.max_daily_loss_sol,
+        "timer_late_tolerance_ms": config.timer_late_tolerance_ms,
+        "max_future_skew_ms": config.max_future_skew_ms,
+        # The history index supplies the marks/prices a resumed position is
+        # valued against, so its bounds are part of the measurement too.
+        "history": {
+            "horizon_ms": config.history_horizon_ms,
+            "max_mints": config.history_max_mints,
+            "max_events_per_mint": config.history_max_events_per_mint,
+            "max_total_events": config.history_max_total_events,
+        },
     }
+
+
+def _fingerprint_subset(saved: Any, current: Any) -> bool:
+    """True when every field in ``saved`` matches ``current``.
+
+    Used only to upgrade a snapshot written by an older build whose fingerprint
+    had fewer fields. Shared fields must still match exactly, so changing a
+    guard that the old build *did* track is refused; fields the old build never
+    recorded are assumed to have been the deployed values, and the warning in
+    ``run_live`` makes the upgrade visible.
+    """
+    if isinstance(saved, dict):
+        if not isinstance(current, dict):
+            return False
+        return all(
+            key in current and _fingerprint_subset(value, current[key])
+            for key, value in saved.items()
+        )
+    return saved == current
+
+
+def _parse_iso_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+def _run_started_at(
+    recovered: dict[str, Any], run_dir: Path, fallback: datetime
+) -> datetime:
+    """Original run start, so a resume does not restamp the sample.
+
+    The snapshot carries ``started_at`` for runs written after this field was
+    added; older snapshots fall back to the run's ``meta.json``. If neither is
+    readable the process start is used rather than refusing a recovery that
+    holds real open positions; the log makes the downgrade visible.
+    """
+    from_snapshot = _parse_iso_utc(recovered.get("started_at"))
+    if from_snapshot is not None:
+        return from_snapshot
+    meta_path = run_dir / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        meta = None
+    if isinstance(meta, dict):
+        from_meta = _parse_iso_utc(meta.get("started_at"))
+        if from_meta is not None:
+            return from_meta
+    LOGGER.warning(
+        "could not recover the original started_at for %s; using %s",
+        run_dir,
+        fallback.isoformat(),
+    )
+    return fallback
 
 
 def _state_saver(
     store: RecoveryStore,
     lane: StrategyLane,
     fingerprint: dict[str, Any],
+    *,
+    started_at: str | None = None,
 ) -> Callable[[dict[str, Any]], None]:
     """Return a callback that persists one lane's restart snapshot.
 
-    The run directory and configuration fingerprint travel with the snapshot so
-    a later ``--resume`` cannot attach a different lane or a changed strategy
-    to an existing five-day sample.
+    The run directory, original start time and configuration fingerprint travel
+    with the snapshot so a later ``--resume`` cannot attach a different lane or
+    a changed strategy to an existing five-day sample.
     """
 
     def save(state: dict[str, Any]) -> None:
-        store.save(
-            {
-                "run_dir": str(lane.run_dir),
-                "fingerprint": fingerprint,
-                "wallet": state["wallet"],
-                "token_balances": state["token_balances"],
-                "positions": state["positions"],
-            }
-        )
+        payload: dict[str, Any] = {
+            "run_dir": str(lane.run_dir),
+            "fingerprint": fingerprint,
+            "wallet": state["wallet"],
+            "token_balances": state["token_balances"],
+            "positions": state["positions"],
+        }
+        if started_at is not None:
+            payload["started_at"] = started_at
+        try:
+            store.save(payload)
+        except RuntimeError:
+            # A failed snapshot must be loud, but it must not stop the exits
+            # that are already in flight. The next successful write repairs
+            # the snapshot; until then a crash cannot be resumed.
+            LOGGER.exception("could not persist the restart snapshot")
 
     return save
 
@@ -488,6 +657,8 @@ def _lane_meta(
     rule: str,
     entry_mode: str,
     is_ab: bool,
+    started_at: str,
+    resumed_at: str | None = None,
 ) -> dict[str, Any]:
     return {
         "mode": (
@@ -515,6 +686,10 @@ def _lane_meta(
         "risk_state_dir": config.risk_state_dir,
         "risk_state_file": str(_risk_state_path(config, rule, entry_mode)),
         "resume": config.resume,
+        "started_at": started_at,
+        # Present only when this process continued an existing run; the run's
+        # original start stays in ``started_at`` so the sample is not restamped.
+        "resumed_at": resumed_at,
         "recovery_state_db": (
             str(config.state_db) if config.state_db is not None else None
         ),
@@ -543,7 +718,6 @@ def _lane_meta(
         "reports": config.reports,
         "max_seconds": config.max_seconds,
         "ab_rule": config.ab_rule,
-        "started_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -559,6 +733,8 @@ def _create_lane(
     env: dict[str, str],
     primary: bool,
     is_ab: bool,
+    started_at: str,
+    resumed_at: str | None,
 ) -> StrategyLane:
     wallet = PaperWallet(WalletConfig(starting_sol=config.starting_sol))
     broker = PaperBroker(
@@ -572,7 +748,13 @@ def _create_lane(
     store = PaperStore(
         run_dir,
         meta=_lane_meta(
-            config, lane=name, rule=rule, entry_mode=entry_mode, is_ab=is_ab
+            config,
+            lane=name,
+            rule=rule,
+            entry_mode=entry_mode,
+            is_ab=is_ab,
+            started_at=started_at,
+            resumed_at=resumed_at,
         ),
     )
     reporter = TelegramReporter.from_env(
@@ -688,7 +870,17 @@ def _write_ab_summary(
 
 
 async def run_live(config: LiveConfig) -> dict[str, Any]:
-    started_at_ms = int(time.time() * 1000)
+    process_started_at = datetime.now(UTC)
+    started_at_ms = int(process_started_at.timestamp() * 1000)
+    if config.memory_trace:
+        import tracemalloc
+
+        if not tracemalloc.is_tracing():
+            tracemalloc.start(10)
+        LOGGER.warning(
+            "tracemalloc diagnostics enabled; expect extra overhead "
+            "(this is a leak-hunt run, not a gate sample)"
+        )
     _MEMORY["peak_mb"] = 0.0
     env = _load_env(env_file())
     api_key = env.get("JUPITER_API_KEY") or os.environ.get("JUPITER_API_KEY")
@@ -725,8 +917,19 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
     recovery: RecoveryStore | None = None
     recovered: dict[str, Any] | None = None
     fingerprint: dict[str, Any] | None = None
+    run_started_at = process_started_at
+    resumed_at: datetime | None = None
     if config.state_db is not None:
         recovery = RecoveryStore(config.state_db)
+        try:
+            pruned = recovery.prune_events(time.time() - 30 * 86400)
+            if pruned:
+                LOGGER.info(
+                    "pruned %d processed-event claims older than 30 days",
+                    pruned,
+                )
+        except RuntimeError:
+            LOGGER.exception("could not prune processed-event claims")
         fingerprint = _recovery_fingerprint(
             config, config.rule, config.entry_mode
         )
@@ -738,17 +941,31 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                     "saved state; start once without --resume to create it"
                 )
             if recovered["fingerprint"] != fingerprint:
-                raise RuntimeError(
-                    "recovery state was written for a different "
-                    f"configuration: saved={recovered['fingerprint']} "
-                    f"current={fingerprint}"
+                if not _fingerprint_subset(
+                    recovered["fingerprint"], fingerprint
+                ):
+                    raise RuntimeError(
+                        "recovery state was written for a different "
+                        f"configuration: saved={recovered['fingerprint']} "
+                        f"current={fingerprint}"
+                    )
+                LOGGER.warning(
+                    "upgrading a recovery fingerprint written by an older "
+                    "build (saved=%s); shared fields match, newly tracked "
+                    "guards take the deployed values",
+                    recovered["fingerprint"],
                 )
             config.run_dir = Path(recovered["run_dir"])
+            run_started_at = _run_started_at(
+                recovered, config.run_dir, process_started_at
+            )
+            resumed_at = process_started_at
             LOGGER.warning(
-                "resuming run %s from %s (open positions=%d)",
+                "resuming run %s from %s (open positions=%d); run started %s",
                 config.run_dir,
                 config.state_db,
                 len(recovered["positions"]),
+                run_started_at.isoformat(),
             )
         else:
             LOGGER.info(
@@ -831,13 +1048,24 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             env=env,
             primary=index == 0,
             is_ab=is_ab,
+            started_at=run_started_at.isoformat(),
+            resumed_at=(
+                resumed_at.isoformat() if resumed_at is not None else None
+            ),
         )
         if recovery is not None and fingerprint is not None:
             lane.engine.on_state_change = _state_saver(
-                recovery, lane, fingerprint
+                recovery,
+                lane,
+                fingerprint,
+                started_at=run_started_at.isoformat(),
             )
             if recovered is not None:
                 lane.engine.restore_state(recovered)
+                # Rewrite the snapshot immediately: this upgrades a legacy
+                # fingerprint to the full one and records this resumed run's
+                # original started_at in the new store.
+                lane.engine.persist_state()
                 LOGGER.warning(
                     "restored lane %s: cash=%.6f SOL, token_balances=%d",
                     lane.name,
@@ -911,6 +1139,38 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
     )
     scanner_counted: OrderedDict[tuple[str, str], None] = OrderedDict()
 
+    # The run summary's scanner totals are cumulative for the *run*, not for
+    # this process: a resumed sample must not report only the cards seen since
+    # the restart. Counters are persisted next to the recovery snapshot and
+    # are only restored when this process actually resumed that run.
+    if recovery is not None and recovered is not None:
+        try:
+            saved_stats = recovery.load_aux("scanner_stats")
+        except RuntimeError:
+            LOGGER.exception("could not read persisted scanner counters")
+            saved_stats = None
+        if isinstance(saved_stats, dict):
+            for name in ("cards", "duplicates"):
+                try:
+                    scanner_stats[name] = int(saved_stats.get(name) or 0)
+                except (TypeError, ValueError):
+                    pass
+        elif recovered is not None:
+            # A legacy snapshot (or a run that predates counter persistence)
+            # has no aux row; seed the card count from the audit trail so the
+            # resumed summary does not restart at zero. Duplicates cannot be
+            # reconstructed, so they stay at zero for the migrated run.
+            scanner_stats["cards"] = _count_scanner_cards(
+                Path(recovered["run_dir"])
+            )
+    def persist_scanner_stats() -> None:
+        if recovery is None:
+            return
+        try:
+            recovery.save_aux("scanner_stats", dict(scanner_stats))
+        except RuntimeError:
+            LOGGER.exception("could not persist scanner counters")
+
     async def on_message(
         *,
         channel: str,
@@ -924,6 +1184,17 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
         seen[key] = None
         if len(seen) > config.message_dedup_window:
             seen.popitem(last=False)
+        if (
+            recovery is not None
+            and message_id
+            and not recovery.claim_event(f"message:{channel}:{message_id}")
+        ):
+            LOGGER.debug(
+                "message %s/%s was already processed before the restart",
+                channel,
+                message_id,
+            )
+            return
         for lane in lanes:
             signal = parse_signal_text(
                 message,
@@ -938,13 +1209,26 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                 and signal.message_type == SCANNER_MESSAGE_TYPE
             ):
                 count_key = (channel, signal.token_address)
-                if count_key in scanner_counted:
+                # Durable pool identity: a repost delivered after a restart is
+                # the same pool, so it must not count as a new card or become
+                # a second trade.
+                already_claimed = count_key in scanner_counted
+                if (
+                    not already_claimed
+                    and recovery is not None
+                    and signal.token_address
+                ):
+                    already_claimed = not recovery.claim_event(
+                        f"scanner:{channel}:{signal.token_address}"
+                    )
+                if already_claimed:
                     scanner_stats["duplicates"] += 1
                 else:
                     scanner_stats["cards"] += 1
                     scanner_counted[count_key] = None
                     if len(scanner_counted) > config.message_dedup_window:
                         scanner_counted.popitem(last=False)
+                persist_scanner_stats()
             if (
                 lane.rule == SCANNER_RULE
                 and signal.message_type == SCANNER_MESSAGE_TYPE
@@ -956,6 +1240,24 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         lane.name,
                         signal.token_address,
                     )
+                    continue
+                if (
+                    recovery is not None
+                    and signal.token_address
+                    and not recovery.claim_event(
+                        f"scanner_trade:{lane.name}:{channel}:"
+                        f"{signal.token_address}"
+                    )
+                ):
+                    LOGGER.debug(
+                        "scanner card lane=%s %s was traded before the "
+                        "restart; ignoring the repost",
+                        lane.name,
+                        signal.token_address,
+                    )
+                    scanner_seen[scanner_key] = None
+                    if len(scanner_seen) > config.message_dedup_window:
+                        scanner_seen.popitem(last=False)
                     continue
                 scanner_seen[scanner_key] = None
                 if len(scanner_seen) > config.message_dedup_window:
@@ -1028,8 +1330,10 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             dex,
             interval_s=config.tick_interval_s,
             history=history,
+            feed=feed,
             memory_limit_mb=config.memory_limit_mb,
             report_s=config.memory_report_s,
+            memory_trace=config.memory_trace,
             on_memory_limit=lambda rss: request_shutdown(
                 f"memory_limit:{rss:.0f}MB"
             ),
@@ -1148,6 +1452,19 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         "shutdown_reason": shutdown_reason,
                         "scanner_cards": scanner_stats["cards"],
                         "scanner_duplicates": scanner_stats["duplicates"],
+                        # ``started_at`` is the original run start (preserved
+                        # across resumes); the process timings are this
+                        # process only, so a restarted sample is not reported
+                        # as younger than it is.
+                        "started_at": run_started_at.isoformat(),
+                        "resumed_at": (
+                            resumed_at.isoformat()
+                            if resumed_at is not None
+                            else None
+                        ),
+                        "process_started_at": process_started_at.isoformat(),
+                        "process_runtime_ms": int(time.time() * 1000)
+                        - started_at_ms,
                         "stopped_at": datetime.now(UTC).isoformat(),
                     }
                 )
@@ -1162,6 +1479,11 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                     )
 
         await asyncio.gather(*(finalize_lane(lane) for lane in lanes))
+        if recovery is not None:
+            try:
+                recovery.close()
+            except Exception:  # noqa: BLE001 - shutdown must not mask results
+                LOGGER.exception("could not close the recovery state store")
         if is_ab:
             try:
                 _write_ab_summary(
@@ -1191,16 +1513,16 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                     "rule": lane.rule,
                     "entry_mode": lane.entry_mode,
                     "run_dir": str(lane.run_dir),
-                    "closed": len(lane.engine.closed),
-                    "skips": len(lane.engine.skips),
-                    "signals": len(lane.engine.signal_log),
+                    "closed": lane.engine.closed_total,
+                    "skips": lane.engine.skip_total,
+                    "signals": lane.engine.signal_total,
                 }
                 for lane in lanes
             },
         }
     return {
         "run_dir": str(config.run_dir),
-        "closed": len(primary.engine.closed),
-        "skips": len(primary.engine.skips),
-        "signals": len(primary.engine.signal_log),
+        "closed": primary.engine.closed_total,
+        "skips": primary.engine.skip_total,
+        "signals": primary.engine.signal_total,
     }

@@ -120,7 +120,7 @@ edit the `ExecStart` line in the service to `run_bot.sh live`, set
 `daemon-reload` + `restart`.
 
 For a continuous forward sample across service restarts, start once without
-recovery (that seeds `output/recovery/<rule>_<entry-mode>.json`), then set
+recovery (that seeds `output/recovery/<rule>_<entry-mode>.sqlite3`), then set
 `Environment=RESUME=1` in `deploy/paper-bot.service` (or prefix the `nohup`
 command with `RESUME=1`) so every later start continues the same run
 directory. This is deliberately fail-closed: if the snapshot is missing or
@@ -146,7 +146,8 @@ open positions within `shutdown_timeout_ms` (25 s default).
 - **Notional cap.** `max_notional_sol` (default 0.1 SOL) enforced before every order.
 - **Slippage ceiling.** Buys and sells never exceed `--max-slippage-bps` (default 10 %); past that the trade is skipped or the position is written off.
 - **Optional mint allowlist.** `LIVE_MINT_ALLOWLIST` in `.env` restricts which mints can be traded live.
-- **Memory guard.** Self-restarts above 550 MB RSS instead of being OOM-killed; systemd restarts it.
+- **Memory guard.** Self-restarts above 550 MB RSS instead of being OOM-killed; systemd restarts it. The 5-minute memory line logs `locks`, `feed_watched` and `dex_watched`; dormant per-mint locks and watch entries are pruned every tick, so those counters stay flat. The engine also keeps only a bounded in-memory audit tail (`closed` 5,000, `skips` 20,000, `signal_log` 20,000) while the JSONL files remain the record of truth; run summaries report cumulative counters, not the tail length. The token-decimals cache is LRU-capped at 50,000 mints. For a leak hunt, add `--memory-trace`: tracemalloc starts and each memory report logs the top five allocation sites by growth since the previous report (diagnostic only; it adds overhead and should not be used for a gate sample).
+- **Recovery state is SQLite.** Restart snapshots live in `output/recovery/<rule>_<entry-mode>.sqlite3` (WAL, `synchronous=FULL`, one transaction per snapshot, schema version via `PRAGMA user_version`). The same file records processed Telegram/scanner ids so a redelivered message or reposted pool is not traded twice after a restart; identical claims older than 30 days are pruned at startup. A legacy `*.json` snapshot is imported once and archived as `*.json.imported`.
 - **Graceful shutdown.** On SIGTERM, open positions are closed within 25 s and a run summary is written.
 - **Secrets never logged.** A logging filter redacts bot tokens and API keys.
 - **Faster landing with priority fees.** Live mode supports `LIVE_PRIORITY_FEE_LAMPORTS` and `LIVE_JITO_TIP_LAMPORTS`, and the `--priority-fee-lamports`/`--jito-tip-lamports` CLI flags. CLI flags take precedence; an explicit `0` overrides the env var. `run_bot.sh` defaults to 2000 lamports priority fee and 10000 lamports Jito tip.
@@ -209,16 +210,27 @@ What to watch in the first days:
 - A failed write during the run blocks new entries (`risk_state_unavailable`)
   while exits continue.
 - **Restart recovery (paper only).** Every single-lane paper start writes
-  `output/recovery/<rule>_<entry-mode>.json` (one atomically replaced JSON
-  file) with the wallet, token balances, open positions, the original run
-  directory and a strategy fingerprint. Start with `--resume` (or
-  `RESUME=1 ./run_bot.sh paper`) to continue that run instead of opening a new
-  timestamped directory. Recovery is fail-closed: a missing file, corrupt JSON,
-  unsupported version, non-finite number, or a fingerprint mismatch (rule,
-  entry mode, sizing, fee, horizon) refuses to start. Positions already present
-  in `trades.jsonl` are not closed twice, and open positions are re-subscribed
-  for marks and retried exits. Live mode never restores local state: its
-  balances come from the chain.
+  `output/recovery/<rule>_<entry-mode>.sqlite3` (SQLite, WAL,
+  `synchronous=FULL`, one transaction per snapshot) with the wallet, token
+  balances, open positions, the original run directory, the run's original
+  `started_at` and a configuration fingerprint. A legacy
+  `<rule>_<entry-mode>.json` from an earlier build is imported once and
+  archived as `*.json.imported`.
+  Start with `--resume` (or `RESUME=1 ./run_bot.sh paper`) to continue that run
+  instead of opening a new timestamped directory. The deployed oxmgr command
+  already passes `--resume`; the first start of a *new* sample must seed the
+  snapshot without it (see the oxfile notes), because a missing file is
+  deliberately refused. Recovery is fail-closed: corrupt JSON, unsupported
+  version, non-finite number, or a fingerprint mismatch refuses to start. The
+  fingerprint covers the entry convention, every fidelity guard (delivery lag,
+  minimum quote notional, reference/mark age, concurrency, daily loss cap,
+  timer lateness, future skew), the exit settings and the history bounds, so a
+  restarted run cannot silently become a different experiment. Positions
+  already present in `trades.jsonl` are not closed twice, and open positions
+  are re-subscribed for marks and retried exits. `meta.json` keeps the original
+  `started_at` across resumes (`resumed_at` records this process); `runtime_ms`
+  in summaries is always per-process, never the age of the sample. Live mode
+  never restores local state: its balances come from the chain.
 - Without `--resume`, a restart still starts a fresh wallet from
   `--starting-sol` in a new run directory. For the five-day gate, either run
   uninterrupted or run with `RESUME=1` so restarts continue the same

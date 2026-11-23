@@ -285,6 +285,108 @@ class ForwardGateTests(unittest.TestCase):
         self.assertLess(execution["entry_failure_rate"], 0.10)
         self.assertTrue(execution["passed"])
 
+    def _write_signal(
+        self,
+        handle: object,
+        *,
+        allowed: bool,
+        message_type: str = "scanner_pool_launch",
+        reasons: list[str] | None = None,
+    ) -> None:
+        handle.write(
+            json.dumps(
+                {
+                    "signal": {"message_type": message_type},
+                    "decision": {
+                        "allowed": allowed,
+                        "reasons": reasons or [],
+                    },
+                }
+            )
+            + "\n"
+        )
+
+    def test_censor_share_exposes_rejected_scanner_cards(self) -> None:
+        # A 100 % fill rate only measures cards that reached the entry gate.
+        # Cards rejected earlier (late delivery, missed print, timer lateness,
+        # concurrency) leave both numerator and denominator, so the gate alone
+        # cannot tell a selective bot from a lucky one. The execution report
+        # must show the traded share of all scanner cards and the reasons.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=300, days=5, pnl=0.01)
+            with (root / "signals.jsonl").open("w", encoding="utf-8") as handle:
+                for _ in range(300):
+                    self._write_signal(handle, allowed=True)
+                for _ in range(50):
+                    self._write_signal(
+                        handle,
+                        allowed=False,
+                        reasons=["delivery_lag_exceeded"],
+                    )
+                for _ in range(20):
+                    self._write_signal(
+                        handle,
+                        allowed=False,
+                        reasons=["missed_eligible_print"],
+                    )
+                # Non-scanner rows are excluded from the scanner population.
+                for _ in range(5):
+                    self._write_signal(
+                        handle,
+                        allowed=False,
+                        message_type="other_channel",
+                    )
+            result = evaluate(root)
+        execution = result["gates"]["execution"]
+        self.assertEqual(execution["scanner_cards"], 370)
+        self.assertEqual(execution["scanner_cards_allowed"], 300)
+        self.assertEqual(execution["signals_allowed"], 300)
+        self.assertAlmostEqual(execution["censor_share"], 70 / 370)
+        self.assertEqual(
+            execution["rejection_reason_counts"],
+            {"delivery_lag_exceeded": 50, "missed_eligible_print": 20},
+        )
+        # Visibility only: the frozen gate verdict is unchanged.
+        self.assertTrue(execution["passed"])
+
+    def test_unparsable_signal_row_fails_input_integrity(self) -> None:
+        # A torn line after a hard kill must not vanish: dropping a rejection
+        # row would flatter the fill rate and hide the censor share.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=300, days=5, pnl=0.01)
+            with (root / "signals.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write('{"decision": {"allowed": tr\n')
+            result = evaluate(root)
+        integrity = result["gates"]["input_integrity"]
+        self.assertFalse(integrity["passed"])
+        self.assertEqual(integrity["corrupt_rows"]["signals"], 1)
+        self.assertEqual(result["corrupt_rows"]["signals"], 1)
+        self.assertFalse(result["passed"])
+
+    def test_trade_missing_pnl_fails_instead_of_counting_as_zero(self) -> None:
+        # ``row.get("pnl_sol") or 0.0`` used to turn a damaged row into a flat
+        # trade, which is indistinguishable from a real break-even exit.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=300, days=5, pnl=0.01)
+            rows = [
+                json.loads(line)
+                for line in (root / "trades.jsonl").read_text().splitlines()
+            ]
+            del rows[0]["pnl_sol"]
+            (root / "trades.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            result = evaluate(root)
+        integrity = result["gates"]["input_integrity"]
+        self.assertFalse(integrity["passed"])
+        self.assertEqual(integrity["malformed_trades"], 1)
+        self.assertEqual(result["malformed_trades"], 1)
+        self.assertFalse(result["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -69,6 +70,14 @@ LOGGER = logging.getLogger(__name__)
 # Version 1 is the only supported on-disk daily-risk schema. Bump it when the
 # format changes so an older binary refuses to guess at a newer file.
 RISK_STATE_VERSION = 1
+
+# Upper bounds for the in-memory audit tails. These are not the record of
+# truth (the JSONL files are), only what the process keeps for debugging and
+# summaries. Without a bound, RSS grows with messages processed and a
+# multi-day forward run eventually trips the memory guard.
+IN_MEMORY_CLOSED = 5_000
+IN_MEMORY_SKIPS = 20_000
+IN_MEMORY_SIGNALS = 20_000
 
 
 def _reject_json_constant(value: str) -> None:
@@ -310,9 +319,19 @@ class PaperEngine:
 
         self.pending: dict[str, PendingEntry] = {}
         self.positions: dict[str, Position] = {}
-        self.closed: list[ClosedTrade] = []
-        self.skips: list[SkipRecord] = []
-        self.signal_log: list[tuple[Signal, GateDecision]] = []
+        # In-memory audit tails only. ``signals.jsonl``/``skips.jsonl``/
+        # ``trades.jsonl`` are the source of truth; a five-day forward run can
+        # process tens of thousands of messages, so keeping every one of them
+        # alive would make RSS grow with run length. The run summary reports
+        # the separate totals below.
+        self.closed: deque[ClosedTrade] = deque(maxlen=IN_MEMORY_CLOSED)
+        self.skips: deque[SkipRecord] = deque(maxlen=IN_MEMORY_SKIPS)
+        self.signal_log: deque[tuple[Signal, GateDecision]] = deque(
+            maxlen=IN_MEMORY_SIGNALS
+        )
+        self.closed_total = 0
+        self.skip_total = 0
+        self.signal_total = 0
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         # Realized PnL by UTC day, used only by the optional daily loss cap.
@@ -356,6 +375,26 @@ class PaperEngine:
             lock = asyncio.Lock()
             self._locks[mint] = lock
         return lock
+
+    def _prune_locks(self) -> None:
+        """Drop per-mint locks for dormant mints.
+
+        ``_lock`` is keyed by mint and was never pruned, so a 24/7 run grew one
+        asyncio.Lock per card ever quoted. A lock is only needed while the mint
+        is pending, open, or a task is inside its critical section; tick runs
+        outside every such section, so anything else is safe to drop.
+        """
+        if not self._locks:
+            return
+        stale = [
+            mint
+            for mint, lock in self._locks.items()
+            if mint not in self.pending
+            and mint not in self.positions
+            and not lock.locked()
+        ]
+        for mint in stale:
+            self._locks.pop(mint, None)
 
     def wallet_snapshot(self) -> dict[str, Any] | None:
         """Snapshot cash plus open token inventory, with mark freshness.
@@ -818,6 +857,7 @@ class PaperEngine:
             message_id=message_id,
         )
         self.skips.append(skip)
+        self.skip_total += 1
         if self.store is not None:
             self.store.record_skip(skip)
 
@@ -950,6 +990,35 @@ class PaperEngine:
                     features=decision.features,
                 )
                 rejection_reason = "duplicate_pending_signal"
+            elif (
+                self.config.max_future_skew_ms > 0
+                and received_ms > 0
+                and received_ms + self.config.max_future_skew_ms
+                < signal.signal_ts_ms
+            ):
+                # The card claims to have been posted after we received it.
+                # Telegram timestamps are server-side UTC, so this means the
+                # host clock is behind; pricing "card + 5 s" would then point
+                # into our future and shift every entry. Reject instead of
+                # silently running an unmeasurable convention.
+                skew_ms = signal.signal_ts_ms - received_ms
+                LOGGER.warning(
+                    "signal timestamp is %d ms in the future; check the host "
+                    "clock (%s)",
+                    skew_ms,
+                    mint,
+                )
+                final = GateDecision(
+                    allowed=False,
+                    rule=decision.rule,
+                    reasons=["signal_timestamp_in_future"],
+                    features=decision.features,
+                )
+                rejection_reason = "signal_timestamp_in_future"
+                rejection_detail = (
+                    f"clock_skew_ms={skew_ms};"
+                    f"max_future_skew_ms={self.config.max_future_skew_ms}"
+                )
             elif (
                 self.config.max_delivery_lag_ms > 0
                 and received_ms > 0
@@ -1117,6 +1186,7 @@ class PaperEngine:
         # ``allowed=true`` for a signal the safety screen or duplicate check
         # rejected, which made replay/audit reconciliation impossible.
         self.signal_log.append((signal, final))
+        self.signal_total += 1
         if self.store is not None:
             self.store.record_signal(signal, final)
         return final
@@ -1945,6 +2015,7 @@ class PaperEngine:
             ),
         )
         self.closed.append(trade)
+        self.closed_total += 1
         day = self._day_key(trade.exit_ts_ms)
         self._daily_pnl[day] = self._daily_pnl.get(day, 0.0) + trade.pnl_sol
         self._persist_daily_pnl()
@@ -1967,6 +2038,7 @@ class PaperEngine:
         self, now_ms: int | None = None, *, await_actions: bool = False
     ) -> None:
         now = self._now() if now_ms is None else int(now_ms)
+        self._prune_locks()
 
         for pending in list(self.pending.values()):
             if pending.in_flight:

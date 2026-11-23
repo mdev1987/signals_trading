@@ -29,7 +29,7 @@ from paper_bot.execution import (  # noqa: E402
     jupiter_error_reason,
     live_config_from_env,
 )
-from paper_bot.feeds import parse_pump_event  # noqa: E402
+from paper_bot.feeds import PumpApiFeed, parse_pump_event  # noqa: E402
 from paper_bot.history import MarketHistory  # noqa: E402
 from paper_bot.models import (  # noqa: E402
     PendingEntry,
@@ -293,6 +293,17 @@ class PumpApiFeedParsingTests(unittest.TestCase):
             "[]",
         ):
             self.assertIsNone(parse_pump_event(payload, 0), payload)
+
+    def test_watch_set_can_be_pruned(self) -> None:
+        async def on_trade(event: object) -> None:
+            return None
+
+        feed = PumpApiFeed(on_trade)
+        feed.watch("a")
+        feed.watch("b")
+        feed.unwatch("a")
+        feed.unwatch("never-watched")
+        self.assertEqual(feed.watched, {"b"})
 
 
 class HotMoneyGateTests(unittest.TestCase):
@@ -588,6 +599,33 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.reasons, ["delivery_lag_exceeded"])
         self.assertEqual(engine.skips[-1].reason, "delivery_lag_exceeded")
         self.assertNotIn(MINT, engine.pending)
+
+    async def test_card_from_the_future_is_rejected_as_clock_skew(self) -> None:
+        # Telegram timestamps are server UTC. If receipt time is behind the
+        # card, the host clock is behind and "card + 5 s" points into the
+        # future; the run would silently price a different window.
+        engine = self.engine(max_future_skew_ms=5_000)
+        signal_ts = self.NOW_MS + 30_000
+        decision = await engine.on_signal(
+            self.make_signal(
+                signal_ts_ms=signal_ts, received_ts_ms=self.NOW_MS
+            )
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["signal_timestamp_in_future"])
+        self.assertEqual(engine.skips[-1].reason, "signal_timestamp_in_future")
+        self.assertIn("clock_skew_ms=30000", engine.skips[-1].detail or "")
+        self.assertNotIn(MINT, engine.pending)
+
+    async def test_small_clock_skew_is_tolerated(self) -> None:
+        engine = self.engine(max_future_skew_ms=5_000)
+        decision = await engine.on_signal(
+            self.make_signal(
+                signal_ts_ms=self.NOW_MS + 1_000,
+                received_ts_ms=self.NOW_MS,
+            )
+        )
+        self.assertTrue(decision.allowed)
 
     async def test_card_within_the_lag_window_is_traded(self) -> None:
         engine = self.engine(max_delivery_lag_ms=60_000)
@@ -1065,6 +1103,29 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
         snapshot = reporter.wallet_snapshot()
         assert snapshot is not None
         self.assertAlmostEqual(snapshot["equity_sol"], 9.9 + 0.2)
+
+    async def test_tick_prunes_locks_for_dormant_mints(self) -> None:
+        # ``_lock`` is keyed by mint; over a 24/7 run one lock per card ever
+        # quoted accumulated forever. A lock is needed only while the mint is
+        # pending/open, so tick must drop the rest.
+        engine = self.engine()
+        engine.pending[MINT] = PendingEntry(
+            signal=self.make_signal(),
+            eligible_at_ms=self.NOW_MS,
+            expires_at_ms=self.NOW_MS + 60_000,
+        )
+        active_lock = engine._lock(MINT)
+        engine._lock("dormant-mint")
+        await engine.tick()
+        self.assertIs(engine._locks[MINT], active_lock)
+        self.assertNotIn("dormant-mint", engine._locks)
+
+    async def test_tick_keeps_a_lock_that_is_still_held(self) -> None:
+        engine = self.engine()
+        lock = engine._lock("dormant-mint")
+        async with lock:
+            await engine.tick()
+        self.assertIn("dormant-mint", engine._locks)
 
 
 class LiveGuardTests(unittest.TestCase):

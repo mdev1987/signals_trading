@@ -266,8 +266,9 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help=(
-            "paper restart-recovery file used with --resume "
-            "(default output/recovery/<rule>_<entry-mode>.json)"
+            "paper restart-recovery SQLite store used with --resume "
+            "(default output/recovery/<rule>_<entry-mode>.sqlite3; a legacy "
+            ".json at that name is imported once)"
         ),
     )
     parser.add_argument("--safety-screen", action="store_true")
@@ -321,6 +322,14 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=300.0,
         help="seconds between memory telemetry log lines",
+    )
+    parser.add_argument(
+        "--memory-trace",
+        action="store_true",
+        help=(
+            "start tracemalloc and log allocation growth between memory "
+            "reports (diagnostic; adds overhead)"
+        ),
     )
     parser.add_argument(
         "--max-seconds",
@@ -524,6 +533,7 @@ def main() -> int:
             history_max_total_events=args.history_max_total_events,
             memory_limit_mb=args.memory_limit_mb,
             memory_report_s=args.memory_report_s,
+            memory_trace=args.memory_trace,
             telegram=not args.no_telegram,
             reports=not args.no_reports,
             report_commands=not args.no_report_commands,

@@ -60,7 +60,14 @@ def load(
             continue
         frame = pd.read_csv(path)
         frame["day"] = day
-        if fill_mode is not None and "entry_fill_mode" in frame:
+        if fill_mode is not None:
+            if "entry_fill_mode" not in frame:
+                # Silently ignoring the requested convention would mix fill
+                # modes and present it as one comparison.
+                raise ValueError(
+                    f"{path} has no 'entry_fill_mode' column; cannot apply "
+                    f"--fill-mode {fill_mode!r}"
+                )
             # The pricing tool records the convention it used; never mix
             # last-before and first-after rows in one comparison.
             frame = frame[frame["entry_fill_mode"] == fill_mode]

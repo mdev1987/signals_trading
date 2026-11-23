@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from typing import Any
 
 import httpx
@@ -20,6 +21,11 @@ import httpx
 from .models import WSOL_MINT, FillQuote
 
 LOGGER = logging.getLogger(__name__)
+
+# Decimals are immutable per mint, so caching them is safe indefinitely; the
+# bound is only there so a very long run cannot accumulate an entry for every
+# mint ever resolved. Eviction just costs one more lookup.
+MAX_DECIMALS_CACHE = 50_000
 
 
 class QuoteError(RuntimeError):
@@ -153,7 +159,13 @@ class TokenMetadataResolver:
         self.timeout_s = timeout_s
         self._client = client
         self._owns_client = client is None
-        self._cache: dict[str, int] = {}
+        self._cache: OrderedDict[str, int] = OrderedDict()
+
+    def _remember(self, mint: str, decimals: int) -> None:
+        self._cache[mint] = int(decimals)
+        self._cache.move_to_end(mint)
+        while len(self._cache) > MAX_DECIMALS_CACHE:
+            self._cache.popitem(last=False)
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -167,10 +179,11 @@ class TokenMetadataResolver:
 
     async def decimals(self, mint: str, event_decimals: int | None = None) -> int:
         if event_decimals is not None and event_decimals >= 0:
-            self._cache[mint] = int(event_decimals)
+            self._remember(mint, event_decimals)
             return int(event_decimals)
         cached = self._cache.get(mint)
         if cached is not None:
+            self._cache.move_to_end(mint)
             return cached
 
         client = await self._get_client()
@@ -212,7 +225,7 @@ class TokenMetadataResolver:
             if item.get("id") == mint or item.get("address") == mint:
                 raw = item.get("decimals")
                 if raw is not None:
-                    self._cache[mint] = int(raw)
+                    self._remember(mint, int(raw))
                     return int(raw)
         return self._or_fallback(mint, "unknown_decimals", mint)
 
@@ -232,7 +245,7 @@ class TokenMetadataResolver:
                     reason,
                     PUMPFUN_DECIMALS,
                 )
-            self._cache[mint] = PUMPFUN_DECIMALS
+            self._remember(mint, PUMPFUN_DECIMALS)
             return PUMPFUN_DECIMALS
         raise QuoteError(reason, detail)
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -39,12 +40,21 @@ MIN_ENTRY_FILL_RATE = 0.80
 MAX_ENTRY_FAILURE_RATE = 0.10
 BOOTSTRAP_LOWER_QUANTILE = 0.05
 BOOTSTRAP_LOSS_ALLOWANCE = 0.05
+SCANNER_MESSAGE_TYPE = "scanner_pool_launch"
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+def _read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
+    """Return ``(rows, unparsable)``.
+
+    A torn final line after a hard kill is counted instead of silently
+    dropped: losing a trade row flatters the median, and losing a rejection
+    row flatters the fill rate. The caller fails the input-integrity gate
+    when this is non-zero.
+    """
     if not path.exists():
-        return []
+        return [], 0
     rows: list[dict[str, Any]] = []
+    corrupt = 0
     with path.open("rb") as handle:
         for line in handle:
             line = line.strip()
@@ -53,10 +63,13 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
+                corrupt += 1
                 continue
             if isinstance(payload, dict):
                 rows.append(payload)
-    return rows
+            else:
+                corrupt += 1
+    return rows, corrupt
 
 
 def _day(ts_ms: Any) -> str | None:
@@ -103,14 +116,35 @@ def cluster_bootstrap(
 
 
 def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
-    trades = _read_jsonl(run_dir / "trades.jsonl")
-    skips = _read_jsonl(run_dir / "skips.jsonl")
-    signals = _read_jsonl(run_dir / "signals.jsonl")
-    entries = _read_jsonl(run_dir / "entries.jsonl")
+    trades, corrupt_trades = _read_jsonl(run_dir / "trades.jsonl")
+    skips, corrupt_skips = _read_jsonl(run_dir / "skips.jsonl")
+    signals, corrupt_signals = _read_jsonl(run_dir / "signals.jsonl")
+    entries, corrupt_entries = _read_jsonl(run_dir / "entries.jsonl")
+    corrupt_rows = {
+        "trades": corrupt_trades,
+        "skips": corrupt_skips,
+        "signals": corrupt_signals,
+        "entries": corrupt_entries,
+    }
+    corrupt_total = sum(corrupt_rows.values())
 
-    pnls = [float(row.get("pnl_sol") or 0.0) for row in trades]
-    returns = [float(row.get("return_pct") or 0.0) for row in trades]
-    mints = [str(row.get("mint") or "unknown") for row in trades]
+    pnls: list[float] = []
+    returns: list[float] = []
+    mints: list[str] = []
+    malformed_trades = 0
+    for row in trades:
+        try:
+            pnl = float(row["pnl_sol"])
+            ret = float(row["return_pct"])
+        except (KeyError, TypeError, ValueError):
+            malformed_trades += 1
+            continue
+        if not (math.isfinite(pnl) and math.isfinite(ret)):
+            malformed_trades += 1
+            continue
+        pnls.append(pnl)
+        returns.append(ret)
+        mints.append(str(row.get("mint") or "unknown"))
     days = sorted(
         {
             day
@@ -136,6 +170,20 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
     bootstrap = cluster_bootstrap(pnls, mints)
 
     gates: dict[str, dict[str, Any]] = {}
+
+    # Not a strategy gate: an unreadable row means the measurement itself is
+    # unreliable, so it is reported as a failed gate instead of being dropped.
+    gates["input_integrity"] = {
+        "passed": corrupt_total == 0 and malformed_trades == 0,
+        "corrupt_rows": corrupt_rows,
+        "malformed_trades": malformed_trades,
+        "detail": (
+            f"corrupt_rows={corrupt_total} "
+            f"(trades={corrupt_trades}, skips={corrupt_skips}, "
+            f"signals={corrupt_signals}, entries={corrupt_entries}); "
+            f"malformed_trades={malformed_trades}"
+        ),
+    }
 
     coverage_ok = len(trades) >= MIN_TRADES and len(days) >= MIN_DAYS
     gates["coverage"] = {
@@ -199,6 +247,40 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         entry_failure_rate is not None
         and entry_failure_rate < MAX_ENTRY_FAILURE_RATE
     )
+
+    # Visibility, not a gate: fidelity guards (late delivery, missed eligible
+    # print, timer lateness, concurrency) reject cards as ``allowed=false``, so
+    # they leave both the fill-rate numerator and denominator. Report how much
+    # of the scanner population the bot actually traded, and why the rest was
+    # dropped, so a "100 % fill rate" on a small subset is visible. The frozen
+    # thresholds are unchanged.
+    scanner_rows = [
+        row
+        for row in signals
+        if isinstance(row.get("signal"), dict)
+        and row["signal"].get("message_type") == SCANNER_MESSAGE_TYPE
+    ]
+    scanner_cards = len(scanner_rows)
+    allowed_scanner = sum(
+        1
+        for row in scanner_rows
+        if isinstance(row.get("decision"), dict)
+        and row["decision"].get("allowed")
+    )
+    rejection_reasons: dict[str, int] = defaultdict(int)
+    for row in scanner_rows:
+        decision = row.get("decision")
+        if not isinstance(decision, dict) or decision.get("allowed"):
+            continue
+        reasons = decision.get("reasons") or ["unknown"]
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        for reason in reasons:
+            rejection_reasons[str(reason)] += 1
+    censor_share = (
+        (1.0 - allowed_scanner / scanner_cards) if scanner_cards else None
+    )
+
     gates["execution"] = {
         "passed": (
             write_off_rate is not None
@@ -210,6 +292,10 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         "write_off_rate": write_off_rate,
         "entries": len(entries),
         "signals_allowed": allowed,
+        "scanner_cards": scanner_cards,
+        "scanner_cards_allowed": allowed_scanner,
+        "censor_share": censor_share,
+        "rejection_reason_counts": dict(sorted(rejection_reasons.items())),
         "entry_fill_rate": fill_rate,
         "required_entry_fill_rate": MIN_ENTRY_FILL_RATE,
         "entry_delay_exceeded": entry_delay_failures,
@@ -221,7 +307,8 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
             f"fill_rate={fill_rate!s}; "
             f"entry_failures={entry_delay_failures + quote_failures}"
             f"/{allowed} ({entry_failure_rate!s}) must be "
-            f"< {MAX_ENTRY_FAILURE_RATE}"
+            f"< {MAX_ENTRY_FAILURE_RATE}; "
+            f"traded={allowed_scanner}/{scanner_cards} cards"
         ),
     }
 
@@ -232,6 +319,8 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         "starting_sol": starting_sol,
         "trades": len(trades),
         "days": days,
+        "corrupt_rows": corrupt_rows,
+        "malformed_trades": malformed_trades,
         "skip_reason_counts": dict(sorted(skip_counts.items())),
         "gates": gates,
         "passed": passed,

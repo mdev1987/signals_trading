@@ -78,7 +78,7 @@ echo ">>> Starting paper_bot in $MODE mode"
 echo ">>> CWD: $SCRIPT_DIR"
 echo ">>> Strategy: scanner_pumpfun_amm on @AveSolanaTokenScanner (5 min hold)"
 echo ">>> Daily loss cap: ${DAILY_LOSS_SOL} SOL (0 disables)"
-echo ">>> Restart recovery: ${RESUME:-0} (paper state: output/recovery/scanner_pumpfun_amm_trade.json)"
+echo ">>> Restart recovery: ${RESUME:-0} (paper state: output/recovery/scanner_pumpfun_amm_trade.sqlite3)"
 echo ">>> Logs: output/paper/bot_$(date +%Y%m%d).log  (Ctrl-C to stop; systemd restarts on crash)"
 
 mkdir -p output/paper

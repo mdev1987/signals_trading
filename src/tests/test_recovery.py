@@ -1,4 +1,4 @@
-"""Restart recovery (paper mode) backed by PickleDB.
+"""Restart recovery (paper mode) backed by SQLite.
 
 These tests pin the safety properties that matter for a continuous forward
 sample: a restart restores exactly the wallet/positions the process had, a
@@ -12,6 +12,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parents[1]
@@ -24,7 +25,10 @@ from paper_bot.history import MarketHistory  # noqa: E402
 from paper_bot.live import (  # noqa: E402
     LiveConfig,
     StrategyLane,
+    _count_scanner_cards,
+    _fingerprint_subset,
     _recovery_fingerprint,
+    _run_started_at,
     _state_saver,
 )
 from paper_bot.models import FillQuote, Position, Signal  # noqa: E402
@@ -145,8 +149,42 @@ class RecoveryStoreTests(unittest.TestCase):
             second["wallet"] = {"sol_balance": 8.5}
             store.save(second)
             loaded = store.load()
+            store.close()
         assert loaded is not None
         self.assertEqual(loaded["wallet"], {"sol_balance": 8.5})
+
+    def test_legacy_json_is_imported_once_and_archived(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = Path(tmp) / "lane.json"
+            legacy.write_text(
+                json.dumps(
+                    {"state": {"version": RECOVERY_VERSION, **self.payload()}}
+                ),
+                encoding="utf-8",
+            )
+            store = RecoveryStore(legacy)
+            loaded = store.load()
+            db_path = Path(tmp) / "lane.sqlite3"
+            archived = Path(tmp) / "lane.json.imported"
+            self.assertTrue(db_path.exists())
+            self.assertFalse(legacy.exists())
+            self.assertTrue(archived.exists())
+            # A second open must not re-import the archived file over newer
+            # state, and the DB alone is enough to resume.
+            again = RecoveryStore(legacy)
+            second = again.load()
+            again.close()
+            store.close()
+        assert loaded is not None and second is not None
+        self.assertEqual(loaded["wallet"], {"sol_balance": 9.9})
+        self.assertEqual(second["wallet"], {"sol_balance": 9.9})
+
+    def test_corrupt_legacy_json_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = Path(tmp) / "lane.json"
+            legacy.write_text("{not json", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                RecoveryStore(legacy)
 
     def test_corrupt_json_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,6 +192,18 @@ class RecoveryStoreTests(unittest.TestCase):
             path.write_text("{not json", encoding="utf-8")
             with self.assertRaises(RuntimeError):
                 RecoveryStore(path).load()
+
+    def test_valid_json_without_envelope_fails_closed(self) -> None:
+        # The file exists, so the operator expects a snapshot. Treating it as
+        # "no saved state" would let a truncated/hand-edited file pass as a
+        # clean first start and silently abandon open positions.
+        for document in ({"run_dir": "x"}, [1, 2, 3], {"state": None}):
+            with self.subTest(document=document):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "state.json"
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaises(RuntimeError):
+                        RecoveryStore(path).load()
 
     def test_unsupported_version_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -191,7 +241,40 @@ class RecoveryStoreTests(unittest.TestCase):
         self.assertEqual(first, again)
         self.assertNotEqual(first, other)
         self.assertEqual(first.parent, Path("output/recovery"))
-        self.assertEqual(first.name, "scanner_pumpfun_amm_trade.json")
+        self.assertEqual(first.name, "scanner_pumpfun_amm_trade.sqlite3")
+
+    def test_aux_counters_survive_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lane.sqlite3"
+            store = RecoveryStore(path)
+            store.save_aux("scanner_stats", {"cards": 12, "duplicates": 30})
+            store.close()
+            reopened = RecoveryStore(path)
+            restored = reopened.load_aux("scanner_stats")
+            reopened.close()
+        self.assertEqual(restored, {"cards": 12, "duplicates": 30})
+
+
+class ScannerCounterTests(unittest.TestCase):
+    def test_counts_only_scanner_card_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            rows = [
+                json.dumps(
+                    {"signal": {"message_type": "scanner_pool_launch"}}
+                ),
+                json.dumps({"signal": {"message_type": "other"}}),
+                "not json",
+                json.dumps({"decision": {"allowed": True}}),
+            ]
+            (run_dir / "signals.jsonl").write_text(
+                "\n".join(rows) + "\n", encoding="utf-8"
+            )
+            self.assertEqual(_count_scanner_cards(run_dir), 1)
+
+    def test_missing_file_is_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(_count_scanner_cards(Path(tmp)), 0)
 
 
 class EngineStateTests(unittest.TestCase):
@@ -332,6 +415,41 @@ class StateSaverTests(unittest.TestCase):
         assert payload is not None
         self.assertEqual(payload["run_dir"], "output/paper/live_20261123")
         self.assertEqual(payload["fingerprint"], fingerprint)
+        self.assertNotIn("started_at", payload)
+
+    def test_saver_persists_the_original_started_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RecoveryStore(Path(tmp) / "state.json")
+            config = live_config(state_db=store.path)
+            lane = StrategyLane(
+                name="A",
+                rule="scanner_pumpfun_amm",
+                entry_mode="trade",
+                run_dir=Path("output/paper/live_20261118"),
+                wallet=PaperWallet(),
+                broker=object(),  # type: ignore[arg-type]
+                store=object(),  # type: ignore[arg-type]
+                engine=object(),  # type: ignore[arg-type]
+                reporter=object(),  # type: ignore[arg-type]
+                stats=object(),  # type: ignore[arg-type]
+            )
+            fingerprint = _recovery_fingerprint(
+                config, "scanner_pumpfun_amm", "trade"
+            )
+            started_at = "2026-11-18T12:00:00+00:00"
+            save = _state_saver(
+                store, lane, fingerprint, started_at=started_at
+            )
+            save(
+                {
+                    "wallet": {"sol_balance": 9.5},
+                    "token_balances": {},
+                    "positions": [],
+                }
+            )
+            payload = store.load()
+        assert payload is not None
+        self.assertEqual(payload["started_at"], started_at)
 
     def test_fingerprint_tracks_execution_convention(self) -> None:
         base = _recovery_fingerprint(
@@ -349,18 +467,135 @@ class StateSaverTests(unittest.TestCase):
             base, _recovery_fingerprint(live_config(), "scanner_pumpfun_amm", "trade")
         )
 
+    def test_fingerprint_covers_every_guard_and_exit_setting(self) -> None:
+        # A resume that changes a guard measures a different experiment even
+        # when the wallet restores cleanly, so each of these must invalidate
+        # the snapshot.
+        base = _recovery_fingerprint(
+            live_config(), "scanner_pumpfun_amm", "trade"
+        )
+        overrides: tuple[dict[str, object], ...] = (
+            {"max_delivery_lag_ms": 30_000},
+            {"min_entry_quote_sol": 0.02},
+            {"max_reference_age_ms": 15_000},
+            {"max_mark_age_ms": 60_000},
+            {"max_concurrent_positions": 5},
+            {"max_daily_loss_sol": 1.0},
+            {"timer_late_tolerance_ms": 2_000},
+            {"max_future_skew_ms": 1_000},
+            {"entry_retry_backoff_ms": 500},
+            {"horizon_settle_ms": 2_000},
+            {"tp_pct": 0.5},
+            {"sl_pct": -0.5},
+            {"exit_quote_timeout_ms": 10_000},
+            {"preflight_exit_route": False},
+            {"exit_fallback_feed": True},
+            {"slippage_bps": 100},
+            {"max_slippage_bps": 500},
+            {"history_max_total_events": 100_000},
+            {"history_max_events_per_mint": 1_000},
+            {"history_horizon_ms": 600_000},
+        )
+        for override in overrides:
+            with self.subTest(override=override):
+                changed = _recovery_fingerprint(
+                    live_config(**override),
+                    "scanner_pumpfun_amm",
+                    "trade",
+                )
+                self.assertNotEqual(base, changed, override)
+
+    def test_legacy_fingerprint_is_a_valid_subset(self) -> None:
+        # Snapshots written before the fingerprint was expanded must still be
+        # resumable, provided their shared fields are unchanged.
+        current = _recovery_fingerprint(
+            live_config(), "scanner_pumpfun_amm", "trade"
+        )
+        legacy = {
+            "mode": "paper",
+            "rule": "scanner_pumpfun_amm",
+            "entry_mode": "trade",
+            "starting_sol": 10.0,
+            "notional_sol": 0.1,
+            "fee": 0.0125,
+            "slippage": 0.0,
+            "horizon_min": 5.0,
+            "entry_delay_ms": 5_000,
+            "max_entry_delay_ms": 60_000,
+        }
+        self.assertTrue(_fingerprint_subset(legacy, current))
+
+    def test_legacy_fingerprint_still_rejects_a_shared_change(self) -> None:
+        current = _recovery_fingerprint(
+            live_config(), "scanner_pumpfun_amm", "trade"
+        )
+        legacy = {
+            "rule": "scanner_pumpfun_amm",
+            "notional_sol": 0.2,
+        }
+        self.assertFalse(_fingerprint_subset(legacy, current))
+
+    def test_unknown_or_non_object_fingerprint_is_rejected(self) -> None:
+        current = _recovery_fingerprint(
+            live_config(), "scanner_pumpfun_amm", "trade"
+        )
+        self.assertFalse(_fingerprint_subset({"unknown_field": 1}, current))
+        self.assertFalse(_fingerprint_subset("nope", current))
+
+
+class RunStartedAtTests(unittest.TestCase):
+    def test_snapshot_start_wins_over_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "meta.json").write_text(
+                json.dumps({"started_at": "2026-11-18T00:00:00+00:00"}),
+                encoding="utf-8",
+            )
+            recovered = {"started_at": "2026-11-17T00:00:00+00:00"}
+            resolved = _run_started_at(
+                recovered, run_dir, datetime(2026, 11, 23, tzinfo=UTC)
+            )
+        self.assertEqual(resolved, datetime(2026, 11, 17, tzinfo=UTC))
+
+    def test_meta_is_the_fallback_for_older_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "meta.json").write_text(
+                json.dumps({"started_at": "2026-11-18T12:00:00+00:00"}),
+                encoding="utf-8",
+            )
+            resolved = _run_started_at(
+                {}, run_dir, datetime(2026, 11, 23, tzinfo=UTC)
+            )
+        self.assertEqual(resolved, datetime(2026, 11, 18, 12, tzinfo=UTC))
+
+    def test_process_start_is_used_when_nothing_is_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fallback = datetime(2026, 11, 23, 5, tzinfo=UTC)
+            resolved = _run_started_at({}, Path(tmp), fallback)
+        self.assertEqual(resolved, fallback)
+
+    def test_naive_timestamps_are_treated_as_utc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved = _run_started_at(
+                {"started_at": "2026-11-18T12:00:00"},
+                Path(tmp),
+                datetime(2026, 11, 23, tzinfo=UTC),
+            )
+        self.assertEqual(resolved, datetime(2026, 11, 18, 12, tzinfo=UTC))
+
 
 class RecoveryConfigTests(unittest.TestCase):
     def test_live_mode_rejects_recovery(self) -> None:
         with self.assertRaises(ValueError):
-            live_config(mode="live", state_db=Path("output/recovery/x.json"))
+            live_config(mode="live", state_db=Path("output/recovery/x.sqlite3"))
 
     def test_ab_run_rejects_recovery(self) -> None:
         with self.assertRaises(ValueError):
             live_config(
                 ab_rule="scanner_pumpfun_amm",
                 ab_entry_mode="timer",
-                state_db=Path("output/recovery/x.json"),
+                state_db=Path("output/recovery/x.sqlite3"),
             )
 
     def test_resume_requires_a_state_path(self) -> None:
@@ -369,10 +604,10 @@ class RecoveryConfigTests(unittest.TestCase):
 
     def test_paper_single_lane_accepts_resume(self) -> None:
         config = live_config(
-            resume=True, state_db=Path("output/recovery/x.json")
+            resume=True, state_db=Path("output/recovery/x.sqlite3")
         )
         self.assertTrue(config.resume)
-        self.assertEqual(config.state_db, Path("output/recovery/x.json"))
+        self.assertEqual(config.state_db, Path("output/recovery/x.sqlite3"))
 
 
 class ResumeStartupTests(unittest.IsolatedAsyncioTestCase):
@@ -425,6 +660,27 @@ class ResumeStartupTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ResumedRunSummaryTests(unittest.TestCase):
+    def test_meta_keeps_the_original_started_at(self) -> None:
+        # A resumed process writes meta.json again. If the caller forgets to
+        # carry started_at, the store must not restamp the run to the restart.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            original = "2026-11-18T12:00:00+00:00"
+            PaperStore(run_dir, meta={"started_at": original})
+            PaperStore(
+                run_dir,
+                meta={
+                    "resumed_at": "2026-11-19T12:00:00+00:00",
+                    "pid": 123,
+                },
+            )
+            meta = json.loads((run_dir / "meta.json").read_text())
+        self.assertEqual(meta["started_at"], original)
+        self.assertEqual(
+            meta["resumed_at"], "2026-11-19T12:00:00+00:00"
+        )
+        self.assertEqual(meta["pid"], 123)
+
     def test_finalize_includes_trades_from_the_previous_process(self) -> None:
         import polars as pl
 

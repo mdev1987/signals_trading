@@ -28,15 +28,23 @@ class PaperStore:
         self.skips_path = run_dir / "skips.jsonl"
         self.meta_path = run_dir / "meta.json"
         if meta is not None:
+            payload = dict(meta)
+            # A resumed run reuses its original directory. Keep the original
+            # ``started_at`` if a caller forgot to carry it: restamping the
+            # run to the restart time would make a five-day sample look young.
+            if payload.get("started_at") is None:
+                try:
+                    existing = json.loads(
+                        self.meta_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    existing = None
+                if isinstance(existing, dict) and existing.get("started_at"):
+                    payload["started_at"] = existing["started_at"]
             self.meta_path.write_text(
-                json.dumps(meta, indent=2, sort_keys=True, default=str),
+                json.dumps(payload, indent=2, sort_keys=True, default=str),
                 encoding="utf-8",
             )
-        # Trades are read back from the append-only file when needed (finalize,
-        # summary, restart dedupe) instead of being mirrored in memory for the
-        # whole run: a five-day run appends a few thousand rows, and the replay
-        # harness can append far more.
-        self._trades: list[dict[str, Any]] = []
 
     def closed_position_keys(self) -> set[tuple[str, int]]:
         """``(mint, entry_ts_ms)`` for every trade already on disk.
@@ -140,7 +148,6 @@ class PaperStore:
             payload["features"] = json.dumps(
                 payload["features"], sort_keys=True, default=str
             )
-        self._trades.append(payload)
         self._append(self.trades_path, payload)
 
     def record_skip(self, skip: SkipRecord) -> None:
@@ -186,11 +193,7 @@ class PaperStore:
     def finalize(self, *, extra: dict[str, Any] | None = None) -> Path | None:
         # Read the append-only file so a resumed run's parquet contains the
         # earlier process's trades as well as this one's.
-        trades = (
-            _read_jsonl(self.trades_path)
-            if self.trades_path.exists()
-            else list(self._trades)
-        )
+        trades = _read_jsonl(self.trades_path)
         parquet_path = None
         if trades:
             frame = pl.DataFrame(trades, infer_schema_length=None)
