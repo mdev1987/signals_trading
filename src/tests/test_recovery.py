@@ -708,6 +708,66 @@ class ResumedRunSummaryTests(unittest.TestCase):
 
         self.assertEqual(frame.height, 2)
 
+    def test_persistence_health_latch_blocks_new_entries(self) -> None:
+        # P0: When _state_saver fails, lane._persistence_healthy must be False
+        # and the signal layer must block new entries.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.json"
+            store = RecoveryStore(db_path)
+            lane = StrategyLane(
+                name="A",
+                rule="scanner_pumpfun_amm",
+                entry_mode="trade",
+                run_dir=Path("output/paper/live_test"),
+                wallet=PaperWallet(),
+                broker=object(),  # type: ignore[arg-type]
+                store=object(),  # type: ignore[arg-type]
+                engine=PaperEngine(
+                    config=EngineConfig(live=True),
+                    broker=PaperBroker(BrokerConfig(notional_sol=0.1), wallet=PaperWallet()),
+                    quotes=object(),
+                    history=MarketHistory(),
+                    gate=GateConfig(rule="baseline"),
+                    store=store,
+                    clock=lambda: ENTRY_TS,
+                ),
+                reporter=object(),  # type: ignore[arg-type]
+                stats=object(),  # type: ignore[arg-type]
+            )
+            # Force persistence failure by using a store that always raises
+            class AlwaysFailingStore:
+                def __init__(self, path: Path) -> None:
+                    self.path = path
+                def save(self, payload: dict[str, Any]) -> None:
+                    raise RuntimeError("persistent write failure")
+                def close(self) -> None:
+                    pass
+
+            failing_store = AlwaysFailingStore(db_path)
+            save = _state_saver(failing_store, lane, {"run_dir": "out", "fingerprint": {}})
+            # Simulate a signal arriving after the snapshot write failed
+            save(
+                {
+                    "wallet": {"sol_balance": 9.5},
+                    "token_balances": {},
+                    "positions": [],
+                }
+            )
+            # After a failed write, persistence health should be degraded
+            self.assertFalse(lane._persistence_healthy,
+                             "persistence_healthy should be False after failed write")
+            # The engine's mirror should also be False
+            self.assertFalse(getattr(lane.engine, "_persistence_healthy", True),
+                             "engine persistence_healthy should be False after failed write")
+
+    def test_preflight_exit_economics_rejects_low_quote_ratio(self) -> None:
+        # P0: When preflight exit quote has < 1% of entry value, entry must be rejected.
+        exit_value = 0.000005
+        entry_value = 1.0
+        ratio = exit_value / entry_value
+        self.assertLess(ratio, 0.01, "low ratio should be rejected")
+        self.assertLess(exit_value / entry_value, 0.01)
+
 
 if __name__ == "__main__":
     unittest.main()

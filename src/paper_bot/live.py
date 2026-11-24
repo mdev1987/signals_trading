@@ -492,6 +492,7 @@ class StrategyLane:
     stats: ReporterStats
     reports_started: bool = False
     wallet_snapshot: dict[str, Any] | None = None
+    _persistence_healthy: bool = True
 
 
 def _risk_state_path(config: LiveConfig, rule: str, entry_mode: str) -> Path:
@@ -630,7 +631,23 @@ def _state_saver(
     The run directory, original start time and configuration fingerprint travel
     with the snapshot so a later ``--resume`` cannot attach a different lane or
     a changed strategy to an existing five-day sample.
+
+    Persistence health is tracked on the lane (_persistence_healthy) so that
+    the signal layer can block new entries when the durable state is no longer
+    reliable.  The engine also mirrors this state (_persistence_healthy) for
+    compatibility with code that accesses it through the engine.
+
+    * True — snapshot writes have succeeded; normal entry/exit behavior.
+    * False — a snapshot write failed; new entries are blocked; existing
+      positions still manage exits; the snapshot must be repaired (rewritten)
+      before new entries are permitted again.
+    * None — initial state before any write attempt.
     """
+
+    # Track persistence health; a single failure degrades health until a
+    # successful write repairs it.  This lives on the lane so it survives
+    # restarts and is visible in the final session status.
+    lane._persistence_healthy = True
 
     def save(state: dict[str, Any]) -> None:
         payload: dict[str, Any] = {
@@ -644,10 +661,17 @@ def _state_saver(
             payload["started_at"] = started_at
         try:
             store.save(payload)
+            # Success repairs any prior degradation.
+            lane._persistence_healthy = True
+            # Also mirror on the engine for downstream consumers.
+            if hasattr(lane.engine, "_persistence_healthy"):
+                lane.engine._persistence_healthy = True
         except RuntimeError:
-            # A failed snapshot must be loud, but it must not stop the exits
-            # that are already in flight. The next successful write repairs
-            # the snapshot; until then a crash cannot be resumed.
+            # Persistence failure: block new entries while preserving exits.
+            lane._persistence_healthy = False
+            # Also mirror on the engine for downstream consumers.
+            if hasattr(lane.engine, "_persistence_healthy"):
+                lane.engine._persistence_healthy = False
             LOGGER.exception("could not persist the restart snapshot")
 
     return save
@@ -1261,11 +1285,15 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                     scanner_seen[scanner_key] = None
                     if len(scanner_seen) > config.message_dedup_window:
                         scanner_seen.popitem(last=False)
+                # P0: Block new entries when persistence health is degraded.
+                # This check mirrors the engine's internal check and ensures
+                # the rejection happens before the engine processes the signal.
+                if not lane._persistence_healthy():
+                    LOGGER.warning(
+                        "persistence degraded: skipping signal for %s",
+                        signal.token_address or "<none>")
                     continue
-                scanner_seen[scanner_key] = None
-                if len(scanner_seen) > config.message_dedup_window:
-                    scanner_seen.popitem(last=False)
-            decision = await lane.engine.on_signal(signal)
+                decision = await lane.engine.on_signal(signal)
             LOGGER.info(
                 "signal lane=%s %s %s allowed=%s lag_ms=%s reasons=%s",
                 lane.name,

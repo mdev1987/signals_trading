@@ -334,6 +334,10 @@ class PaperEngine:
         self.signal_total = 0
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
+        # Persistence health: True when recovery snapshot writes have succeeded.
+        # When False, new entries are blocked while exits continue.  Set by the
+        # _state_saver callback in live.py after each write attempt.
+        self._persistence_healthy: bool = True
         # Realized PnL by UTC day, used only by the optional daily loss cap.
         # The stable risk-state file wins over the per-run store; the run
         # directory changes on every restart, so it cannot be the only source.
@@ -939,6 +943,22 @@ class PaperEngine:
         rejection_reason: str | None = None
         rejection_detail: str | None = None
 
+        # P0: Block new entries when persistence health is degraded.
+        # Entries are rejected with a clear reason so the operator knows
+        # the session is in an invalid state. Exits remain fully operational.
+        if not self._persistence_healthy:
+            final = GateDecision(
+                allowed=False,
+                rule=decision.rule,
+                reasons=["persistence_degraded"],
+                features=decision.features,
+            )
+            rejection_reason = "persistence_degraded"
+            rejection_detail = (
+                "recovery snapshot writes have failed; new entries are blocked "
+                "until the snapshot is repaired by a successful write or restart"
+            )
+
         if not decision.allowed:
             rejection_reason = "gate_rejected"
             rejection_detail = ";".join(decision.reasons)
@@ -1537,13 +1557,35 @@ class PaperEngine:
                 # surface. Transient failures retry on the next BUY trade.
                 if self.config.preflight_exit_route:
                     try:
-                        await self.quotes.exit_quote(
+                        exit_quote = await self.quotes.exit_quote(
                             pending.mint,
                             entry.size,
                             entry.entry_price_sol,
                             decimals=decimals,
                             action="preflight",
                         )
+                        # P0: Validate exit quote economics, not merely route existence.
+                        # Reject entries whose preflight exit quote has negligible
+                        # value relative to the entry cost, since a real wallet would
+                        # be unable to close the position at a meaningful price.
+                        exit_value = exit_quote.price_sol or 0.0
+                        entry_value = entry.entry_value_sol or 0.0
+                        if entry_value > 0 and exit_value / entry_value < 0.01:
+                            # Exit quote is less than 1% of entry value — treat
+                            # as no viable exit route and skip the entry.
+                            pending.last_reason = "preflight_exit_economics"
+                            pending.last_detail = (
+                                f"exit_quote={exit_value:.6f}; "
+                                f"entry_value={entry_value:.6f}; "
+                                f"ratio={exit_value/entry_value:.4f}"
+                            )
+                            async with self._lock(pending.mint):
+                                self._skip_pending(
+                                    pending,
+                                    "entry_no_exit_economics",
+                                    f"preflight_exit_economics: ratio={exit_value/entry_value:.4f}",
+                                )
+                            return
                     except QuoteError as exc:
                         pending.last_reason = exc.reason
                         pending.last_detail = exc.detail
