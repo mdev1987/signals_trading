@@ -131,6 +131,15 @@ class PaperStore:
                 ),
                 "signal_liquidity_usd": position.signal_liquidity_usd,
                 "entry_liquidity_usd": position.entry_liquidity_usd,
+                "quote_raw": (
+                    json.dumps(
+                        position.entry_quote.raw,
+                        sort_keys=True,
+                        default=str,
+                    )
+                    if position.entry_quote
+                    else None
+                ),
             },
         )
 
@@ -150,6 +159,14 @@ class PaperStore:
             payload["features"] = json.dumps(
                 payload["features"], sort_keys=True, default=str
             )
+        # Raw quote bodies are nested structures with provider-specific keys;
+        # serializing them keeps the parquet schema stable while the JSONL
+        # still carries the evidence (as a readable JSON string).
+        for key in ("entry_quote_raw", "exit_quote_raw", "exit_quote_raws"):
+            value = payload.get(key)
+            if isinstance(value, (dict, list)):
+                payload = dict(payload)
+                payload[key] = json.dumps(value, sort_keys=True, default=str)
         self._append(self.trades_path, payload)
 
     def record_skip(self, skip: SkipRecord) -> None:

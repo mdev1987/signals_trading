@@ -1779,6 +1779,38 @@ class LiveQuoteProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["amount"], "1000000000")
 
 
+class StoreEvidenceTests(unittest.TestCase):
+    def test_raw_quotes_are_json_encoded_for_stable_parquet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperStore(Path(tmp))
+            store.record_trade_payload(
+                {
+                    "mint": "mint",
+                    "exit_ts_ms": 1,
+                    "pnl_sol": 0.0,
+                    "return_pct": 0.0,
+                    "entry_quote_raw": {
+                        "routePlan": [{"swapInfo": {"label": "metis"}}]
+                    },
+                    "exit_quote_raw": {"outAmount": "1"},
+                    "exit_quote_raws": [{"outAmount": "1"}],
+                }
+            )
+            parquet = store.finalize()
+            self.assertIsNotNone(parquet)
+            payload = json.loads(
+                (Path(tmp) / "trades.jsonl").read_text().splitlines()[-1]
+            )
+            self.assertIsInstance(payload["entry_quote_raw"], str)
+            self.assertIsInstance(payload["exit_quote_raws"], str)
+            self.assertEqual(
+                json.loads(payload["entry_quote_raw"])["routePlan"][0][
+                    "swapInfo"
+                ]["label"],
+                "metis",
+            )
+
+
 class ReportTests(unittest.TestCase):
     def startup(self, mode: str) -> str:
         return format_startup(
