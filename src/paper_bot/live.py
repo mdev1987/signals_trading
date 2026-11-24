@@ -1121,10 +1121,18 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             )
         )
 
-    async def handle_mark(mint: str, price_sol: float, ts_ms: int) -> None:
+    async def handle_mark(
+        mint: str,
+        price_sol: float,
+        ts_ms: int,
+        *,
+        liquidity_usd: float | None = None,
+    ) -> None:
         await asyncio.gather(
             *(
-                lane.engine.on_mark(mint, price_sol, ts_ms)
+                lane.engine.on_mark(
+                    mint, price_sol, ts_ms, liquidity_usd=liquidity_usd
+                )
                 for lane in lanes
             )
         )
@@ -1319,6 +1327,16 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                     horizon_min=config.horizon_min,
                     notional_sol=config.notional_sol,
                     starting_sol=config.starting_sol,
+                    restored_sol=(
+                        lane.wallet.sol_balance
+                        if resumed_at is not None
+                        else None
+                    ),
+                    resumed_at=(
+                        run_started_at.isoformat()
+                        if resumed_at is not None
+                        else None
+                    ),
                     fee=config.fee,
                     slippage=config.slippage,
                     channels=config.channels,

@@ -79,6 +79,13 @@ IN_MEMORY_CLOSED = 5_000
 IN_MEMORY_SKIPS = 20_000
 IN_MEMORY_SIGNALS = 20_000
 
+# A horizon exit that returns less than this share of the entry value is
+# economically a total loss even when Jupiter did return a route. Classifying
+# it separately makes the catastrophic tail visible instead of letting it hide
+# behind ``horizon_complete``. It does not change any frozen gate: the gate
+# still uses the realized return.
+NEAR_ZERO_EXIT_RATIO = 0.01
+
 
 def _reject_json_constant(value: str) -> None:
     """``json.loads`` hook that refuses NaN/Infinity instead of accepting it."""
@@ -92,6 +99,15 @@ def _is_utc_day(value: str) -> bool:
     except (TypeError, ValueError):
         return False
     return parsed.strftime("%Y-%m-%d") == value
+
+
+def _usd(value: object) -> float | None:
+    """Parse an optional positive USD figure from a signal feature."""
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
 
 
 def quote_detail(reason: str | None, detail: str | None) -> str | None:
@@ -334,6 +350,9 @@ class PaperEngine:
         self.signal_total = 0
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
+        # Latest Dexscreener USD depth per watched mint. Used only to record
+        # the book a fill happened in, never to trigger or size a trade.
+        self._mark_liquidity: dict[str, float] = {}
         # Persistence health: True when recovery snapshot writes have succeeded.
         # When False, new entries are blocked while exits continue.  Set by the
         # _state_saver callback in live.py after each write attempt.
@@ -388,17 +407,29 @@ class PaperEngine:
         is pending, open, or a task is inside its critical section; tick runs
         outside every such section, so anything else is safe to drop.
         """
-        if not self._locks:
-            return
-        stale = [
+        if self._locks:
+            stale = [
+                mint
+                for mint, lock in self._locks.items()
+                if mint not in self.pending
+                and mint not in self.positions
+                and not lock.locked()
+            ]
+            for mint in stale:
+                self._locks.pop(mint, None)
+        # Mark liquidity is pruned independently: a mint can have been marked
+        # while pending without ever acquiring a lock in this engine.
+        stale_liquidity = [
             mint
-            for mint, lock in self._locks.items()
-            if mint not in self.pending
-            and mint not in self.positions
-            and not lock.locked()
+            for mint in self._mark_liquidity
+            if mint not in self.pending and mint not in self.positions
         ]
-        for mint in stale:
-            self._locks.pop(mint, None)
+        for mint in stale_liquidity:
+            self._mark_liquidity.pop(mint, None)
+
+    def _mark_liquidity_or_none(self, mint: str) -> float | None:
+        value = self._mark_liquidity.get(mint)
+        return float(value) if value is not None and value > 0 else None
 
     def wallet_snapshot(self) -> dict[str, Any] | None:
         """Snapshot cash plus open token inventory, with mark freshness.
@@ -1294,13 +1325,26 @@ class PaperEngine:
         price_sol: float,
         ts_ms: int,
         *,
+        liquidity_usd: float | None = None,
         await_actions: bool = False,
     ) -> None:
-        """Apply a fallback mark (for example a Dexscreener poll)."""
+        """Apply a fallback mark (for example a Dexscreener poll).
+
+        ``liquidity_usd`` is diagnostic only: it is stored so a trade row shows
+        the depth the fill was priced in. It never changes an entry or exit.
+        """
         if not math.isfinite(price_sol) or price_sol <= 0:
             return
+        if (
+            liquidity_usd is not None
+            and math.isfinite(liquidity_usd)
+            and liquidity_usd > 0
+        ):
+            self._mark_liquidity[mint] = float(liquidity_usd)
         position = self.positions.get(mint)
         if position is not None:
+            if liquidity_usd is not None and liquidity_usd > 0:
+                position.last_liquidity_usd = float(liquidity_usd)
             await self._on_position_price(
                 position, ts_ms, price_sol, await_actions=await_actions
             )
@@ -1654,6 +1698,16 @@ class PaperEngine:
                             and pending.reference_price_sol > 0
                             else None
                         ),
+                        signal_liquidity_usd=_usd(
+                            pending.signal.features.get("liquidity_usd")
+                        ),
+                        entry_liquidity_usd=(
+                            self._mark_liquidity_or_none(pending.mint)
+                            or _usd(pending.signal.features.get("liquidity_usd"))
+                        ),
+                        last_liquidity_usd=self._mark_liquidity_or_none(
+                            pending.mint
+                        ),
                     )
                     self.positions[pending.mint] = position
                     if self.store is not None:
@@ -1826,6 +1880,7 @@ class PaperEngine:
                     fill = self.broker.close(position, quote, fraction=fraction)
                     self.broker.settle(position, fill)
                     self._apply_partial(position, fill)
+                    position.exit_quote_raws.append(dict(quote.raw))
                     last_quote = quote
                     if position.size <= DUST_SIZE:
                         self._commit_close(position, quote)
@@ -1979,6 +2034,16 @@ class PaperEngine:
         exit_status = position.exit_status or "horizon_complete"
         if forced and quote.source == "fallback_feed":
             exit_status = "forced_no_price"
+        # A priced sale that recovered almost nothing is not a normal horizon
+        # exit, even though the quote technically routed. Keep the reason as
+        # ``horizon`` (the PIT decision) and classify only the outcome.
+        entry_cost = position.entry_basis_acc + position.entry_fee_acc
+        if (
+            exit_status == "horizon_complete"
+            and entry_cost > 0
+            and position.exit_value_acc / entry_cost < NEAR_ZERO_EXIT_RATIO
+        ):
+            exit_status = "near_zero_exit"
         exit_ts = (
             position.exit_ts_ms or position.exit_requested_ts_ms or position.entry_ts_ms
         )
@@ -2055,6 +2120,12 @@ class PaperEngine:
             entry_reference_deviation_pct=(
                 position.entry_reference_deviation_pct
             ),
+            signal_liquidity_usd=position.signal_liquidity_usd,
+            entry_liquidity_usd=position.entry_liquidity_usd,
+            exit_liquidity_usd=position.last_liquidity_usd,
+            entry_quote_raw=dict(entry_quote.raw) if entry_quote else {},
+            exit_quote_raw=dict(quote.raw),
+            exit_quote_raws=list(position.exit_quote_raws),
         )
         self.closed.append(trade)
         self.closed_total += 1

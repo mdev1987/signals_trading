@@ -168,7 +168,7 @@ class DexscreenerPoller:
 
     def __init__(
         self,
-        on_mark: Callable[[str, float, int], Awaitable[None]],
+        on_mark: Callable[..., Awaitable[None]],
         *,
         base_url: str = DEFAULT_DEXSCREENER_URL,
         interval_s: float = 2.0,
@@ -224,16 +224,30 @@ class DexscreenerPoller:
                 except (httpx.HTTPError, ValueError) as exc:
                     self._last_error = str(exc)
                     continue
-                prices = _best_sol_prices(pairs)
+                marks = _best_sol_marks(pairs)
                 now_ms = int(time.time() * 1000)
-                for mint, price in prices.items():
+                for mint, (price, liquidity_usd) in marks.items():
                     if mint in self.watched:
-                        await self.on_mark(mint, price, now_ms)
+                        await self.on_mark(
+                            mint, price, now_ms, liquidity_usd=liquidity_usd
+                        )
             await asyncio.sleep(self.interval_s)
 
 
 def _best_sol_prices(pairs: object) -> dict[str, float]:
     """Pick the deepest SOL-quoted pair for each base mint."""
+    return {
+        mint: price for mint, (price, _) in _best_sol_marks(pairs).items()
+    }
+
+
+def _best_sol_marks(pairs: object) -> dict[str, tuple[float, float]]:
+    """Return ``mint -> (price_sol, liquidity_usd)`` for the deepest pair.
+
+    Depth is the pair's USD liquidity, kept with the price so a mark can be
+    recorded alongside the book it was observed in. A missing liquidity field
+    is reported as ``0.0`` rather than invented.
+    """
     if not isinstance(pairs, list):
         return {}
     best: dict[str, tuple[float, float]] = {}
@@ -256,4 +270,4 @@ def _best_sol_prices(pairs: object) -> dict[str, float]:
         current = best.get(mint)
         if current is None or depth > current[1]:
             best[mint] = (price, depth)
-    return {mint: value[0] for mint, value in best.items()}
+    return best

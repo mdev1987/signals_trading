@@ -256,6 +256,17 @@ class Position:
     exit_fill_count: int = 0
     unsold_size: float = 0.0
     wallet_before_exit: dict[str, Any] | None = None
+    # Liquidity is a different metric from market cap. The scanner card
+    # carries launch liquidity at signal time; the Dexscreener poll supplies
+    # the latest observed depth while the mint is watched. Keeping both makes
+    # it possible to tell whether a fill happened in a thin book.
+    signal_liquidity_usd: float | None = None
+    entry_liquidity_usd: float | None = None
+    last_liquidity_usd: float | None = None
+    # Raw quote body for every exit fill, in fill order. Kept on the position
+    # so a multi-fill close (Jupiter routing only part of the size) still
+    # records the evidence for each partial sale.
+    exit_quote_raws: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def is_open(self) -> bool:
@@ -331,6 +342,18 @@ class ClosedTrade:
     features: dict[str, Any] = field(default_factory=dict)
     exit_fill_count: int = 1
     unsold_size: float = 0.0
+    # Liquidity at signal, fill and exit time (USD). ``signal_liquidity_usd``
+    # comes from the scanner card; the other two from the latest Dexscreener
+    # mark, or ``None`` when no mark arrived before the fill/exit.
+    signal_liquidity_usd: float | None = None
+    entry_liquidity_usd: float | None = None
+    exit_liquidity_usd: float | None = None
+    # Raw quote payloads (route, price impact, slippage ladder diagnostics).
+    # The curated fields above are convenient; the raw body is what lets a
+    # reviewer reconstruct exactly which route priced the fill.
+    entry_quote_raw: dict[str, Any] = field(default_factory=dict)
+    exit_quote_raw: dict[str, Any] = field(default_factory=dict)
+    exit_quote_raws: list[dict[str, Any]] = field(default_factory=list)
     # Telegram delivery lag (received - posted) and the lag at which the trade
     # actually entered. ``entry_delay_ms`` above is measured from the card, so
     # this separates "slow signal" from "slow engine".

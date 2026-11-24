@@ -29,10 +29,16 @@ from paper_bot.execution import (  # noqa: E402
     jupiter_error_reason,
     live_config_from_env,
 )
-from paper_bot.feeds import PumpApiFeed, parse_pump_event  # noqa: E402
+from paper_bot.feeds import (  # noqa: E402
+    PumpApiFeed,
+    _best_sol_marks,
+    parse_pump_event,
+)
 from paper_bot.history import MarketHistory  # noqa: E402
 from paper_bot.models import (  # noqa: E402
+    FillQuote,
     PendingEntry,
+    Position,
     Signal,
     TradeEvent,
     canonical_quote_notional_sol,
@@ -40,6 +46,7 @@ from paper_bot.models import (  # noqa: E402
 from paper_bot.notifier import (  # noqa: E402
     ReporterConfig,
     TelegramReporter,
+    _signal_evidence,
     format_startup,
 )
 from paper_bot.quotes import (  # noqa: E402
@@ -293,6 +300,31 @@ class PumpApiFeedParsingTests(unittest.TestCase):
             "[]",
         ):
             self.assertIsNone(parse_pump_event(payload, 0), payload)
+
+    def test_deepest_pair_keeps_liquidity_with_the_price(self) -> None:
+        marks = _best_sol_marks(
+            [
+                {
+                    "baseToken": {"address": "mintA"},
+                    "quoteToken": {"address": self.WSOL, "symbol": "SOL"},
+                    "priceNative": "0.001",
+                    "liquidity": {"usd": 30_000},
+                },
+                {
+                    "baseToken": {"address": "mintA"},
+                    "quoteToken": {"address": self.WSOL, "symbol": "SOL"},
+                    "priceNative": "0.002",
+                    "liquidity": {"usd": 90_000},
+                },
+                {
+                    "baseToken": {"address": "mintB"},
+                    "quoteToken": {"address": self.WSOL, "symbol": "SOL"},
+                    "priceNative": "0.003",
+                },
+            ]
+        )
+        self.assertEqual(marks["mintA"], (0.002, 90_000.0))
+        self.assertEqual(marks["mintB"], (0.003, 0.0))
 
     def test_watch_set_can_be_pruned(self) -> None:
         async def on_trade(event: object) -> None:
@@ -589,6 +621,97 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
             is_confirmed_buy_signal=True,
             features={},
         )
+
+    async def test_near_zero_exit_is_classified_separately(self) -> None:
+        engine = self.engine()
+        position = Position(
+            signal=self.make_signal(),
+            mint=MINT,
+            entry_ts_ms=self.NOW_MS - 300_000,
+            entry_price_sol=1e-3,
+            size=100.0,
+            entry_value_sol=0.1,
+            entry_fee_sol=0.00125,
+            entry_impact=0.0,
+            horizon_ts_ms=self.NOW_MS,
+        )
+        position.sold_size = 100.0
+        position.size = 0.0
+        position.exit_price_acc = 1e-6
+        position.exit_value_acc = 1e-6
+        position.exit_fee_acc = 0.0
+        position.pnl_acc = -0.10125 + 1e-6
+        position.entry_basis_acc = 0.1
+        position.entry_fee_acc = 0.00125
+        position.exit_reason = "horizon"
+        position.exit_ts_ms = self.NOW_MS
+        engine.positions[MINT] = position
+
+        engine._commit_close(
+            position, FillQuote(price_sol=1e-8, source="jupiter")
+        )
+
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_status, "near_zero_exit")
+        # The PIT reason is untouched; only the outcome classification changed.
+        self.assertEqual(trade.exit_reason, "horizon")
+
+    async def test_normal_horizon_exit_keeps_horizon_status(self) -> None:
+        engine = self.engine()
+        position = Position(
+            signal=self.make_signal(),
+            mint=MINT,
+            entry_ts_ms=self.NOW_MS - 300_000,
+            entry_price_sol=1e-3,
+            size=100.0,
+            entry_value_sol=0.1,
+            entry_fee_sol=0.00125,
+            entry_impact=0.0,
+            horizon_ts_ms=self.NOW_MS,
+        )
+        position.sold_size = 100.0
+        position.size = 0.0
+        position.exit_price_acc = 1.2
+        position.exit_value_acc = 0.12
+        position.exit_fee_acc = 0.0
+        position.pnl_acc = 0.01875
+        position.entry_basis_acc = 0.1
+        position.entry_fee_acc = 0.00125
+        position.exit_reason = "horizon"
+        position.exit_ts_ms = self.NOW_MS
+        engine.positions[MINT] = position
+
+        engine._commit_close(
+            position, FillQuote(price_sol=1.2e-3, source="jupiter")
+        )
+
+        self.assertEqual(engine.closed[-1].exit_status, "horizon_complete")
+
+    async def test_mark_liquidity_is_recorded_not_gating(self) -> None:
+        engine = self.engine()
+        position = Position(
+            signal=self.make_signal(),
+            mint=MINT,
+            entry_ts_ms=self.NOW_MS - 1_000,
+            entry_price_sol=1e-3,
+            size=100.0,
+            entry_value_sol=0.1,
+            entry_fee_sol=0.00125,
+            entry_impact=0.0,
+            horizon_ts_ms=self.NOW_MS + 299_000,
+            last_price_sol=1e-3,
+            last_ts_ms=self.NOW_MS - 1_000,
+        )
+        engine.positions[MINT] = position
+
+        await engine.on_mark(
+            MINT, 1.1e-3, self.NOW_MS, liquidity_usd=42_000.0
+        )
+
+        self.assertEqual(engine._mark_liquidity[MINT], 42_000.0)
+        self.assertEqual(position.last_liquidity_usd, 42_000.0)
+        # A mark is a price observation, not an exit signal.
+        self.assertFalse(position.exit_requested)
 
     async def test_late_card_is_not_traded(self) -> None:
         engine = self.engine(max_delivery_lag_ms=60_000)
@@ -1645,6 +1768,58 @@ class ReportTests(unittest.TestCase):
         self.assertIn("LIVE", text)
         self.assertIn("signed locally", text)
         self.assertNotIn("Paper trading only", text)
+
+    def test_resumed_startup_shows_restored_balance(self) -> None:
+        text = format_startup(
+            rule="scanner_pumpfun_amm",
+            horizon_min=5,
+            notional_sol=0.1,
+            starting_sol=10.0,
+            fee=0.0125,
+            slippage=0.0,
+            channels=["@ave"],
+            session_file="bot.session",
+            preflight_exit_route=False,
+            mode="paper",
+            restored_sol=9.979139,
+            resumed_at="2026-11-23T12:00:00+00:00",
+        )
+        self.assertIn("Restored balance", text)
+        self.assertIn("9.979139", text)
+        self.assertIn("2026-11-23T12:00:00+00:00", text)
+
+    def test_scanner_evidence_shows_only_scanner_gates(self) -> None:
+        text = "\n".join(
+            _signal_evidence(
+                {
+                    "rule": SCANNER_RULE,
+                    "dex": "Pumpfunamm",
+                    "liquidity_usd": 45_000.0,
+                    "mcap_usd": 0.0,
+                    "hist_flow_1m_sol": 1.2,
+                }
+            )
+        )
+        self.assertIn("DEX", text)
+        self.assertIn("Pumpfunamm", text)
+        self.assertIn("Launch liquidity", text)
+        self.assertIn("$45,000", text)
+        # The scanner rule has no flow/volume gate; the old text claimed one.
+        self.assertNotIn("gate `> 9.46`", text)
+        self.assertIn("context, no gate", text)
+
+    def test_flow_gate_label_only_for_hot_money_rule(self) -> None:
+        features = {"hist_flow_1m_sol": 1.2, "total_buy_sol": 1.0}
+        baseline = "\n".join(
+            _signal_evidence({**features, "rule": "baseline"})
+        )
+        hot_money = "\n".join(
+            _signal_evidence({**features, "rule": "hot_money_continuation"})
+        )
+        self.assertNotIn("gate `> 9.46`", baseline)
+        self.assertIn("(context)", baseline)
+        self.assertIn("gate `> 9.46`", hot_money)
+        self.assertIn("gate `> 3`", hot_money)
 
 
 if __name__ == "__main__":

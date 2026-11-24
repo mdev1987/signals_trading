@@ -129,6 +129,8 @@ class PaperStore:
                 "entry_reference_deviation_pct": (
                     position.entry_reference_deviation_pct
                 ),
+                "signal_liquidity_usd": position.signal_liquidity_usd,
+                "entry_liquidity_usd": position.entry_liquidity_usd,
             },
         )
 
