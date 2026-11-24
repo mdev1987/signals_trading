@@ -16,6 +16,57 @@ import orjson
 import polars as pl
 
 from .models import ClosedTrade, GateDecision, Position, Signal, SkipRecord
+from .quotes import normalize_price_impact_pct
+
+
+def _quote_body(raw: Any) -> dict[str, Any]:
+    """The Jupiter response body, unwrapping the live ``{"order": ...}`` form."""
+    if not isinstance(raw, dict):
+        return {}
+    nested = raw.get("order")
+    return nested if isinstance(nested, dict) else raw
+
+
+def _quote_audit(
+    *,
+    mint: str | None,
+    raw: Any,
+    normalized_pct: float | None,
+    router: str | None,
+    request_id: str | None,
+    quoted_at_ms: int | None,
+    fallback_ts_ms: int | None,
+) -> dict[str, Any] | None:
+    """Explicit, reviewable quote evidence independent of provider schema.
+
+    The raw body is still persisted unchanged. This record lifts the fields
+    needed to audit an unusual price-impact reading (including the deprecated
+    ratio field and USD valuations) and pins them to the mint and quote time.
+    """
+    body = _quote_body(raw)
+    if not body and normalized_pct is None and quoted_at_ms is None:
+        return None
+    if normalized_pct is None:
+        # Per-fill raw bodies may not have a trade-level normalized value
+        # supplied; derive it from the same fields the display uses.
+        normalized_pct = normalize_price_impact_pct(body)
+    return {
+        "mint": mint,
+        "quoted_at_ms": (
+            quoted_at_ms
+            if quoted_at_ms is not None
+            else (body.get("_quoted_at_ms") or fallback_ts_ms)
+        ),
+        "price_impact": body.get("priceImpact"),
+        "price_impact_pct": body.get("priceImpactPct"),
+        "normalized_price_impact_pct": normalized_pct,
+        "in_usd_value": body.get("inUsdValue"),
+        "out_usd_value": body.get("outUsdValue"),
+        "swap_usd_value": body.get("swapUsdValue"),
+        "router": router or body.get("router"),
+        "request_id": request_id or body.get("requestId"),
+        "route_plan": body.get("routePlan"),
+    }
 
 
 class PaperStore:
@@ -140,6 +191,25 @@ class PaperStore:
                     if position.entry_quote
                     else None
                 ),
+                "quote_audit": (
+                    json.dumps(
+                        _quote_audit(
+                            mint=position.mint,
+                            raw=position.entry_quote.raw,
+                            normalized_pct=(
+                                position.entry_quote.price_impact_pct
+                            ),
+                            router=position.entry_quote.router,
+                            request_id=position.entry_quote.request_id,
+                            quoted_at_ms=position.entry_quote.quoted_at_ms,
+                            fallback_ts_ms=position.entry_ts_ms,
+                        ),
+                        sort_keys=True,
+                        default=str,
+                    )
+                    if position.entry_quote
+                    else None
+                ),
             },
         )
 
@@ -159,6 +229,68 @@ class PaperStore:
             payload["features"] = json.dumps(
                 payload["features"], sort_keys=True, default=str
             )
+        # Explicit quote audit alongside the untouched raw bodies. This makes
+        # a large or negative price-impact reading traceable to the exact
+        # provider fields, mint and quote time without re-parsing the route.
+        entry_raw = payload.get("entry_quote_raw")
+        if isinstance(entry_raw, dict):
+            payload = dict(payload)
+            payload["entry_quote_audit"] = json.dumps(
+                _quote_audit(
+                    mint=payload.get("mint"),
+                    raw=entry_raw,
+                    normalized_pct=payload.get(
+                        "entry_quote_price_impact_pct"
+                    ),
+                    router=payload.get("entry_quote_router"),
+                    request_id=payload.get("entry_quote_request_id"),
+                    quoted_at_ms=entry_raw.get("_quoted_at_ms"),
+                    fallback_ts_ms=payload.get("entry_ts_ms"),
+                ),
+                sort_keys=True,
+                default=str,
+            )
+        exit_raw = payload.get("exit_quote_raw")
+        if isinstance(exit_raw, dict):
+            payload = dict(payload)
+            payload["exit_quote_audit"] = json.dumps(
+                _quote_audit(
+                    mint=payload.get("mint"),
+                    raw=exit_raw,
+                    normalized_pct=payload.get(
+                        "exit_quote_price_impact_pct"
+                    ),
+                    router=payload.get("exit_quote_router"),
+                    request_id=payload.get("exit_quote_request_id"),
+                    quoted_at_ms=exit_raw.get("_quoted_at_ms"),
+                    fallback_ts_ms=payload.get("exit_ts_ms"),
+                ),
+                sort_keys=True,
+                default=str,
+            )
+        exit_raws = payload.get("exit_quote_raws")
+        if isinstance(exit_raws, list):
+            payload = dict(payload)
+            payload["exit_quote_audits"] = [
+                json.dumps(
+                    _quote_audit(
+                        mint=payload.get("mint"),
+                        raw=item,
+                        normalized_pct=None,
+                        router=payload.get("exit_quote_router"),
+                        request_id=payload.get("exit_quote_request_id"),
+                        quoted_at_ms=(
+                            item.get("_quoted_at_ms")
+                            if isinstance(item, dict)
+                            else None
+                        ),
+                        fallback_ts_ms=payload.get("exit_ts_ms"),
+                    ),
+                    sort_keys=True,
+                    default=str,
+                )
+                for item in exit_raws
+            ]
         # Raw quote bodies are nested structures with provider-specific keys;
         # serializing them keeps the parquet schema stable while the JSONL
         # still carries the evidence (as a readable JSON string).
@@ -221,6 +353,22 @@ class PaperStore:
         summary = summarize(self.run_dir)
         if extra:
             summary.update(extra)
+        # Research-run reconciliation: every closed trade and every still-open
+        # position should have exactly one entry record in this run directory.
+        # A mismatch is evidence of a crash between the position and its entry
+        # row (or a legacy run), not something to silently average over.
+        entries = _read_jsonl(self.entries_path)
+        open_positions = None if extra is None else extra.get("open_positions")
+        summary["ledger"] = {
+            "entries": len(entries),
+            "closed_trades": len(trades),
+            "open_positions": open_positions,
+            "balanced": (
+                len(entries) == len(trades) + open_positions
+                if isinstance(open_positions, int)
+                else None
+            ),
+        }
         (self.run_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True, default=str),
             encoding="utf-8",

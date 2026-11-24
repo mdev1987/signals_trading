@@ -421,6 +421,7 @@ class LiveSolanaExecutor:
                             payload["_latency_ms"] = int(
                                 (time.perf_counter() - started) * 1000
                             )
+                            payload["_quoted_at_ms"] = int(time.time() * 1000)
                             return payload
                 elif response.status_code in (401, 403):
                     raise LiveExecutionError(
@@ -593,6 +594,7 @@ class LiveSolanaExecutor:
             router=order.get("router") or "jupiter",
             request_id=order.get("requestId"),
             latency_ms=order.get("_latency_ms"),
+            quoted_at_ms=order.get("_quoted_at_ms"),
             slippage_bps=order.get("_slippage_bps"),
             raw={"order": order, "execute": result},
         )
@@ -650,6 +652,7 @@ class LiveSolanaExecutor:
             router=order.get("router") or "jupiter",
             request_id=order.get("requestId"),
             latency_ms=order.get("_latency_ms"),
+            quoted_at_ms=order.get("_quoted_at_ms"),
             slippage_bps=order.get("_slippage_bps"),
             raw={"order": order, "execute": result},
         )

@@ -92,8 +92,10 @@ version = 1
 # `run_bot.sh` once without RESUME=1), let the bot write its first snapshot,
 # then restore `--resume`. To start a *new* sample after the five-day gates are
 # evaluated, stop the app and delete output/recovery/scanner_pumpfun_amm_trade.sqlite3
-# (and the old risk state if a different day should start clean). Never delete
-# the snapshot unless you intend to end the current sample.
+# and its `.degraded` sidecar marker (and the old risk state if a different day
+# should start clean). Never delete the snapshot unless you intend to end the
+# current sample. A run whose summary says DEGRADED or INVALID is not valid for
+# the gates: keep it paper-only and start a new sample.
 #
 # One-time setup:
 #   cd /home/mdev/Programming/signals_trading

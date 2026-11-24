@@ -1723,6 +1723,20 @@ class PaperEngine:
                 async with self._lock(pending.mint):
                     if self.pending.get(pending.mint) is not pending:
                         return
+                    # P0: the signal may have been accepted before either
+                    # quote await above. A snapshot write can fail while a
+                    # quote is in flight, so recheck inside the mint lock
+                    # immediately before reserving cash. Without this the
+                    # entry would create a position after durable state was
+                    # already known to be unreliable.
+                    if not self._persistence_healthy:
+                        self._skip_pending(
+                            pending,
+                            "persistence_degraded",
+                            "recovery snapshot writes failed while the entry "
+                            "quote was in flight; entry not reserved",
+                        )
+                        return
                     wallet_before = self.wallet_snapshot()
                     try:
                         self.broker.reserve(entry, pending.mint)
@@ -1779,9 +1793,13 @@ class PaperEngine:
                         signal_liquidity_usd=_usd(
                             pending.signal.features.get("liquidity_usd")
                         ),
-                        entry_liquidity_usd=(
-                            self._mark_liquidity_or_none(pending.mint)
-                            or _usd(pending.signal.features.get("liquidity_usd"))
+                        # Only an observed mark at fill time belongs here. The
+                        # scanner card's launch liquidity stays in
+                        # ``signal_liquidity_usd``: copying it into the fill
+                        # field would claim a book observation that never
+                        # happened and make execution-quality analysis wrong.
+                        entry_liquidity_usd=self._mark_liquidity_or_none(
+                            pending.mint
                         ),
                         last_liquidity_usd=self._mark_liquidity_or_none(
                             pending.mint

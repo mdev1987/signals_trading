@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 SRC_DIR = Path(__file__).resolve().parents[1]
@@ -28,8 +29,10 @@ from paper_bot.live import (  # noqa: E402
     StrategyLane,
     _count_scanner_cards,
     _fingerprint_subset,
+    _lane_integrity,
     _lane_meta,
     _recovery_fingerprint,
+    _resume_integrity,
     _run_started_at,
     _state_saver,
 )
@@ -187,6 +190,34 @@ class RecoveryStoreTests(unittest.TestCase):
             legacy.write_text("{not json", encoding="utf-8")
             with self.assertRaises(RuntimeError):
                 RecoveryStore(legacy)
+
+    def test_degradation_marker_round_trip_and_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RecoveryStore(Path(tmp) / "state.json")
+            self.assertIsNone(store.load_degradation())
+            store.mark_degraded(
+                run_dir="output/paper/live_20261123",
+                lane="A",
+                reason="snapshot write failed",
+            )
+            marker = store.load_degradation()
+            self.assertIsNotNone(marker)
+            assert marker is not None
+            self.assertEqual(
+                marker["run_dir"], "output/paper/live_20261123"
+            )
+            self.assertTrue(store.clear_degradation())
+            self.assertIsNone(store.load_degradation())
+            self.assertFalse(store.clear_degradation())
+
+    def test_unreadable_degradation_marker_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RecoveryStore(Path(tmp) / "state.json")
+            store.degradation_marker_path.write_text(
+                "{not json", encoding="utf-8"
+            )
+            with self.assertRaises(RuntimeError):
+                store.load_degradation()
 
     def test_corrupt_json_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -633,6 +664,40 @@ class RecoveryConfigTests(unittest.TestCase):
             meta["scanner_gate"]["max_liquidity_usd_exclusive"], 100_000.0
         )
 
+    def test_session_integrity_never_downgrades_invalid(self) -> None:
+        self.assertEqual(
+            _lane_integrity(
+                SimpleNamespace(
+                    _integrity="INVALID", _persistence_degraded=True
+                )
+            ),
+            "INVALID",
+        )
+        self.assertEqual(
+            _lane_integrity(
+                SimpleNamespace(
+                    _integrity="VALID", _persistence_degraded=True
+                )
+            ),
+            "DEGRADED",
+        )
+        self.assertEqual(
+            _lane_integrity(
+                SimpleNamespace(
+                    _integrity="DEGRADED", _persistence_degraded=False
+                )
+            ),
+            "DEGRADED",
+        )
+        self.assertEqual(
+            _lane_integrity(
+                SimpleNamespace(
+                    _integrity="VALID", _persistence_degraded=False
+                )
+            ),
+            "VALID",
+        )
+
 
 class ResumeStartupTests(unittest.IsolatedAsyncioTestCase):
     """The runner must refuse an unusable snapshot before touching the network."""
@@ -827,6 +892,143 @@ class ResumedRunSummaryTests(unittest.TestCase):
                 getattr(lane.engine, "_persistence_degraded", False),
                 "engine degraded flag should mirror the lane",
             )
+
+    def test_persistence_failure_leaves_a_durable_marker_across_restart(self) -> None:
+        # Sequence: snapshot write fails, process exits before any successful
+        # write, restart loads the old VALID snapshot. The sidecar marker must
+        # still make the resumed run INVALID rather than silently clean.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            run_dir = Path(tmp) / "run"
+            fingerprint = {"run_dir": str(run_dir), "rule": "scanner"}
+            seed = RecoveryStore(path)
+            seed.save(
+                {
+                    "run_dir": str(run_dir),
+                    "fingerprint": fingerprint,
+                    "wallet": {"sol_balance": 10.0},
+                    "token_balances": {},
+                    "positions": [],
+                    "started_at": "2026-11-23T12:00:00+00:00",
+                    "integrity": "VALID",
+                }
+            )
+
+            class FailingSnapshotStore(RecoveryStore):
+                def save(self, payload: dict[str, Any]) -> None:
+                    raise RuntimeError("disk full")
+
+            failing = FailingSnapshotStore(path)
+            lane = StrategyLane(
+                name="A",
+                rule="scanner_pumpfun_amm",
+                entry_mode="trade",
+                run_dir=run_dir,
+                wallet=PaperWallet(),
+                broker=object(),  # type: ignore[arg-type]
+                store=object(),  # type: ignore[arg-type]
+                engine=PaperEngine(
+                    config=EngineConfig(live=True),
+                    broker=PaperBroker(
+                        BrokerConfig(notional_sol=0.1),
+                        wallet=PaperWallet(),
+                    ),
+                    quotes=object(),
+                    history=MarketHistory(),
+                    gate=GateConfig(rule="baseline"),
+                    store=None,
+                    clock=lambda: ENTRY_TS,
+                ),
+                reporter=object(),  # type: ignore[arg-type]
+                stats=object(),  # type: ignore[arg-type]
+            )
+            save = _state_saver(failing, lane, fingerprint)
+            save(
+                {
+                    "wallet": {"sol_balance": 9.5},
+                    "token_balances": {},
+                    "positions": [],
+                }
+            )
+            self.assertTrue(failing.degradation_marker_path.exists())
+            marker = failing.load_degradation()
+            assert marker is not None
+            self.assertEqual(marker["run_dir"], str(run_dir))
+
+            # Simulated restart: the snapshot is still the old VALID one.
+            restarted = RecoveryStore(path)
+            snapshot = restarted.load()
+            assert snapshot is not None
+            self.assertEqual(snapshot["integrity"], "VALID")
+            self.assertEqual(
+                _resume_integrity(
+                    snapshot.get("integrity"),
+                    restarted.load_degradation(),
+                    run_dir,
+                ),
+                "INVALID",
+            )
+            # A marker left by a different, archived run is not inherited.
+            self.assertEqual(
+                _resume_integrity(
+                    "VALID",
+                    {"run_dir": str(Path(tmp) / "other-run")},
+                    run_dir,
+                ),
+                "VALID",
+            )
+            self.assertEqual(
+                _resume_integrity("DEGRADED", marker, run_dir),
+                "DEGRADED",
+            )
+
+    def test_marker_write_failure_makes_the_session_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+
+            class BrokenStore(RecoveryStore):
+                def save(self, payload: dict[str, Any]) -> None:
+                    raise RuntimeError("disk full")
+
+                def mark_degraded(
+                    self, *, run_dir: str, lane: str, reason: str
+                ) -> None:
+                    raise RuntimeError("marker disk full")
+
+            store = BrokenStore(path)
+            lane = StrategyLane(
+                name="A",
+                rule="scanner_pumpfun_amm",
+                entry_mode="trade",
+                run_dir=Path(tmp) / "run",
+                wallet=PaperWallet(),
+                broker=object(),  # type: ignore[arg-type]
+                store=object(),  # type: ignore[arg-type]
+                engine=PaperEngine(
+                    config=EngineConfig(live=True),
+                    broker=PaperBroker(
+                        BrokerConfig(notional_sol=0.1),
+                        wallet=PaperWallet(),
+                    ),
+                    quotes=object(),
+                    history=MarketHistory(),
+                    gate=GateConfig(rule="baseline"),
+                    store=None,
+                    clock=lambda: ENTRY_TS,
+                ),
+                reporter=object(),  # type: ignore[arg-type]
+                stats=object(),  # type: ignore[arg-type]
+            )
+            save = _state_saver(store, lane, {"run_dir": "run"})
+            save(
+                {
+                    "wallet": {"sol_balance": 9.5},
+                    "token_balances": {},
+                    "positions": [],
+                }
+            )
+            self.assertEqual(lane._integrity, "INVALID")
+            self.assertFalse(lane._persistence_healthy)
 
     def test_later_successful_write_does_not_re_enable_entries(self) -> None:
         # A write that succeeds after a failure proves the store works now,

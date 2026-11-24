@@ -162,6 +162,9 @@ class FillQuote:
     router: str | None = None
     request_id: str | None = None
     latency_ms: int | None = None
+    # Wall-clock time at which the provider received the quote response. Used
+    # only for the persisted quote audit (raw body, normalized impact, mint).
+    quoted_at_ms: int | None = None
     # Slippage tolerance that produced this route. A fresh pool often needs a
     # wider tolerance than the default before Jupiter can build a route, so the
     # value actually used is recorded rather than assumed.

@@ -202,6 +202,11 @@ def fmt_mc(value: float | None) -> str:
     return f"${value:,.0f}"
 
 
+def fmt_observed_liquidity(value: float | None) -> str:
+    """Fill/exit liquidity is an observation, never a copied signal value."""
+    return fmt_mc(value) if value is not None else "Not observed"
+
+
 def fmt_ratio(value: float | None) -> str:
     if value is None:
         return "—"
@@ -548,7 +553,7 @@ def format_entry(
             f"🧾 **Entry fee:** `{fmt_sol(position.entry_fee_sol)} SOL`",
             f"🔒 **Total spent:** "
             f"`{fmt_sol(position.entry_value_sol + position.entry_fee_sol)} SOL`",
-            f"📉 **Slippage:** `{position.entry_impact * 100:.2f}%`"
+            f"📉 **Modeled slippage:** `{position.entry_impact * 100:.2f}%`"
             + (
                 f" · **Price impact:** "
                 f"`{entry_quote.price_impact_pct:.2f}%`"
@@ -562,10 +567,13 @@ def format_entry(
             f"🎯 **Horizon:** `{fmt_ts(position.horizon_ts_ms)}`",
         ]
     )
-    if position.signal_liquidity_usd is not None or position.entry_liquidity_usd:
+    if (
+        position.signal_liquidity_usd is not None
+        or position.entry_liquidity_usd is not None
+    ):
         lines.append(
             f"💧 **Liquidity:** signal `{fmt_mc(position.signal_liquidity_usd)}`"
-            f" · fill `{fmt_mc(position.entry_liquidity_usd)}`"
+            f" · fill `{fmt_observed_liquidity(position.entry_liquidity_usd)}`"
         )
     if entry_quote and entry_quote.router:
         latency = (
@@ -634,8 +642,8 @@ def format_exit(
     ):
         lines.append(
             f"💧 **Liquidity:** signal `{fmt_mc(trade.signal_liquidity_usd)}`"
-            f" · fill `{fmt_mc(trade.entry_liquidity_usd)}`"
-            f" · exit `{fmt_mc(trade.exit_liquidity_usd)}`"
+            f" · fill `{fmt_observed_liquidity(trade.entry_liquidity_usd)}`"
+            f" · exit `{fmt_observed_liquidity(trade.exit_liquidity_usd)}`"
         )
     if trade.unsold_size > 0:
         lines.append(f"🚫 **Unsold:** `{fmt_int(trade.unsold_size)}` tokens")
@@ -647,7 +655,7 @@ def format_exit(
     lines.extend(
         [
             f"🔁 **Fills:** `{trade.exit_fill_count}` · "
-            f"📉 **Exit slippage:** `{trade.exit_impact * 100:.2f}%`",
+            f"📉 **Modeled exit slippage:** `{trade.exit_impact * 100:.2f}%`",
             f"⏱ **Duration:** `{fmt_duration(trade.hold_ms)}` of "
             f"`{fmt_duration(max(0, trade.expected_exit_ts_ms - trade.entry_ts_ms))}`",
             f"📈 **PnL:** `{fmt_signed_sol(pnl)} SOL` (`{fmt_pct(trade.return_pct)}`)",
@@ -736,7 +744,7 @@ def format_startup(
             # wallet's cash balance, which is reported separately below.
             f"🏦 **Configured initial capital:** "
             f"`{fmt_sol(starting_sol)} SOL`",
-            f"🧾 **Fee / slippage:** `{fee * 100:.2f}%` / `{slippage * 100:.2f}%`",
+            f"🧾 **Fee / modeled slippage:** `{fee * 100:.2f}%` / `{slippage * 100:.2f}%`",
             f"🛡 **Exit preflight:** `{preflight}`",
         ]
     )

@@ -231,6 +231,21 @@ What to watch in the first days:
   `started_at` across resumes (`resumed_at` records this process); `runtime_ms`
   in summaries is always per-process, never the age of the sample. Live mode
   never restores local state: its balances come from the chain.
+- **Session integrity is explicit.** `summary.json`, `meta.json` and the
+  shutdown notification carry `integrity`:
+  - `VALID` — every restart-snapshot write succeeded and the state reconciled.
+  - `DEGRADED` — a snapshot write failed during the run. New entries stay
+    blocked, open positions are still exited, and the failure is also written
+    to a sidecar `output/recovery/<rule>_<entry-mode>.sqlite3.degraded`
+    marker so an abrupt restart cannot make the run look clean.
+  - `INVALID` — a resume found that marker while the last snapshot still
+    claimed `VALID`, or the marker itself could not be written. The run is not
+    usable for performance conclusions; keep it paper-only and start a new
+    sample.
+  A degraded/invalid run is never silently re-enabled: only a fresh sample
+  (archive the SQLite file and its `.degraded` marker, then seed without
+  `--resume`) starts clean. Corrupt state, a fingerprint mismatch, an
+  unreadable degradation marker, or a pre-guard snapshot refuse to start.
 - Without `--resume`, a restart still starts a fresh wallet from
   `--starting-sol` in a new run directory. For the five-day gate, either run
   uninterrupted or run with `RESUME=1` so restarts continue the same

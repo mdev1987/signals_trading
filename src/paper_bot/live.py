@@ -508,6 +508,10 @@ class StrategyLane:
     # make decisions from a state that was never durable, so new entries stay
     # blocked until a restart recovers the last valid snapshot.
     _persistence_degraded: bool = False
+    # VALID / DEGRADED / INVALID, as recorded in the run summary and carried
+    # across a resume. INVALID means the state could not be reconciled with
+    # the durable evidence (see ``_resume_integrity``).
+    _integrity: str = "VALID"
 
 
 def _risk_state_path(config: LiveConfig, rule: str, entry_mode: str) -> Path:
@@ -637,6 +641,46 @@ def _run_started_at(
     return fallback
 
 
+def _resume_integrity(
+    saved_integrity: Any,
+    degradation: dict[str, Any] | None,
+    run_dir: Path,
+) -> str:
+    """Reconcile the last snapshot with an independent degradation marker.
+
+    ``VALID``    no failed-write evidence.
+    ``DEGRADED`` the snapshot already records a persistence failure.
+    ``INVALID``  a marker exists for this run but the snapshot still claims
+                 clean state. That means the process may have made entry
+                 decisions after a write failed and before a later write
+                 could record the degradation; the session must not be used
+                 for valid performance conclusions.
+
+    A marker for a different run is ignored: an operator who archived the
+    database and started a new sample does not inherit the old failure.
+    """
+    status = (
+        saved_integrity
+        if saved_integrity in {"VALID", "DEGRADED", "INVALID"}
+        else "VALID"
+    )
+    if degradation is None:
+        return status
+    marker_run = degradation.get("run_dir")
+    if marker_run is not None and str(run_dir) != str(marker_run):
+        return status
+    return "INVALID" if status == "VALID" else status
+
+
+def _lane_integrity(lane: StrategyLane) -> str:
+    """Current status for the summary, never less severe than the start state."""
+    if lane._integrity == "INVALID":
+        return "INVALID"
+    if lane._persistence_degraded or lane._integrity == "DEGRADED":
+        return "DEGRADED"
+    return "VALID"
+
+
 def _state_saver(
     store: RecoveryStore,
     lane: StrategyLane,
@@ -658,6 +702,13 @@ def _state_saver(
     * False — a snapshot write failed at least once; new entries stay blocked
       for the rest of the process. Existing positions continue to be managed
       and exited. Only a restart that loads the last valid snapshot clears it.
+
+    A failure also writes a sidecar marker outside the failing snapshot store
+    (``RecoveryStore.mark_degraded``) so an abrupt restart can still detect
+    the degradation. ``_resume_integrity`` upgrades a snapshot that still
+    claims VALID to INVALID when that marker exists. If the marker itself
+    cannot be written the run is INVALID immediately, because a restart would
+    have no reliable evidence; this is a hard-fail condition, not a warning.
     """
 
     def _mirror(healthy: bool) -> None:
@@ -666,10 +717,6 @@ def _state_saver(
             lane.engine._persistence_healthy = healthy
         if hasattr(lane.engine, "_persistence_degraded"):
             lane.engine._persistence_degraded = lane._persistence_degraded
-
-    # The process starts healthy; any failure below is sticky.
-    lane._persistence_degraded = False
-    _mirror(True)
 
     def save(state: dict[str, Any]) -> None:
         payload: dict[str, Any] = {
@@ -682,10 +729,8 @@ def _state_saver(
         if started_at is not None:
             payload["started_at"] = started_at
         # Persist the integrity flag whenever the store is writable: a later
-        # successful write then carries DEGRADED into the next restart.
-        payload["integrity"] = (
-            "DEGRADED" if lane._persistence_degraded else "VALID"
-        )
+        # successful write then carries DEGRADED/INVALID into the next restart.
+        payload["integrity"] = _lane_integrity(lane)
         payload["persistence_degraded"] = lane._persistence_degraded
         try:
             store.save(payload)
@@ -704,6 +749,8 @@ def _state_saver(
         except RuntimeError:
             first_failure = not lane._persistence_degraded
             lane._persistence_degraded = True
+            if lane._integrity == "VALID":
+                lane._integrity = "DEGRADED"
             # Persistence failure: block new entries while preserving exits.
             _mirror(False)
             LOGGER.exception(
@@ -713,7 +760,28 @@ def _state_saver(
                 "validation sample.",
                 lane.name,
             )
-            if first_failure:
+            if first_failure or lane._integrity == "INVALID":
+                mark_degraded = getattr(store, "mark_degraded", None)
+                if callable(mark_degraded):
+                    try:
+                        mark_degraded(
+                            run_dir=str(lane.run_dir),
+                            lane=lane.name,
+                            reason="restart snapshot write failed",
+                        )
+                    except RuntimeError:
+                        # Without a durable marker a restart may see the last
+                        # snapshot as clean. That is an unreconciled research
+                        # state, so do not let it masquerade as VALID.
+                        lane._integrity = "INVALID"
+                        LOGGER.critical(
+                            "PERSISTENCE INVALID: the durable degradation "
+                            "marker could not be written for lane %s; a "
+                            "restart cannot prove this run's state was "
+                            "durable",
+                            lane.name,
+                            exc_info=True,
+                        )
                 schedule = getattr(lane.reporter, "schedule", None)
                 notify = getattr(lane.reporter, "notify_error", None)
                 if schedule is not None and notify is not None:
@@ -934,6 +1002,7 @@ def _create_lane(
         engine=engine,
         reporter=reporter,
         stats=stats,
+        _integrity=start_integrity,
     )
 
 
@@ -1085,13 +1154,27 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                 recovered, config.run_dir, process_started_at
             )
             resumed_at = process_started_at
-            saved_integrity = recovered.get("integrity")
-            if saved_integrity == "DEGRADED":
-                start_integrity = "DEGRADED"
+            # Reconcile the last snapshot with the sidecar marker written when
+            # a snapshot write failed. A marker plus a snapshot that still
+            # claims VALID is an unreconciled run (INVALID): entries may have
+            # been accepted after durable state was already unreliable. An
+            # unreadable marker raises here, so resume fails closed.
+            degradation = recovery.load_degradation()
+            start_integrity = _resume_integrity(
+                recovered.get("integrity"), degradation, config.run_dir
+            )
+            if degradation is not None:
                 LOGGER.warning(
-                    "resuming a session recorded as DEGRADED; new entries "
-                    "stay blocked until the run is restarted from a clean "
-                    "snapshot"
+                    "durable persistence degradation marker for %s: %s",
+                    config.run_dir,
+                    degradation,
+                )
+            if start_integrity != "VALID":
+                LOGGER.warning(
+                    "resuming a session recorded as %s; new entries stay "
+                    "blocked until the run is restarted from a clean "
+                    "snapshot",
+                    start_integrity,
                 )
             LOGGER.warning(
                 "resuming run %s from %s (open positions=%d); run started %s",
@@ -1194,9 +1277,10 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                 fingerprint,
                 started_at=run_started_at.isoformat(),
             )
-            if start_integrity == "DEGRADED":
+            if start_integrity != "VALID":
                 # The snapshot this process recovered already recorded a
-                # persistence failure. Keep entries blocked; exits still run.
+                # persistence failure or an unreconciled state. Keep entries
+                # blocked; exits still run.
                 lane._persistence_degraded = True
                 lane._persistence_healthy = False
                 lane.engine._persistence_degraded = True
@@ -1214,6 +1298,25 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                     len(lane.wallet.token_balances),
                 )
             else:
+                # A fresh sample must not inherit the old run's marker. Clear
+                # it before the first write: if that write fails, the saver
+                # immediately recreates the marker for this run.
+                try:
+                    if recovery.clear_degradation():
+                        LOGGER.warning(
+                            "cleared a stale persistence degradation marker "
+                            "for a fresh sample"
+                        )
+                except RuntimeError:
+                    LOGGER.exception(
+                        "could not clear the stale degradation marker; the "
+                        "fresh run is marked INVALID"
+                    )
+                    lane._integrity = "INVALID"
+                    lane._persistence_degraded = True
+                    lane._persistence_healthy = False
+                    lane.engine._persistence_degraded = True
+                    lane.engine._persistence_healthy = False
                 # Write the snapshot immediately: a crash before the first
                 # trade should still be resumable into this same run.
                 lane.engine.persist_state()
@@ -1649,11 +1752,9 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         # Research integrity: a failed snapshot write means
                         # part of this process ran without durable state, so
                         # the run cannot be pooled with clean validation runs.
-                        "integrity": (
-                            "DEGRADED"
-                            if lane._persistence_degraded
-                            else "VALID"
-                        ),
+                        # INVALID additionally means the durable evidence and
+                        # the last snapshot could not be reconciled.
+                        "integrity": _lane_integrity(lane),
                         "persistence_degraded": lane._persistence_degraded,
                         "integrity_at_start": start_integrity,
                         "preflight_exit_min_ratio": (
@@ -1686,11 +1787,7 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         rule=lane.rule,
                         horizon_min=config.horizon_min,
                         strategy_tag=lane.name if is_ab else None,
-                        integrity=(
-                            "DEGRADED"
-                            if lane._persistence_degraded
-                            else "VALID"
-                        ),
+                        integrity=_lane_integrity(lane),
                     )
 
         await asyncio.gather(*(finalize_lane(lane) for lane in lanes))

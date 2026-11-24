@@ -19,13 +19,21 @@ progress. After the import the legacy file is renamed to ``*.imported``.
 from __future__ import annotations
 
 import json
+import os
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .state_store import StateStore
 
 RECOVERY_VERSION = 1
+# Sidecar written when the snapshot store itself fails. It deliberately does
+# not live in SQLite: the whole point is to survive a write failure in the
+# database that holds the snapshot. A restart reconciles this marker with the
+# last durable snapshot; a marker with no matching snapshot integrity is
+# classified INVALID rather than being silently forgotten.
+DEGRADATION_MARKER_SUFFIX = ".degraded"
 
 
 def _lane_stem(rule: str, entry_mode: str) -> str:
@@ -136,6 +144,86 @@ class RecoveryStore:
         self._store.clear()
 
     # ------------------------------------------------------------------
+    # Durable degradation marker
+    # ------------------------------------------------------------------
+    @property
+    def degradation_marker_path(self) -> Path:
+        return self.path.with_name(self.path.name + DEGRADATION_MARKER_SUFFIX)
+
+    def mark_degraded(
+        self, *, run_dir: str, lane: str, reason: str
+    ) -> None:
+        """Record a snapshot-write failure outside the failing database.
+
+        Written atomically (temp file + fsync + rename) so a crash cannot leave
+        a half marker. Raises ``RuntimeError`` if the marker cannot be made
+        durable; the caller then treats the run as INVALID because a restart
+        would not be able to detect the degradation.
+        """
+        marker = self.degradation_marker_path
+        payload = {
+            "version": RECOVERY_VERSION,
+            "run_dir": run_dir,
+            "lane": lane,
+            "reason": reason,
+            "marked_at": datetime.now(UTC).isoformat(),
+        }
+        temporary = marker.with_name(marker.name + ".tmp")
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, marker)
+            try:
+                os.chmod(marker, 0o600)
+            except OSError:  # pragma: no cover - best effort
+                pass
+        except OSError as exc:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"cannot write degradation marker at {marker}: {exc}"
+            ) from exc
+
+    def load_degradation(self) -> dict[str, Any] | None:
+        """Return the durable degradation marker, or ``None`` if absent.
+
+        An unreadable or non-object marker raises: ignoring it would let a
+        restart treat a run with a failed snapshot write as clean.
+        """
+        marker = self.degradation_marker_path
+        if not marker.exists():
+            return None
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"degradation marker at {marker} is unreadable: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"degradation marker at {marker} is not an object"
+            )
+        return payload
+
+    def clear_degradation(self) -> bool:
+        """Remove the marker for a fresh sample; returns whether one existed."""
+        marker = self.degradation_marker_path
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot clear degradation marker at {marker}: {exc}"
+            ) from exc
+        return True
+
+    # ------------------------------------------------------------------
     # Auxiliary counters and idempotency
     # ------------------------------------------------------------------
     def load_aux(self, key: str) -> dict[str, Any] | None:
@@ -155,6 +243,7 @@ class RecoveryStore:
 
 
 __all__ = [
+    "DEGRADATION_MARKER_SUFFIX",
     "RECOVERY_VERSION",
     "RecoveryStore",
     "default_state_db",

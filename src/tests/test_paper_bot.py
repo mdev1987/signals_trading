@@ -7,6 +7,7 @@ features, the live-execution guards, and the paper/live report wording.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import sys
@@ -52,6 +53,7 @@ from paper_bot.notifier import (  # noqa: E402
     ReporterConfig,
     TelegramReporter,
     _signal_evidence,
+    format_entry,
     format_startup,
 )
 from paper_bot.quotes import (  # noqa: E402
@@ -1801,11 +1803,19 @@ class StoreEvidenceTests(unittest.TestCase):
             store.record_trade_payload(
                 {
                     "mint": "mint",
-                    "exit_ts_ms": 1,
+                    "entry_ts_ms": 1_000,
+                    "exit_ts_ms": 2_000,
                     "pnl_sol": 0.0,
                     "return_pct": 0.0,
+                    "entry_quote_price_impact_pct": -42.14,
+                    "entry_quote_router": "metis",
                     "entry_quote_raw": {
-                        "routePlan": [{"swapInfo": {"label": "metis"}}]
+                        "priceImpact": -42.14,
+                        "priceImpactPct": "-0.4214",
+                        "inUsdValue": 12.5,
+                        "outUsdValue": 7.2,
+                        "swapUsdValue": 12.5,
+                        "routePlan": [{"swapInfo": {"label": "metis"}}],
                     },
                     "exit_quote_raw": {"outAmount": "1"},
                     "exit_quote_raws": [{"outAmount": "1"}],
@@ -1824,6 +1834,96 @@ class StoreEvidenceTests(unittest.TestCase):
                 ]["label"],
                 "metis",
             )
+            audit = json.loads(payload["entry_quote_audit"])
+            self.assertEqual(audit["mint"], "mint")
+            self.assertEqual(audit["quoted_at_ms"], 1_000)
+            self.assertEqual(audit["price_impact"], -42.14)
+            self.assertEqual(audit["price_impact_pct"], "-0.4214")
+            self.assertEqual(audit["normalized_price_impact_pct"], -42.14)
+            self.assertEqual(audit["in_usd_value"], 12.5)
+            self.assertEqual(audit["out_usd_value"], 7.2)
+            self.assertEqual(audit["swap_usd_value"], 12.5)
+            self.assertEqual(audit["router"], "metis")
+
+    def test_summary_ledger_reconciles_entries_trades_and_open_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperStore(Path(tmp))
+            position = Position(
+                signal=signal({"rule": SCANNER_RULE}),
+                mint=MINT,
+                entry_ts_ms=SIGNAL_TS + 5_000,
+                entry_price_sol=0.02,
+                size=5_000.0,
+                entry_value_sol=0.1,
+                entry_fee_sol=0.00125,
+                entry_impact=0.0,
+                horizon_ts_ms=SIGNAL_TS + 305_000,
+            )
+            store.record_entry(position)
+            store.record_trade_payload(
+                {
+                    "mint": MINT,
+                    "entry_ts_ms": SIGNAL_TS + 5_000,
+                    "exit_ts_ms": SIGNAL_TS + 305_000,
+                    "pnl_sol": 0.0,
+                    "return_pct": 0.0,
+                }
+            )
+            store.finalize(extra={"open_positions": 0})
+            summary = json.loads((Path(tmp) / "summary.json").read_text())
+            self.assertEqual(
+                summary["ledger"],
+                {
+                    "entries": 1,
+                    "closed_trades": 1,
+                    "open_positions": 0,
+                    "balanced": True,
+                },
+            )
+
+    def test_entry_audit_pins_quote_to_mint_and_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperStore(Path(tmp))
+            position = Position(
+                signal=signal({"rule": SCANNER_RULE}),
+                mint=MINT,
+                entry_ts_ms=SIGNAL_TS + 5_000,
+                entry_price_sol=0.02,
+                size=5_000.0,
+                entry_value_sol=0.1,
+                entry_fee_sol=0.00125,
+                entry_impact=0.0,
+                horizon_ts_ms=SIGNAL_TS + 305_000,
+                entry_quote=FillQuote(
+                    price_sol=0.02,
+                    source="jupiter",
+                    price_impact_pct=-100.0,
+                    router="metis",
+                    quoted_at_ms=SIGNAL_TS + 4_900,
+                    raw={
+                        "priceImpact": -100.0,
+                        "priceImpactPct": "-1.0",
+                        "inUsdValue": 12.5,
+                        "outUsdValue": 0.0,
+                        "swapUsdValue": 12.5,
+                        "router": "metis",
+                    },
+                ),
+            )
+            store.record_entry(position)
+            payload = json.loads(
+                (Path(tmp) / "entries.jsonl").read_text().splitlines()[-1]
+            )
+            audit = json.loads(payload["quote_audit"])
+            self.assertEqual(audit["mint"], MINT)
+            self.assertEqual(audit["quoted_at_ms"], SIGNAL_TS + 4_900)
+            self.assertEqual(audit["price_impact"], -100.0)
+            self.assertEqual(audit["price_impact_pct"], "-1.0")
+            self.assertEqual(audit["normalized_price_impact_pct"], -100.0)
+            self.assertEqual(audit["in_usd_value"], 12.5)
+            self.assertEqual(audit["out_usd_value"], 0.0)
+            self.assertEqual(audit["swap_usd_value"], 12.5)
+            self.assertEqual(audit["router"], "metis")
 
 
 class PreflightEconomicsTests(unittest.IsolatedAsyncioTestCase):
@@ -1889,7 +1989,7 @@ class PreflightEconomicsTests(unittest.IsolatedAsyncioTestCase):
             clock=lambda: self.NOW_MS,
         )
 
-    def signal(self) -> Signal:
+    def signal(self, features: dict[str, float | None] | None = None) -> Signal:
         return Signal(
             token_address=MINT,
             signal_ts_ms=self.NOW_MS - 10_000,
@@ -1902,11 +2002,15 @@ class PreflightEconomicsTests(unittest.IsolatedAsyncioTestCase):
             message_type="buy",
             is_buy_signal=True,
             is_confirmed_buy_signal=True,
-            features={},
+            features=dict(features or {}),
         )
 
-    async def enter(self, engine: PaperEngine) -> None:
-        await engine.on_signal(self.signal())
+    async def enter(
+        self,
+        engine: PaperEngine,
+        signal: Signal | None = None,
+    ) -> None:
+        await engine.on_signal(signal or self.signal())
         await engine.on_trade(
             TradeEvent(
                 mint=MINT,
@@ -1995,6 +2099,78 @@ class PreflightEconomicsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(engine.closed), 1)
         self.assertEqual(engine.closed[-1].exit_reason, "horizon")
         self.assertIn("exit", quotes.actions)
+
+    async def test_persistence_failure_during_entry_quote_blocks_reserve(
+        self,
+    ) -> None:
+        # The signal is accepted while persistence is healthy, then a snapshot
+        # write fails while the entry quote is in flight. The final check
+        # inside the mint lock must stop the reserve even though the earlier
+        # health check passed.
+        class BlockingQuotes(self.FakeQuotes):
+            def __init__(self) -> None:
+                super().__init__(entry_price=0.02, exit_price=0.02)
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def entry_quote(
+                self,
+                mint: str,
+                notional_sol: float,
+                reference_price_sol: float | None,
+                *,
+                decimals: int | None = None,
+            ) -> FillQuote:
+                self.started.set()
+                await self.release.wait()
+                return await super().entry_quote(
+                    mint,
+                    notional_sol,
+                    reference_price_sol,
+                    decimals=decimals,
+                )
+
+        quotes = BlockingQuotes()
+        engine = self.make_engine(quotes)
+        before = engine.broker.wallet.sol_balance
+        task = asyncio.create_task(self.enter(engine))
+        await asyncio.wait_for(quotes.started.wait(), timeout=2)
+
+        # Persistence degrades while the quote request is waiting.
+        engine._persistence_healthy = False
+        engine._persistence_degraded = True
+        quotes.release.set()
+        await asyncio.wait_for(task, timeout=2)
+
+        self.assertNotIn(MINT, engine.positions)
+        self.assertNotIn(MINT, engine.pending)
+        self.assertEqual(engine.broker.wallet.sol_balance, before)
+        self.assertEqual(engine.skips[-1].reason, "persistence_degraded")
+        self.assertIn("in flight", engine.skips[-1].detail or "")
+        self.assertNotIn("exit", quotes.actions)
+
+    async def test_entry_liquidity_records_only_the_observed_mark(self) -> None:
+        quotes = self.FakeQuotes(entry_price=0.02, exit_price=0.02)
+        engine = self.make_engine(quotes)
+        engine._mark_liquidity[MINT] = 51_234.0
+        await self.enter(
+            engine,
+            self.signal({"liquidity_usd": 45_000.0}),
+        )
+        position = engine.positions[MINT]
+        self.assertEqual(position.signal_liquidity_usd, 45_000.0)
+        self.assertEqual(position.entry_liquidity_usd, 51_234.0)
+
+    async def test_entry_liquidity_is_none_without_a_mark(self) -> None:
+        quotes = self.FakeQuotes(entry_price=0.02, exit_price=0.02)
+        engine = self.make_engine(quotes)
+        await self.enter(
+            engine,
+            self.signal({"liquidity_usd": 45_000.0}),
+        )
+        position = engine.positions[MINT]
+        self.assertEqual(position.signal_liquidity_usd, 45_000.0)
+        self.assertIsNone(position.entry_liquidity_usd)
 
     def test_fee_and_slippage_are_applied_once_per_side(self) -> None:
         ratio = preflight_exit_value_ratio(
@@ -2154,6 +2330,39 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Equity:** `10.000000 SOL`", text)
         self.assertIn("min exit value 0.90x", text)
         self.assertNotIn("Recovered cash", text)
+
+    def test_entry_notification_does_not_copy_signal_liquidity(self) -> None:
+        position = Position(
+            signal=signal(
+                {
+                    "rule": SCANNER_RULE,
+                    "dex": "Pumpfunamm",
+                    "liquidity_usd": 45_000.0,
+                }
+            ),
+            mint=MINT,
+            entry_ts_ms=SIGNAL_TS + 5_000,
+            entry_price_sol=0.02,
+            size=5_000.0,
+            entry_value_sol=0.1,
+            entry_fee_sol=0.00125,
+            entry_impact=0.0,
+            horizon_ts_ms=SIGNAL_TS + 305_000,
+            entry_quote=FillQuote(
+                price_sol=0.02,
+                source="jupiter",
+                price_impact_pct=1.25,
+            ),
+            signal_liquidity_usd=45_000.0,
+            entry_liquidity_usd=None,
+        )
+        text = format_entry(position, None, None)
+        self.assertIn("fill `Not observed`", text)
+        self.assertNotIn("fill `$45,000`", text)
+        # Paper slippage is the configured model, not an observed on-chain fill.
+        self.assertIn("Modeled slippage", text)
+        self.assertIn("Price impact", text)
+        self.assertIn("1.25%", text)
 
     def test_scanner_evidence_shows_only_scanner_gates(self) -> None:
         text = "\n".join(

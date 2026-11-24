@@ -340,6 +340,7 @@ class JupiterQuoteProvider:
                             )
                         else:
                             payload["_latency_ms"] = latency_ms
+                            payload["_quoted_at_ms"] = int(time.time() * 1000)
                             return payload
                 elif response.status_code in (401, 403):
                     raise QuoteError("quote_auth", f"HTTP {response.status_code}")
@@ -486,6 +487,7 @@ class JupiterQuoteProvider:
             router=payload.get("router"),
             request_id=payload.get("requestId"),
             latency_ms=payload.get("_latency_ms"),
+            quoted_at_ms=payload.get("_quoted_at_ms"),
             slippage_bps=payload.get("_slippage_bps"),
             raw=payload,
         )
@@ -529,6 +531,7 @@ class JupiterQuoteProvider:
             router=payload.get("router"),
             request_id=payload.get("requestId"),
             latency_ms=payload.get("_latency_ms"),
+            quoted_at_ms=payload.get("_quoted_at_ms"),
             slippage_bps=payload.get("_slippage_bps"),
             raw=payload,
         )
