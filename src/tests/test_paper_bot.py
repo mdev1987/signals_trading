@@ -656,6 +656,42 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
         # The PIT reason is untouched; only the outcome classification changed.
         self.assertEqual(trade.exit_reason, "horizon")
 
+    async def test_synthetic_fallback_is_not_reclassified_near_zero(self) -> None:
+        engine = self.engine()
+        position = Position(
+            signal=self.make_signal(),
+            mint=MINT,
+            entry_ts_ms=self.NOW_MS - 300_000,
+            entry_price_sol=1e-3,
+            size=100.0,
+            entry_value_sol=0.1,
+            entry_fee_sol=0.00125,
+            entry_impact=0.0,
+            horizon_ts_ms=self.NOW_MS,
+        )
+        position.sold_size = 100.0
+        position.size = 0.0
+        position.exit_price_acc = 1e-6
+        position.exit_value_acc = 1e-6
+        position.exit_fee_acc = 0.0
+        position.pnl_acc = -0.10125 + 1e-6
+        position.entry_basis_acc = 0.1
+        position.entry_fee_acc = 0.00125
+        position.exit_reason = "horizon"
+        position.exit_status = "horizon_complete"
+        position.exit_ts_ms = self.NOW_MS
+        engine.positions[MINT] = position
+
+        engine._commit_close(
+            position, FillQuote(price_sol=1e-8, source="fallback_feed")
+        )
+
+        # A synthetic feed mark is already flagged exit_synthetic; it must not
+        # masquerade as a priced near-zero sale.
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_status, "horizon_complete")
+        self.assertTrue(trade.exit_synthetic)
+
     async def test_normal_horizon_exit_keeps_horizon_status(self) -> None:
         engine = self.engine()
         position = Position(

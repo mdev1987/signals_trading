@@ -2040,6 +2040,7 @@ class PaperEngine:
         entry_cost = position.entry_basis_acc + position.entry_fee_acc
         if (
             exit_status == "horizon_complete"
+            and quote.source not in {"fallback_feed", "forced", "no_route"}
             and entry_cost > 0
             and position.exit_value_acc / entry_cost < NEAR_ZERO_EXIT_RATIO
         ):
