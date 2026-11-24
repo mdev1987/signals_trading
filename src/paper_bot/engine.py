@@ -201,6 +201,13 @@ class EngineConfig:
     slippage_bps: int = 50
     horizon_settle_ms: int = 0
     preflight_exit_route: bool = False
+    # Execution-sanity guard, separate from any strategy threshold. The
+    # preflight sell quote must return at least this share of the entry cost
+    # after the same fee/slippage model the broker uses for a real exit.
+    # 0.90 means "a round trip that loses more than 10 % before any price move
+    # is not worth entering", which catches thin/one-sided pools that quote a
+    # route but no usable depth. Frozen before a validation sample.
+    min_preflight_exit_value_ratio: float = 0.90
     exit_fractions: tuple[float, ...] = (1.0, 0.5, 0.25, 0.1, 0.01)
     exit_max_fills: int = 8
     exit_fallback_feed: bool = False
@@ -233,6 +240,46 @@ class EngineConfig:
             raise ValueError("timer_late_tolerance_ms must be non-negative")
         if self.max_future_skew_ms < 0:
             raise ValueError("max_future_skew_ms must be non-negative")
+        if not 0.0 < self.min_preflight_exit_value_ratio <= 1.0:
+            raise ValueError(
+                "min_preflight_exit_value_ratio must be in (0, 1]"
+            )
+
+
+def preflight_exit_value_ratio(
+    *,
+    entry_cost_sol: float,
+    size_tokens: float,
+    exit_price_sol: float | None,
+    fee: float,
+    slippage: float,
+) -> float | None:
+    """Expected net exit value as a share of what the entry cost.
+
+    ``entry_cost_sol`` is the cash actually spent, including the entry fee.
+    The exit side uses the broker's own model: gross proceeds are reduced by
+    the configured slippage and then the exit fee. Returning ``None`` means the
+    quote cannot be evaluated and the caller must fail closed.
+
+    Units: ``size_tokens * exit_price_sol`` is SOL because ``price_sol`` is
+    SOL per whole token. This is the same unit as ``entry_cost_sol``; the old
+    direct ``price / entry_value`` comparison mixed price with total value.
+    """
+    if (
+        entry_cost_sol <= 0
+        or size_tokens <= 0
+        or exit_price_sol is None
+        or not math.isfinite(exit_price_sol)
+        or exit_price_sol <= 0
+        or not 0 <= fee < 1
+        or not 0 <= slippage < 1
+    ):
+        return None
+    gross = size_tokens * exit_price_sol
+    net = gross * (1.0 - slippage) * (1.0 - fee)
+    if not math.isfinite(net) or net <= 0:
+        return None
+    return net / entry_cost_sol
 
 
 def entry_backoff_active(
@@ -354,9 +401,11 @@ class PaperEngine:
         # the book a fill happened in, never to trigger or size a trade.
         self._mark_liquidity: dict[str, float] = {}
         # Persistence health: True when recovery snapshot writes have succeeded.
-        # When False, new entries are blocked while exits continue.  Set by the
-        # _state_saver callback in live.py after each write attempt.
+        # When False, new entries are blocked while exits continue. Set by the
+        # _state_saver callback in live.py after each write attempt. The
+        # degraded flag is sticky until a restart restores a valid snapshot.
         self._persistence_healthy: bool = True
+        self._persistence_degraded: bool = False
         # Realized PnL by UTC day, used only by the optional daily loss cap.
         # The stable risk-state file wins over the per-run store; the run
         # directory changes on every restart, so it cannot be the only source.
@@ -986,8 +1035,9 @@ class PaperEngine:
             )
             rejection_reason = "persistence_degraded"
             rejection_detail = (
-                "recovery snapshot writes have failed; new entries are blocked "
-                "until the snapshot is repaired by a successful write or restart"
+                "recovery snapshot writes have failed; new entries stay "
+                "blocked for this process and exits continue; restart from "
+                "the last valid snapshot to resume entries"
             )
 
         if not decision.allowed:
@@ -1608,26 +1658,54 @@ class PaperEngine:
                             decimals=decimals,
                             action="preflight",
                         )
-                        # P0: Validate exit quote economics, not merely route existence.
-                        # Reject entries whose preflight exit quote has negligible
-                        # value relative to the entry cost, since a real wallet would
-                        # be unable to close the position at a meaningful price.
-                        exit_value = exit_quote.price_sol or 0.0
-                        entry_value = entry.entry_value_sol or 0.0
-                        if entry_value > 0 and exit_value / entry_value < 0.01:
-                            # Exit quote is less than 1% of entry value — treat
-                            # as no viable exit route and skip the entry.
-                            pending.last_reason = "preflight_exit_economics"
-                            pending.last_detail = (
-                                f"exit_quote={exit_value:.6f}; "
-                                f"entry_value={entry_value:.6f}; "
-                                f"ratio={exit_value/entry_value:.4f}"
+                        # P0: Validate exit quote economics, not merely route
+                        # existence. Compare the expected net sale proceeds
+                        # with the full entry cost (entry value + entry fee),
+                        # using the same fee/slippage model as a real close.
+                        entry_cost = (
+                            entry.entry_value_sol + entry.entry_fee_sol
+                        )
+                        ratio = preflight_exit_value_ratio(
+                            entry_cost_sol=entry_cost,
+                            size_tokens=entry.size,
+                            exit_price_sol=exit_quote.price_sol,
+                            fee=self.broker.config.fee,
+                            slippage=self.broker.config.slippage,
+                        )
+                        minimum = self.config.min_preflight_exit_value_ratio
+                        LOGGER.info(
+                            "preflight lane mint=%s exit_price=%s "
+                            "entry_cost=%.9f ratio=%s min=%.4f",
+                            pending.mint,
+                            (
+                                f"{exit_quote.price_sol:.9g}"
+                                if exit_quote.price_sol is not None
+                                else "missing"
+                            ),
+                            entry_cost,
+                            f"{ratio:.6f}" if ratio is not None else "invalid",
+                            minimum,
+                        )
+                        if ratio is None or ratio < minimum:
+                            ratio_text = (
+                                f"{ratio:.6f}"
+                                if ratio is not None
+                                else "invalid"
                             )
+                            detail = (
+                                f"exit_price={exit_quote.price_sol!s}; "
+                                f"entry_cost={entry_cost:.9f}; "
+                                f"ratio={ratio_text}; "
+                                f"min_ratio={minimum:.4f}; "
+                                "route=available"
+                            )
+                            pending.last_reason = "preflight_exit_economics"
+                            pending.last_detail = detail
                             async with self._lock(pending.mint):
                                 self._skip_pending(
                                     pending,
                                     "entry_no_exit_economics",
-                                    f"preflight_exit_economics: ratio={exit_value/entry_value:.4f}",
+                                    detail,
                                 )
                             return
                     except QuoteError as exc:

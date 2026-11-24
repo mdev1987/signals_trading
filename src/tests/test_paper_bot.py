@@ -19,7 +19,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from paper_bot.broker import BrokerConfig, PaperBroker  # noqa: E402
-from paper_bot.engine import EngineConfig, PaperEngine, entry_backoff_active  # noqa: E402
+from paper_bot.engine import (  # noqa: E402
+    EngineConfig,
+    PaperEngine,
+    entry_backoff_active,
+    preflight_exit_value_ratio,
+)
 from paper_bot.wallet import PaperWallet, WalletConfig  # noqa: E402
 from paper_bot.execution import (  # noqa: E402
     LiveExecutionConfig,
@@ -55,6 +60,7 @@ from paper_bot.quotes import (  # noqa: E402
     TokenMetadataResolver,
     is_terminal_exit_error,
     is_transient_quote_error,
+    normalize_price_impact_pct,
     slippage_ladder,
 )
 from paper_bot.signal_parser import (  # noqa: E402
@@ -1820,6 +1826,253 @@ class StoreEvidenceTests(unittest.TestCase):
             )
 
 
+class PreflightEconomicsTests(unittest.IsolatedAsyncioTestCase):
+    """Execution-sanity guard: a routable sell is not necessarily usable."""
+
+    NOW_MS = SIGNAL_TS
+
+    class FakeQuotes:
+        def __init__(self, *, entry_price: float, exit_price: float) -> None:
+            self.entry_price = entry_price
+            self.exit_price = exit_price
+            self.actions: list[str] = []
+            self.exit_calls = 0
+
+        async def entry_quote(
+            self,
+            mint: str,
+            notional_sol: float,
+            reference_price_sol: float | None,
+            *,
+            decimals: int | None = None,
+        ) -> FillQuote:
+            return FillQuote(price_sol=self.entry_price, source="test")
+
+        async def exit_quote(
+            self,
+            mint: str,
+            size_tokens: float,
+            reference_price_sol: float | None,
+            *,
+            decimals: int | None = None,
+            action: str = "exit",
+        ) -> FillQuote:
+            self.exit_calls += 1
+            self.actions.append(action)
+            return FillQuote(price_sol=self.exit_price, source="test")
+
+    def make_engine(
+        self,
+        quotes: "PreflightEconomicsTests.FakeQuotes",
+        *,
+        minimum: float = 0.90,
+    ) -> PaperEngine:
+        wallet = PaperWallet(WalletConfig(starting_sol=10.0))
+        broker = PaperBroker(
+            BrokerConfig(notional_sol=0.1, fee=0.0125, slippage=0.0),
+            wallet=wallet,
+        )
+        return PaperEngine(
+            config=EngineConfig(
+                entry_delay_ms=5_000,
+                max_entry_delay_ms=60_000,
+                live=True,
+                preflight_exit_route=True,
+                min_preflight_exit_value_ratio=minimum,
+                horizon_ms=300_000,
+            ),
+            broker=broker,
+            quotes=quotes,
+            history=MarketHistory(),
+            gate=GateConfig(rule="baseline"),
+            store=None,
+            clock=lambda: self.NOW_MS,
+        )
+
+    def signal(self) -> Signal:
+        return Signal(
+            token_address=MINT,
+            signal_ts_ms=self.NOW_MS - 10_000,
+            received_ts_ms=self.NOW_MS,
+            channel="@test",
+            message_id=1,
+            network="solana",
+            address_status="confirmed",
+            address_type="mint",
+            message_type="buy",
+            is_buy_signal=True,
+            is_confirmed_buy_signal=True,
+            features={},
+        )
+
+    async def enter(self, engine: PaperEngine) -> None:
+        await engine.on_signal(self.signal())
+        await engine.on_trade(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=self.NOW_MS,
+                event_index=0,
+                action="buy",
+                price_sol=0.02,
+                token_amount=100.0,
+                quote_amount=2.0,
+                quote_mint=MINT,
+            ),
+            await_actions=True,
+        )
+
+    async def test_acceptable_route_opens_the_position(self) -> None:
+        quotes = self.FakeQuotes(entry_price=0.02, exit_price=0.02)
+        engine = self.make_engine(quotes)
+        before = engine.broker.wallet.sol_balance
+        await self.enter(engine)
+        self.assertIn(MINT, engine.positions)
+        self.assertLess(engine.broker.wallet.sol_balance, before)
+        self.assertEqual(quotes.actions, ["preflight"])
+        # The paper path must never drift onto the exit action for preflight.
+        self.assertNotIn("exit", quotes.actions)
+
+    async def test_poor_route_is_rejected_before_the_wallet_is_debited(self) -> None:
+        # A routable quote returning ~5 % of the entry cost: the old check only
+        # proved a route existed, so this used to open a position.
+        quotes = self.FakeQuotes(entry_price=0.02, exit_price=0.001)
+        engine = self.make_engine(quotes)
+        before = engine.broker.wallet.sol_balance
+        await self.enter(engine)
+        self.assertNotIn(MINT, engine.positions)
+        self.assertNotIn(MINT, engine.pending)
+        self.assertEqual(engine.broker.wallet.sol_balance, before)
+        self.assertEqual(engine.skips[-1].reason, "entry_no_exit_economics")
+        detail = engine.skips[-1].detail or ""
+        self.assertIn("route=available", detail)
+        self.assertIn("min_ratio=0.9000", detail)
+        self.assertIn("ratio=", detail)
+        # Only the preflight quote was requested; no fill was executed.
+        self.assertEqual(quotes.actions, ["preflight"])
+
+    async def test_zero_exit_output_fails_closed(self) -> None:
+        quotes = self.FakeQuotes(entry_price=0.02, exit_price=0.0)
+        engine = self.make_engine(quotes)
+        await self.enter(engine)
+        self.assertNotIn(MINT, engine.positions)
+        self.assertEqual(engine.skips[-1].reason, "entry_no_exit_economics")
+
+    async def test_exact_threshold_passes_and_just_below_rejects(self) -> None:
+        entry_cost = 0.1 * (1 + 0.0125)
+        # net = size * price * (1-fee); solve for net == minimum * entry_cost.
+        size = 0.1 / 0.02
+        price_at_threshold = (0.90 * entry_cost) / (size * (1 - 0.0125))
+        quotes = self.FakeQuotes(
+            entry_price=0.02, exit_price=price_at_threshold
+        )
+        engine = self.make_engine(quotes)
+        await self.enter(engine)
+        self.assertIn(MINT, engine.positions, "ratio == minimum must pass")
+
+        below = self.FakeQuotes(
+            entry_price=0.02, exit_price=price_at_threshold * 0.99
+        )
+        engine = self.make_engine(below)
+        await self.enter(engine)
+        self.assertNotIn(MINT, engine.positions)
+        self.assertEqual(
+            engine.skips[-1].reason, "entry_no_exit_economics"
+        )
+
+    async def test_exits_still_run_while_entries_are_blocked(self) -> None:
+        quotes = self.FakeQuotes(entry_price=0.02, exit_price=0.02)
+        engine = self.make_engine(quotes)
+        await self.enter(engine)
+        self.assertIn(MINT, engine.positions)
+
+        # Snapshot writes have failed: no new entries, but the open position
+        # must still be managed and closed at its horizon.
+        engine._persistence_healthy = False
+        engine._persistence_degraded = True
+        await engine.tick(now_ms=self.NOW_MS + 300_001, await_actions=True)
+
+        self.assertNotIn(MINT, engine.positions)
+        self.assertEqual(len(engine.closed), 1)
+        self.assertEqual(engine.closed[-1].exit_reason, "horizon")
+        self.assertIn("exit", quotes.actions)
+
+    def test_fee_and_slippage_are_applied_once_per_side(self) -> None:
+        ratio = preflight_exit_value_ratio(
+            entry_cost_sol=0.10125,
+            size_tokens=5.0,
+            exit_price_sol=0.02,
+            fee=0.0125,
+            slippage=0.0,
+        )
+        assert ratio is not None
+        self.assertAlmostEqual(ratio, 0.09875 / 0.10125, places=12)
+
+    def test_invalid_inputs_return_none(self) -> None:
+        cases = [
+            dict(entry_cost_sol=0.0, exit_price_sol=0.02),
+            dict(entry_cost_sol=0.1, exit_price_sol=None),
+            dict(entry_cost_sol=0.1, exit_price_sol=0.0),
+            dict(entry_cost_sol=0.1, exit_price_sol=float("nan")),
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertIsNone(
+                    preflight_exit_value_ratio(
+                        size_tokens=5.0,
+                        fee=0.0125,
+                        slippage=0.0,
+                        **case,
+                    )
+                )
+
+    def test_config_rejects_an_out_of_range_ratio(self) -> None:
+        for value in (0.0, -0.1, 1.5):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    EngineConfig(
+                        live=True,
+                        min_preflight_exit_value_ratio=value,
+                    )
+
+
+class PriceImpactNormalizationTests(unittest.TestCase):
+    """Jupiter /order ``priceImpact`` is percentage points, not a ratio."""
+
+    def test_percentage_points_are_preserved(self) -> None:
+        self.assertEqual(
+            normalize_price_impact_pct({"priceImpact": 1.25}), 1.25
+        )
+        self.assertEqual(
+            normalize_price_impact_pct({"priceImpact": 0.5}), 0.5
+        )
+        self.assertEqual(normalize_price_impact_pct({"priceImpact": 0}), 0.0)
+
+    def test_deprecated_decimal_ratio_is_converted(self) -> None:
+        # ``priceImpactPct`` is documented as a decimal ratio.
+        self.assertEqual(
+            normalize_price_impact_pct({"priceImpactPct": "0.0125"}), 1.25
+        )
+
+    def test_primary_field_wins_when_both_are_present(self) -> None:
+        self.assertEqual(
+            normalize_price_impact_pct(
+                {"priceImpact": -0.25, "priceImpactPct": "0.5"}
+            ),
+            -0.25,
+        )
+
+    def test_missing_or_malformed_values_are_unavailable(self) -> None:
+        for payload in (
+            {},
+            {"priceImpact": None},
+            {"priceImpact": "abc"},
+            {"priceImpact": float("nan")},
+            {"priceImpactPct": "not-a-number"},
+        ):
+            with self.subTest(payload=payload):
+                self.assertIsNone(normalize_price_impact_pct(payload))
+
+
 class ReportTests(unittest.TestCase):
     def startup(self, mode: str) -> str:
         return format_startup(
@@ -1846,7 +2099,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("signed locally", text)
         self.assertNotIn("Paper trading only", text)
 
-    def test_resumed_startup_shows_restored_balance(self) -> None:
+    def test_resumed_startup_separates_configured_and_recovered_capital(self) -> None:
         text = format_startup(
             rule="scanner_pumpfun_amm",
             horizon_min=5,
@@ -1858,12 +2111,49 @@ class ReportTests(unittest.TestCase):
             session_file="bot.session",
             preflight_exit_route=False,
             mode="paper",
-            restored_sol=9.979139,
+            recovered_cash_sol=9.979139,
             resumed_at="2026-11-23T12:00:00+00:00",
+            recovery_status="recovered",
+            open_positions=2,
         )
-        self.assertIn("Restored balance", text)
+        self.assertIn("Configured initial capital", text)
+        self.assertIn("10.000000", text)
+        self.assertIn("Recovered cash", text)
         self.assertIn("9.979139", text)
+        self.assertIn("Open positions", text)
+        self.assertIn("`2`", text)
+        self.assertIn("Recovery", text)
+        self.assertIn("recovered", text)
         self.assertIn("2026-11-23T12:00:00+00:00", text)
+        # Equity cannot be computed without fresh marks; it must not silently
+        # show cash-only equity as if the restored tokens were worth zero.
+        self.assertIn("Unavailable", text)
+
+    def test_fresh_startup_reports_configured_capital_and_zero_positions(self) -> None:
+        text = format_startup(
+            rule="scanner_pumpfun_amm",
+            horizon_min=5,
+            notional_sol=0.1,
+            starting_sol=10.0,
+            fee=0.0125,
+            slippage=0.0,
+            channels=["@ave"],
+            session_file="bot.session",
+            preflight_exit_route=True,
+            mode="paper",
+            recovered_cash_sol=None,
+            recovery_status="fresh",
+            open_positions=0,
+            equity_sol=10.0,
+            min_preflight_exit_value_ratio=0.9,
+        )
+        self.assertIn("Configured initial capital", text)
+        self.assertIn("`10.000000 SOL`", text)
+        self.assertIn("Recovery:** `fresh`", text)
+        self.assertIn("Open positions:** `0`", text)
+        self.assertIn("Equity:** `10.000000 SOL`", text)
+        self.assertIn("min exit value 0.90x", text)
+        self.assertNotIn("Recovered cash", text)
 
     def test_scanner_evidence_shows_only_scanner_gates(self) -> None:
         text = "\n".join(
@@ -1881,9 +2171,23 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Pumpfunamm", text)
         self.assertIn("Launch liquidity", text)
         self.assertIn("$45,000", text)
+        self.assertIn("· pass", text)
         # The scanner rule has no flow/volume gate; the old text claimed one.
         self.assertNotIn("gate `> 9.46`", text)
         self.assertIn("context, no gate", text)
+
+    def test_scanner_evidence_marks_out_of_range_liquidity_failed(self) -> None:
+        text = "\n".join(
+            _signal_evidence(
+                {
+                    "rule": SCANNER_RULE,
+                    "dex": "Pumpfunamm",
+                    "liquidity_usd": 5_000.0,
+                }
+            )
+        )
+        self.assertIn("Launch liquidity", text)
+        self.assertIn("· fail", text)
 
     def test_flow_gate_label_only_for_hot_money_rule(self) -> None:
         features = {"hist_flow_1m_sol": 1.2, "total_buy_sol": 1.0}
@@ -1893,10 +2197,45 @@ class ReportTests(unittest.TestCase):
         hot_money = "\n".join(
             _signal_evidence({**features, "rule": "hot_money_continuation"})
         )
-        self.assertNotIn("gate `> 9.46`", baseline)
+        self.assertNotIn("gate `> 9.456 SOL`", baseline)
         self.assertIn("(context)", baseline)
-        self.assertIn("gate `> 9.46`", hot_money)
-        self.assertIn("gate `> 3`", hot_money)
+        self.assertIn("gate `> 9.456 SOL`", hot_money)
+        self.assertIn("gate `> 3 SOL`", hot_money)
+        # Both values are below their gates, so the evidence must show it.
+        self.assertIn("· fail", hot_money)
+
+    def test_hot_money_evidence_shows_dip_and_crowd_gates(self) -> None:
+        text = "\n".join(
+            _signal_evidence(
+                {
+                    "rule": "hot_money_continuation",
+                    "hist_flow_1m_sol": 12.0,
+                    "total_buy_sol": 4.0,
+                    "hist_pre_ret_15m": 3.5,
+                    "hist_signers_5m": 200,
+                    "hist_trades_5m": 700,
+                }
+            )
+        )
+        self.assertIn("gate `<= 2` · fail", text)
+        self.assertIn("gates `<= 147` / `<= 611` · fail", text)
+        self.assertIn("gate `> 9.456 SOL` · pass", text)
+        self.assertIn("gate `> 3 SOL` · pass", text)
+
+    def test_unknown_rule_evidence_has_no_invented_gates(self) -> None:
+        text = "\n".join(
+            _signal_evidence(
+                {
+                    "rule": "some_future_rule",
+                    "hist_flow_1m_sol": 100.0,
+                    "total_buy_sol": 100.0,
+                    "hist_signers_5m": 1,
+                    "hist_trades_5m": 1,
+                }
+            )
+        )
+        self.assertNotIn("gate `", text)
+        self.assertIn("(context)", text)
 
 
 if __name__ == "__main__":

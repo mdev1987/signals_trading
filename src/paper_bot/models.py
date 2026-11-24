@@ -155,6 +155,9 @@ class FillQuote:
     source: str
     in_amount: int | None = None
     out_amount: int | None = None
+    # Jupiter percentage points (``-0.1`` means ``-0.1 %``), normalized by
+    # ``quotes.normalize_price_impact_pct``. Diagnostic only; it is not added
+    # to the broker's cost model a second time.
     price_impact_pct: float | None = None
     router: str | None = None
     request_id: str | None = None

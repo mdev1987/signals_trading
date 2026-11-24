@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import OrderedDict
 from typing import Any
@@ -481,7 +482,7 @@ class JupiterQuoteProvider:
             source="jupiter",
             in_amount=amount,
             out_amount=out_amount,
-            price_impact_pct=_float_or_none(payload.get("priceImpact")),
+            price_impact_pct=normalize_price_impact_pct(payload),
             router=payload.get("router"),
             request_id=payload.get("requestId"),
             latency_ms=payload.get("_latency_ms"),
@@ -524,7 +525,7 @@ class JupiterQuoteProvider:
             source="jupiter",
             in_amount=amount,
             out_amount=out_lamports,
-            price_impact_pct=_float_or_none(payload.get("priceImpact")),
+            price_impact_pct=normalize_price_impact_pct(payload),
             router=payload.get("router"),
             request_id=payload.get("requestId"),
             latency_ms=payload.get("_latency_ms"),
@@ -571,9 +572,29 @@ class ReplayQuoteProvider:
 
 
 def _float_or_none(value: Any) -> float | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def normalize_price_impact_pct(payload: dict[str, Any]) -> float | None:
+    """Return Jupiter's price impact in percentage points.
+
+    Verified against the Jupiter Swap API V2 ``/order`` response schema:
+    ``priceImpact`` is a number in percentage points (``-0.1`` means
+    ``-0.1 %``). ``priceImpactPct`` is the deprecated decimal-ratio field
+    (``0.001`` means ``0.1 %``), so it is only a fallback and is multiplied
+    by 100. Returns ``None`` when neither field is present or finite; the
+    raw payload stays available on ``FillQuote.raw`` for diagnostics.
+    """
+    if not isinstance(payload, dict):
+        return None
+    primary = _float_or_none(payload.get("priceImpact"))
+    if primary is not None:
+        return primary
+    ratio = _float_or_none(payload.get("priceImpactPct"))
+    return ratio * 100.0 if ratio is not None else None

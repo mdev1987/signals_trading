@@ -25,7 +25,18 @@ from telegram.error import RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler
 
 from .models import ClosedTrade, Position, Signal
-from .signals import SCANNER_RULE
+from .signals import (
+    HOT_MONEY_ALERT_TOTAL_BUY_SOL,
+    HOT_MONEY_DIP_PRE_RET_MAX,
+    HOT_MONEY_FLOW_1M_SOL,
+    HOT_MONEY_SIGNERS_5M_MAX,
+    HOT_MONEY_TRADES_5M_MAX,
+    SCANNER_ALLOWED_DEX,
+    SCANNER_MAX_LIQUIDITY_USD,
+    SCANNER_MIN_LIQUIDITY_USD,
+    SCANNER_RULE,
+    normalize_dex,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -207,8 +218,20 @@ def _feature(features: dict[str, Any], key: str) -> float | None:
         return None
 
 
+def _gate_status(ok: bool | None) -> str:
+    """Short pass/fail marker for one displayed gate."""
+    if ok is None:
+        return "missing"
+    return "pass" if ok else "fail"
+
+
 def _signal_evidence(features: dict[str, Any]) -> list[str]:
-    """A compact, auditable view of the filter inputs for one trade."""
+    """A compact, auditable view of the filter inputs for one trade.
+
+    The labels follow the rule that actually accepted the signal. Only the
+    conditions ``evaluate_gate`` evaluates may be called a gate; every other
+    metric is context so a reader cannot mistake it for an entry requirement.
+    """
     max_pump = _feature(features, "max_pump")
     pre_ret = _feature(features, "hist_pre_ret")
     signers = _feature(features, "hist_signers_5m")
@@ -226,15 +249,30 @@ def _signal_evidence(features: dict[str, Any]) -> list[str]:
         # pre-signal history are displayed as context only: they must not be
         # labelled as gates the scanner rule does not evaluate.
         dex = features.get("dex")
-        lines.append(f"• DEX: `{dex or '—'}` (gate `Pumpfunamm`)")
-        liquidity = _feature(features, "liquidity_usd")
+        dex_ok = normalize_dex(dex) == normalize_dex(SCANNER_ALLOWED_DEX)
+        lines.append(f"• Rule: `{SCANNER_RULE}`")
         lines.append(
-            f"• Launch liquidity: `{fmt_mc(liquidity)}` "
-            f"(gate `$20k–<$100k`)"
+            f"• DEX: `{dex or '—'}` — gate `{SCANNER_ALLOWED_DEX}` · "
+            f"{_gate_status(dex_ok)}"
+        )
+        liquidity = _feature(features, "liquidity_usd")
+        if liquidity is None:
+            liquidity_ok: bool | None = None
+        else:
+            liquidity_ok = (
+                SCANNER_MIN_LIQUIDITY_USD
+                <= liquidity
+                < SCANNER_MAX_LIQUIDITY_USD
+            )
+        lines.append(
+            f"• Launch liquidity: `{fmt_mc(liquidity)}` — gate "
+            f"`${SCANNER_MIN_LIQUIDITY_USD:,.0f}–"
+            f"<${SCANNER_MAX_LIQUIDITY_USD:,.0f}` · "
+            f"{_gate_status(liquidity_ok)}"
         )
         mcap = _feature(features, "mcap_usd")
         if mcap is not None:
-            lines.append(f"• Card market cap: `{fmt_mc(mcap)}`")
+            lines.append(f"• Card market cap: `{fmt_mc(mcap)}` (context)")
         if flow_1m is not None:
             lines.append(
                 f"• Net 1m flow: `{fmt_signed_sol(flow_1m, 2)} SOL` "
@@ -249,33 +287,79 @@ def _signal_evidence(features: dict[str, Any]) -> list[str]:
 
     flow_is_gate = rule == "hot_money_continuation"
     if flow_1m is not None:
-        gate = " (gate `> 9.46`)" if flow_is_gate else " (context)"
-        lines.append(
-            f"• Net 1m flow: `{fmt_signed_sol(flow_1m, 2)} SOL`{gate}"
-        )
+        if flow_is_gate:
+            lines.append(
+                f"• Net 1m flow: `{fmt_signed_sol(flow_1m, 2)} SOL` — "
+                f"gate `> {HOT_MONEY_FLOW_1M_SOL:g} SOL` · "
+                f"{_gate_status(flow_1m > HOT_MONEY_FLOW_1M_SOL)}"
+            )
+        else:
+            lines.append(
+                f"• Net 1m flow: `{fmt_signed_sol(flow_1m, 2)} SOL` (context)"
+            )
     if vol_30m is not None:
         # Context only: the > 600 SOL leg was dropped from the deployed gate.
-        lines.append(f"• Prior 30m volume: `{fmt_sol(vol_30m, 0)} SOL`")
-    if max_pump is not None:
-        lines.append(f"• Max pump: `{fmt_ratio(max_pump)}`")
-    if pre_ret is not None:
-        lines.append(f"• Pre-signal run-up: `{fmt_pct(pre_ret)}`")
-    if signers is not None or trades is not None:
         lines.append(
-            "• Prior 5m crowd: "
+            f"• Prior 30m volume: `{fmt_sol(vol_30m, 0)} SOL` (context)"
+        )
+    if max_pump is not None:
+        lines.append(f"• Max pump: `{fmt_ratio(max_pump)}` (context)")
+    if pre_ret is not None:
+        lines.append(
+            f"• Pre-signal run-up: `{fmt_pct(pre_ret)}` (context)"
+        )
+    dip_15m = _feature(features, "hist_pre_ret_15m")
+    if dip_15m is not None:
+        if flow_is_gate:
+            lines.append(
+                f"• 15m run-up: `{fmt_pct(dip_15m)}` — gate "
+                f"`<= {HOT_MONEY_DIP_PRE_RET_MAX:g}` · "
+                f"{_gate_status(dip_15m <= HOT_MONEY_DIP_PRE_RET_MAX)}"
+            )
+        else:
+            lines.append(f"• 15m run-up: `{fmt_pct(dip_15m)}` (context)")
+    if signers is not None or trades is not None:
+        crowd = (
+            f"• Prior 5m crowd: "
             f"`{fmt_int(signers)}` signers / `{fmt_int(trades)}` trades"
         )
+        if flow_is_gate:
+            # The anti-crowd overlay rejects only when the feature is present
+            # and above the threshold; an absent feature passes.
+            crowd_ok = (
+                signers is not None
+                and trades is not None
+                and signers <= HOT_MONEY_SIGNERS_5M_MAX
+                and trades <= HOT_MONEY_TRADES_5M_MAX
+            )
+            crowd += (
+                f" — gates `<= {HOT_MONEY_SIGNERS_5M_MAX}` / "
+                f"`<= {HOT_MONEY_TRADES_5M_MAX}` · "
+                f"{_gate_status(crowd_ok)}"
+            )
+        else:
+            crowd += " (context)"
+        lines.append(crowd)
     if age is not None or drawdown is not None:
         lines.append(
             f"• Age: `{fmt_int(age)} min` · "
-            f"Drawdown from high: `{fmt_pct(drawdown)}`"
+            f"Drawdown from high: `{fmt_pct(drawdown)}` (context)"
         )
     if total_buy is not None or inflow_n is not None:
-        buys_gate = " (gate `> 3`)" if flow_is_gate else ""
-        lines.append(
-            f"• Message buys: `{fmt_sol(total_buy, 4)} SOL`{buys_gate} · "
-            f"Inflow: `{fmt_int(inflow_n)}` wallets"
+        buys = (
+            f"• Message buys: `{fmt_sol(total_buy, 4)} SOL`"
+            f" · Inflow: `{fmt_int(inflow_n)}` wallets"
         )
+        if flow_is_gate and total_buy is not None:
+            buys = (
+                f"• Message buys: `{fmt_sol(total_buy, 4)} SOL` — gate "
+                f"`> {HOT_MONEY_ALERT_TOTAL_BUY_SOL:g} SOL` · "
+                f"{_gate_status(total_buy > HOT_MONEY_ALERT_TOTAL_BUY_SOL)}"
+                f" · Inflow: `{fmt_int(inflow_n)}` wallets (context)"
+            )
+        elif not flow_is_gate:
+            buys += " (context)"
+        lines.append(buys)
     if not lines and features.get("hist_available") is False:
         lines.append("• History: `cold start — history rule rejected`")
     if not lines:
@@ -466,7 +550,7 @@ def format_entry(
             f"`{fmt_sol(position.entry_value_sol + position.entry_fee_sol)} SOL`",
             f"📉 **Slippage:** `{position.entry_impact * 100:.2f}%`"
             + (
-                f" · **Quote impact:** "
+                f" · **Price impact:** "
                 f"`{entry_quote.price_impact_pct:.2f}%`"
                 if entry_quote and entry_quote.price_impact_pct is not None
                 else ""
@@ -622,6 +706,12 @@ def format_startup(
     mode: str = "paper",
     restored_sol: float | None = None,
     resumed_at: str | None = None,
+    recovered_cash_sol: float | None = None,
+    equity_sol: float | None = None,
+    open_positions: int | None = None,
+    session_pnl_sol: float | None = None,
+    recovery_status: str | None = None,
+    min_preflight_exit_value_ratio: float | None = None,
 ) -> str:
     live = mode == "live"
     lines = [
@@ -633,24 +723,49 @@ def format_startup(
         lines.insert(2, f"🏷 **Lane:** `{strategy_tag}`")
     if rule_description:
         lines.append(f"🧠 **Strategy:** {rule_description}")
+    preflight = "on" if preflight_exit_route else "off"
+    if preflight_exit_route and min_preflight_exit_value_ratio is not None:
+        preflight += (
+            f" · min exit value {min_preflight_exit_value_ratio:.2f}x"
+        )
     lines.extend(
         [
             f"⏳ **Horizon:** `{horizon_min:g} min`",
             f"💵 **Notional:** `{fmt_sol(notional_sol)} SOL`",
-            f"🏦 **Starting balance:** `{fmt_sol(starting_sol)} SOL`",
+            # Deliberately named "configured": on a resumed run this is NOT the
+            # wallet's cash balance, which is reported separately below.
+            f"🏦 **Configured initial capital:** "
+            f"`{fmt_sol(starting_sol)} SOL`",
             f"🧾 **Fee / slippage:** `{fee * 100:.2f}%` / `{slippage * 100:.2f}%`",
-            f"🛡 **Exit preflight:** `{'on' if preflight_exit_route else 'off'}`",
+            f"🛡 **Exit preflight:** `{preflight}`",
         ]
     )
-    if restored_sol is not None:
-        # On --resume the wallet carries the previous process's realized PnL,
-        # so the configured starting balance alone cannot reconcile a balance
-        # seen at the first fill. Show the actual restored cash explicitly.
-        resumed = f" · run started `{resumed_at}`" if resumed_at else ""
+    # On --resume the wallet carries the previous process's realized PnL, so
+    # the configured starting balance cannot reconcile a balance seen at the
+    # first fill. Keep both values visible and marked unambiguously.
+    recovered = (
+        recovered_cash_sol if recovered_cash_sol is not None else restored_sol
+    )
+    status = recovery_status or (
+        "recovered" if resumed_at is not None or recovered is not None else "fresh"
+    )
+    resumed = f" · run started `{resumed_at}`" if resumed_at else ""
+    lines.append(f"📂 **Recovery:** `{status}`{resumed}")
+    if recovered is not None:
+        lines.append(f"💵 **Recovered cash:** `{fmt_sol(recovered)} SOL`")
+    if open_positions is not None:
+        lines.append(f"📌 **Open positions:** `{open_positions}`")
+    if session_pnl_sol is not None:
         lines.append(
-            f"♻️ **Restored balance:** `{fmt_sol(restored_sol)} SOL`"
-            f" (resumed{resumed})"
+            f"📈 **Session realized PnL:** "
+            f"`{fmt_signed_sol(session_pnl_sol)} SOL`"
         )
+    if equity_sol is not None:
+        lines.append(f"💼 **Equity:** `{fmt_sol(equity_sol)} SOL`")
+    elif status == "recovered":
+        # A restored token position has no fresh mark yet; cash-only equity
+        # would understate it, so do not present a number as reliable.
+        lines.append("💼 **Equity:** `Unavailable (no fresh marks)`")
     lines.extend(
         [
             f"📡 **Channels:** `{', '.join(channels) or '—'}`",
@@ -682,6 +797,7 @@ def format_shutdown(
     rule: str | None = None,
     horizon_min: float | None = None,
     strategy_tag: str | None = None,
+    integrity: str | None = None,
 ) -> str:
     lines = [
         "🔌 **PAPER BOT OFFLINE**",
@@ -690,6 +806,8 @@ def format_shutdown(
         f"⏱ **Runtime:** `{fmt_duration(runtime_ms)}`",
         f"💼 **Balance:** `{fmt_sol(_wallet_sol(wallet))} SOL`",
     ]
+    if integrity:
+        lines.append(f"🧪 **Session integrity:** `{integrity}`")
     if strategy_tag:
         lines.insert(2, f"🏷 **Lane:** `{strategy_tag}`")
     if wallet and wallet.get("equity_sol") is not None:
@@ -1063,6 +1181,12 @@ class TelegramReporter:
         mode: str = "paper",
         restored_sol: float | None = None,
         resumed_at: str | None = None,
+        recovered_cash_sol: float | None = None,
+        equity_sol: float | None = None,
+        open_positions: int | None = None,
+        session_pnl_sol: float | None = None,
+        recovery_status: str | None = None,
+        min_preflight_exit_value_ratio: float | None = None,
     ) -> bool:
         self.stats = self.stats or ReporterStats(starting_sol=starting_sol)
         return await self.send_markdown(
@@ -1082,6 +1206,12 @@ class TelegramReporter:
                 mode=mode,
                 restored_sol=restored_sol,
                 resumed_at=resumed_at,
+                recovered_cash_sol=recovered_cash_sol,
+                equity_sol=equity_sol,
+                open_positions=open_positions,
+                session_pnl_sol=session_pnl_sol,
+                recovery_status=recovery_status,
+                min_preflight_exit_value_ratio=min_preflight_exit_value_ratio,
             )
         )
 
@@ -1113,6 +1243,7 @@ class TelegramReporter:
         rule: str | None = None,
         horizon_min: float | None = None,
         strategy_tag: str | None = None,
+        integrity: str | None = None,
     ) -> bool:
         stats = self.stats or ReporterStats(starting_sol=0.0)
         return await self.send_markdown(
@@ -1124,6 +1255,7 @@ class TelegramReporter:
                 rule=rule,
                 horizon_min=horizon_min,
                 strategy_tag=strategy_tag,
+                integrity=integrity,
             ),
             silent=True,
         )

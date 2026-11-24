@@ -117,6 +117,16 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
         help="skip the sell-route check before opening a position",
     )
     parser.add_argument(
+        "--min-preflight-exit-value-ratio",
+        type=float,
+        default=0.90,
+        help=(
+            "Preflight sell quote must return at least this share of the "
+            "entry cost after fees/slippage (default 0.90). Part of the "
+            "recovery fingerprint: freeze it before a validation sample."
+        ),
+    )
+    parser.add_argument(
         "--exit-fallback-feed",
         action="store_true",
         help=(
@@ -500,6 +510,9 @@ def main() -> int:
             notional_sol=args.notional_sol,
             starting_sol=args.starting_sol,
             preflight_exit_route=not args.no_preflight_exit,
+            min_preflight_exit_value_ratio=(
+                args.min_preflight_exit_value_ratio
+            ),
             exit_fallback_feed=args.exit_fallback_feed,
             slippage_bps=args.slippage_bps,
             max_slippage_bps=args.max_slippage_bps,

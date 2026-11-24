@@ -58,7 +58,10 @@ from .recovery import RecoveryStore
 from .signals import (
     DEFAULT_RULE,
     RULE_DESCRIPTIONS,
+    SCANNER_ALLOWED_DEX,
+    SCANNER_MAX_LIQUIDITY_USD,
     SCANNER_MESSAGE_TYPE,
+    SCANNER_MIN_LIQUIDITY_USD,
     SCANNER_RULE,
     SUPPORTED_RULES,
     GateConfig,
@@ -162,6 +165,9 @@ class LiveConfig:
     max_seconds: float | None = None
     starting_sol: float = 10.0
     preflight_exit_route: bool = True
+    # Execution-sanity guard, frozen with the validation sample. See
+    # EngineConfig.min_preflight_exit_value_ratio.
+    min_preflight_exit_value_ratio: float = 0.90
     exit_fallback_feed: bool = False
     history_horizon_ms: int = 2_100_000
     # Memory budget: real firehose events cost ~300-600 B each (signature and
@@ -283,6 +289,10 @@ class LiveConfig:
             raise ValueError("risk_state_dir must not be empty")
         if self.exit_quote_timeout_ms <= 0:
             raise ValueError("exit_quote_timeout_ms must be positive")
+        if not 0.0 < self.min_preflight_exit_value_ratio <= 1.0:
+            raise ValueError(
+                "min_preflight_exit_value_ratio must be in (0, 1]"
+            )
         if self.shutdown_timeout_ms <= 0:
             raise ValueError("shutdown_timeout_ms must be positive")
         if self.tick_interval_s <= 0 or self.dex_interval_s <= 0:
@@ -493,6 +503,11 @@ class StrategyLane:
     reports_started: bool = False
     wallet_snapshot: dict[str, Any] | None = None
     _persistence_healthy: bool = True
+    # Sticky once a snapshot write fails. A later successful write proves the
+    # store is writable again but does not prove the process did not already
+    # make decisions from a state that was never durable, so new entries stay
+    # blocked until a restart recovers the last valid snapshot.
+    _persistence_degraded: bool = False
 
 
 def _risk_state_path(config: LiveConfig, rule: str, entry_mode: str) -> Path:
@@ -533,6 +548,9 @@ def _recovery_fingerprint(
         "sl_pct": config.sl_pct,
         "exit_quote_timeout_ms": config.exit_quote_timeout_ms,
         "preflight_exit_route": config.preflight_exit_route,
+        "min_preflight_exit_value_ratio": (
+            config.min_preflight_exit_value_ratio
+        ),
         "exit_fallback_feed": config.exit_fallback_feed,
         # Entry convention and fidelity guards.
         "entry_delay_ms": config.entry_delay_ms,
@@ -633,21 +651,25 @@ def _state_saver(
     a changed strategy to an existing five-day sample.
 
     Persistence health is tracked on the lane (_persistence_healthy) so that
-    the signal layer can block new entries when the durable state is no longer
-    reliable.  The engine also mirrors this state (_persistence_healthy) for
-    compatibility with code that accesses it through the engine.
+    the engine can block new entries when the durable state is no longer
+    reliable. The engine mirrors both the health and the sticky degraded flag.
 
-    * True — snapshot writes have succeeded; normal entry/exit behavior.
-    * False — a snapshot write failed; new entries are blocked; existing
-      positions still manage exits; the snapshot must be repaired (rewritten)
-      before new entries are permitted again.
-    * None — initial state before any write attempt.
+    * True — every snapshot write has succeeded; normal entry behavior.
+    * False — a snapshot write failed at least once; new entries stay blocked
+      for the rest of the process. Existing positions continue to be managed
+      and exited. Only a restart that loads the last valid snapshot clears it.
     """
 
-    # Track persistence health; a single failure degrades health until a
-    # successful write repairs it.  This lives on the lane so it survives
-    # restarts and is visible in the final session status.
-    lane._persistence_healthy = True
+    def _mirror(healthy: bool) -> None:
+        lane._persistence_healthy = healthy
+        if hasattr(lane.engine, "_persistence_healthy"):
+            lane.engine._persistence_healthy = healthy
+        if hasattr(lane.engine, "_persistence_degraded"):
+            lane.engine._persistence_degraded = lane._persistence_degraded
+
+    # The process starts healthy; any failure below is sticky.
+    lane._persistence_degraded = False
+    _mirror(True)
 
     def save(state: dict[str, Any]) -> None:
         payload: dict[str, Any] = {
@@ -659,20 +681,55 @@ def _state_saver(
         }
         if started_at is not None:
             payload["started_at"] = started_at
+        # Persist the integrity flag whenever the store is writable: a later
+        # successful write then carries DEGRADED into the next restart.
+        payload["integrity"] = (
+            "DEGRADED" if lane._persistence_degraded else "VALID"
+        )
+        payload["persistence_degraded"] = lane._persistence_degraded
         try:
             store.save(payload)
-            # Success repairs any prior degradation.
-            lane._persistence_healthy = True
-            # Also mirror on the engine for downstream consumers.
-            if hasattr(lane.engine, "_persistence_healthy"):
-                lane.engine._persistence_healthy = True
+            if lane._persistence_degraded:
+                # Do not silently re-enable entries: a successful write only
+                # proves the store works now, not that earlier decisions were
+                # made from durable state. A restart is the recovery path.
+                LOGGER.warning(
+                    "restart snapshot is writable again, but lane %s stays "
+                    "entry-blocked until a clean restart restores the last "
+                    "valid snapshot",
+                    lane.name,
+                )
+            else:
+                _mirror(True)
         except RuntimeError:
+            first_failure = not lane._persistence_degraded
+            lane._persistence_degraded = True
             # Persistence failure: block new entries while preserving exits.
-            lane._persistence_healthy = False
-            # Also mirror on the engine for downstream consumers.
-            if hasattr(lane.engine, "_persistence_healthy"):
-                lane.engine._persistence_healthy = False
-            LOGGER.exception("could not persist the restart snapshot")
+            _mirror(False)
+            LOGGER.exception(
+                "PERSISTENCE DEGRADED: could not write the restart snapshot "
+                "for lane %s; new entries are blocked, exits continue. The "
+                "session is marked DEGRADED and must not be used as a clean "
+                "validation sample.",
+                lane.name,
+            )
+            if first_failure:
+                schedule = getattr(lane.reporter, "schedule", None)
+                notify = getattr(lane.reporter, "notify_error", None)
+                if schedule is not None and notify is not None:
+                    try:
+                        schedule(
+                            notify(
+                                "persistence degraded: restart snapshot "
+                                "write failed; new entries blocked, exits "
+                                "still running"
+                            )
+                        )
+                    except (AttributeError, RuntimeError):
+                        # No running loop (for example a synchronous test or
+                        # an early startup path): the log above is the
+                        # notification.
+                        pass
 
     return save
 
@@ -686,6 +743,7 @@ def _lane_meta(
     is_ab: bool,
     started_at: str,
     resumed_at: str | None = None,
+    integrity_at_start: str = "VALID",
 ) -> dict[str, Any]:
     return {
         "mode": (
@@ -717,6 +775,17 @@ def _lane_meta(
         # Present only when this process continued an existing run; the run's
         # original start stays in ``started_at`` so the sample is not restamped.
         "resumed_at": resumed_at,
+        "recovery_status": "recovered" if resumed_at else "fresh",
+        # Integrity is authoritative in the final summary; this records the
+        # state the process started from so a crash cannot look clean.
+        "integrity_at_start": integrity_at_start,
+        # Gate inputs the engine actually evaluates for this rule. Frozen
+        # constants, recorded so a later reader can tell what accepted a card.
+        "scanner_gate": {
+            "allowed_dex": SCANNER_ALLOWED_DEX,
+            "min_liquidity_usd": SCANNER_MIN_LIQUIDITY_USD,
+            "max_liquidity_usd_exclusive": SCANNER_MAX_LIQUIDITY_USD,
+        },
         "recovery_state_db": (
             str(config.state_db) if config.state_db is not None else None
         ),
@@ -729,6 +798,9 @@ def _lane_meta(
         "notional_sol": config.notional_sol,
         "starting_sol": config.starting_sol,
         "preflight_exit_route": config.preflight_exit_route,
+        "min_preflight_exit_value_ratio": (
+            config.min_preflight_exit_value_ratio
+        ),
         "exit_fallback_feed": config.exit_fallback_feed,
         "exit_quote_timeout_ms": config.exit_quote_timeout_ms,
         "safety_screen": config.safety_screen,
@@ -762,6 +834,7 @@ def _create_lane(
     is_ab: bool,
     started_at: str,
     resumed_at: str | None,
+    start_integrity: str = "VALID",
 ) -> StrategyLane:
     wallet = PaperWallet(WalletConfig(starting_sol=config.starting_sol))
     broker = PaperBroker(
@@ -782,6 +855,7 @@ def _create_lane(
             is_ab=is_ab,
             started_at=started_at,
             resumed_at=resumed_at,
+            integrity_at_start=start_integrity,
         ),
     )
     reporter = TelegramReporter.from_env(
@@ -830,6 +904,9 @@ def _create_lane(
             slippage_bps=config.slippage_bps,
             horizon_settle_ms=config.horizon_settle_ms,
             preflight_exit_route=config.preflight_exit_route,
+            min_preflight_exit_value_ratio=(
+                config.min_preflight_exit_value_ratio
+            ),
             exit_fallback_feed=config.exit_fallback_feed,
             shutdown_timeout_ms=config.shutdown_timeout_ms,
         ),
@@ -946,6 +1023,9 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
     fingerprint: dict[str, Any] | None = None
     run_started_at = process_started_at
     resumed_at: datetime | None = None
+    # Integrity of the run this process starts from. A resumed run adopts the
+    # snapshot's flag so a degraded session cannot look clean after a restart.
+    start_integrity = "VALID"
     if config.state_db is not None:
         recovery = RecoveryStore(config.state_db)
         try:
@@ -976,6 +1056,24 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         f"configuration: saved={recovered['fingerprint']} "
                         f"current={fingerprint}"
                     )
+                saved_guard = recovered["fingerprint"].get(
+                    "min_preflight_exit_value_ratio"
+                )
+                if (
+                    saved_guard is None
+                    and config.min_preflight_exit_value_ratio is not None
+                ):
+                    # Before this guard existed entries were accepted on route
+                    # existence alone. Continuing the same ``started_at``
+                    # would pool trades accepted under two different
+                    # execution rules, which the validation gates forbid.
+                    raise RuntimeError(
+                        "saved run predates the preflight exit-economics "
+                        f"guard (now {config.min_preflight_exit_value_ratio:.2f}x). "
+                        "Resuming would pool entries accepted under a "
+                        "different rule. Archive the state database and "
+                        "start a new validation sample."
+                    )
                 LOGGER.warning(
                     "upgrading a recovery fingerprint written by an older "
                     "build (saved=%s); shared fields match, newly tracked "
@@ -987,6 +1085,14 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                 recovered, config.run_dir, process_started_at
             )
             resumed_at = process_started_at
+            saved_integrity = recovered.get("integrity")
+            if saved_integrity == "DEGRADED":
+                start_integrity = "DEGRADED"
+                LOGGER.warning(
+                    "resuming a session recorded as DEGRADED; new entries "
+                    "stay blocked until the run is restarted from a clean "
+                    "snapshot"
+                )
             LOGGER.warning(
                 "resuming run %s from %s (open positions=%d); run started %s",
                 config.run_dir,
@@ -1079,6 +1185,7 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             resumed_at=(
                 resumed_at.isoformat() if resumed_at is not None else None
             ),
+            start_integrity=start_integrity,
         )
         if recovery is not None and fingerprint is not None:
             lane.engine.on_state_change = _state_saver(
@@ -1087,6 +1194,13 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                 fingerprint,
                 started_at=run_started_at.isoformat(),
             )
+            if start_integrity == "DEGRADED":
+                # The snapshot this process recovered already recorded a
+                # persistence failure. Keep entries blocked; exits still run.
+                lane._persistence_degraded = True
+                lane._persistence_healthy = False
+                lane.engine._persistence_degraded = True
+                lane.engine._persistence_healthy = False
             if recovered is not None:
                 lane.engine.restore_state(recovered)
                 # Rewrite the snapshot immediately: this upgrades a legacy
@@ -1319,15 +1433,49 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
         if config.reports:
             lane.reports_started = await lane.reporter.start()
             if lane.reports_started:
+                # Report recovered cash/equity from the actual wallet, not from
+                # ``starting_sol``. Equity is only shown when every restored
+                # token has a fresh mark; otherwise cash-only equity would
+                # understate the position and look like a loss.
+                marks: dict[str, float] = {}
+                if resumed_at is not None:
+                    for mint in list(lane.wallet.token_balances):
+                        price, _ = history.last_price(mint)
+                        if price is not None and price > 0:
+                            marks[mint] = price
+                unmarked = any(
+                    mint not in marks for mint in lane.wallet.token_balances
+                )
+                equity = (
+                    None
+                    if unmarked
+                    else lane.wallet.equity_sol(marks)
+                )
+                session_pnl: float | None
+                try:
+                    session_pnl = sum(
+                        lane.store.realized_pnl_by_day().values()
+                    )
+                except OSError:
+                    session_pnl = None
                 await lane.reporter.notify_startup(
                     rule=lane.rule,
                     horizon_min=config.horizon_min,
                     notional_sol=config.notional_sol,
                     starting_sol=config.starting_sol,
-                    restored_sol=(
+                    recovered_cash_sol=(
                         lane.wallet.sol_balance
                         if resumed_at is not None
                         else None
+                    ),
+                    equity_sol=equity,
+                    open_positions=len(lane.engine.positions),
+                    session_pnl_sol=session_pnl,
+                    recovery_status=(
+                        "recovered" if resumed_at is not None else "fresh"
+                    ),
+                    min_preflight_exit_value_ratio=(
+                        config.min_preflight_exit_value_ratio
                     ),
                     resumed_at=(
                         run_started_at.isoformat()
@@ -1498,6 +1646,22 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         "shutdown_reason": shutdown_reason,
                         "scanner_cards": scanner_stats["cards"],
                         "scanner_duplicates": scanner_stats["duplicates"],
+                        # Research integrity: a failed snapshot write means
+                        # part of this process ran without durable state, so
+                        # the run cannot be pooled with clean validation runs.
+                        "integrity": (
+                            "DEGRADED"
+                            if lane._persistence_degraded
+                            else "VALID"
+                        ),
+                        "persistence_degraded": lane._persistence_degraded,
+                        "integrity_at_start": start_integrity,
+                        "preflight_exit_min_ratio": (
+                            config.min_preflight_exit_value_ratio
+                        ),
+                        "recovery_status": (
+                            "recovered" if resumed_at is not None else "fresh"
+                        ),
                         # ``started_at`` is the original run start (preserved
                         # across resumes); the process timings are this
                         # process only, so a restarted sample is not reported
@@ -1522,6 +1686,11 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         rule=lane.rule,
                         horizon_min=config.horizon_min,
                         strategy_tag=lane.name if is_ab else None,
+                        integrity=(
+                            "DEGRADED"
+                            if lane._persistence_degraded
+                            else "VALID"
+                        ),
                     )
 
         await asyncio.gather(*(finalize_lane(lane) for lane in lanes))

@@ -28,6 +28,7 @@ from paper_bot.live import (  # noqa: E402
     StrategyLane,
     _count_scanner_cards,
     _fingerprint_subset,
+    _lane_meta,
     _recovery_fingerprint,
     _run_started_at,
     _state_saver,
@@ -490,6 +491,7 @@ class StateSaverTests(unittest.TestCase):
             {"sl_pct": -0.5},
             {"exit_quote_timeout_ms": 10_000},
             {"preflight_exit_route": False},
+            {"min_preflight_exit_value_ratio": 0.5},
             {"exit_fallback_feed": True},
             {"slippage_bps": 100},
             {"max_slippage_bps": 500},
@@ -604,6 +606,33 @@ class RecoveryConfigTests(unittest.TestCase):
         self.assertTrue(config.resume)
         self.assertEqual(config.state_db, Path("output/recovery/x.sqlite3"))
 
+    def test_preflight_ratio_must_be_a_fraction(self) -> None:
+        self.assertEqual(live_config().min_preflight_exit_value_ratio, 0.90)
+        for value in (0.0, -0.1, 1.01):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    live_config(min_preflight_exit_value_ratio=value)
+
+    def test_meta_records_gate_and_integrity_before_a_crash(self) -> None:
+        meta = _lane_meta(
+            live_config(),
+            lane="A",
+            rule="scanner_pumpfun_amm",
+            entry_mode="trade",
+            is_ab=False,
+            started_at="2026-11-24T00:00:00+00:00",
+            integrity_at_start="DEGRADED",
+        )
+        self.assertEqual(meta["integrity_at_start"], "DEGRADED")
+        self.assertEqual(meta["recovery_status"], "fresh")
+        self.assertEqual(meta["min_preflight_exit_value_ratio"], 0.90)
+        self.assertTrue(meta["preflight_exit_route"])
+        self.assertEqual(meta["scanner_gate"]["allowed_dex"], "Pumpfunamm")
+        self.assertEqual(meta["scanner_gate"]["min_liquidity_usd"], 20_000.0)
+        self.assertEqual(
+            meta["scanner_gate"]["max_liquidity_usd_exclusive"], 100_000.0
+        )
+
 
 class ResumeStartupTests(unittest.IsolatedAsyncioTestCase):
     """The runner must refuse an unusable snapshot before touching the network."""
@@ -652,6 +681,38 @@ class ResumeStartupTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError) as caught:
                 await self._run(config)
             self.assertIn("different configuration", str(caught.exception))
+
+    async def test_resume_refuses_a_run_without_the_preflight_guard(self) -> None:
+        # Entries accepted on route existence alone cannot be pooled with
+        # entries that passed the exit-economics guard.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            config = live_config(
+                resume=True,
+                state_db=path,
+                telegram=False,
+                max_seconds=1,
+                rule="scanner_pumpfun_amm",
+                entry_mode="trade",
+            )
+            legacy = _recovery_fingerprint(
+                live_config(rule="scanner_pumpfun_amm", entry_mode="trade"),
+                "scanner_pumpfun_amm",
+                "trade",
+            )
+            legacy.pop("min_preflight_exit_value_ratio")
+            RecoveryStore(path).save(
+                {
+                    "run_dir": str(Path(tmp) / "run"),
+                    "fingerprint": legacy,
+                    "wallet": {"sol_balance": 10.0},
+                    "token_balances": {},
+                    "positions": [],
+                }
+            )
+            with self.assertRaises(RuntimeError) as caught:
+                await self._run(config)
+            self.assertIn("preflight exit-economics", str(caught.exception))
 
 
 class ResumedRunSummaryTests(unittest.TestCase):
@@ -757,17 +818,81 @@ class ResumedRunSummaryTests(unittest.TestCase):
             # After a failed write, persistence health should be degraded
             self.assertFalse(lane._persistence_healthy,
                              "persistence_healthy should be False after failed write")
+            self.assertTrue(lane._persistence_degraded,
+                            "degraded flag should be sticky after a failed write")
             # The engine's mirror should also be False
             self.assertFalse(getattr(lane.engine, "_persistence_healthy", True),
                              "engine persistence_healthy should be False after failed write")
+            self.assertTrue(
+                getattr(lane.engine, "_persistence_degraded", False),
+                "engine degraded flag should mirror the lane",
+            )
 
-    def test_preflight_exit_economics_rejects_low_quote_ratio(self) -> None:
-        # P0: When preflight exit quote has < 1% of entry value, entry must be rejected.
-        exit_value = 0.000005
-        entry_value = 1.0
-        ratio = exit_value / entry_value
-        self.assertLess(ratio, 0.01, "low ratio should be rejected")
-        self.assertLess(exit_value / entry_value, 0.01)
+    def test_later_successful_write_does_not_re_enable_entries(self) -> None:
+        # A write that succeeds after a failure proves the store works now,
+        # not that earlier decisions were made from durable state. Only a
+        # restart from the last valid snapshot may clear the latch.
+        with tempfile.TemporaryDirectory():
+            lane = StrategyLane(
+                name="A",
+                rule="scanner_pumpfun_amm",
+                entry_mode="trade",
+                run_dir=Path("output/paper/live_test"),
+                wallet=PaperWallet(),
+                broker=object(),  # type: ignore[arg-type]
+                store=object(),  # type: ignore[arg-type]
+                engine=PaperEngine(
+                    config=EngineConfig(live=True),
+                    broker=PaperBroker(
+                        BrokerConfig(notional_sol=0.1),
+                        wallet=PaperWallet(),
+                    ),
+                    quotes=object(),
+                    history=MarketHistory(),
+                    gate=GateConfig(rule="baseline"),
+                    store=None,
+                    clock=lambda: ENTRY_TS,
+                ),
+                reporter=object(),  # type: ignore[arg-type]
+                stats=object(),  # type: ignore[arg-type]
+            )
+
+            class FlakyStore:
+                def __init__(self) -> None:
+                    self.calls = 0
+                    self.payloads: list[dict[str, Any]] = []
+
+                def save(self, payload: dict[str, Any]) -> None:
+                    self.calls += 1
+                    self.payloads.append(dict(payload))
+                    if self.calls == 1:
+                        raise RuntimeError("write failed once")
+
+                def close(self) -> None:
+                    pass
+
+            store = FlakyStore()
+            save = _state_saver(
+                store, lane, {"run_dir": "out", "fingerprint": {}}
+            )
+            payload = {
+                "wallet": {"sol_balance": 9.5},
+                "token_balances": {},
+                "positions": [],
+            }
+            save(payload)
+            self.assertTrue(lane._persistence_degraded)
+            save(payload)  # this write succeeds
+            self.assertEqual(store.calls, 2)
+            self.assertFalse(
+                lane._persistence_healthy,
+                "a successful retry must not silently re-open entries",
+            )
+            self.assertTrue(lane._persistence_degraded)
+            self.assertFalse(lane.engine._persistence_healthy)
+            # The snapshot that a later restart would load must not look clean.
+            self.assertEqual(store.payloads[-1]["integrity"], "DEGRADED")
+            self.assertTrue(store.payloads[-1]["persistence_degraded"])
 
 
 if __name__ == "__main__":

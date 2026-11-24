@@ -11,8 +11,8 @@ For a flat-cost run the maths is identical to ``backtest_signals``::
 
 The live price comes from a Jupiter quote; the backtest's fee and slippage are
 then applied on top so paper results stay comparable with ``output/backtest``.
-The Jupiter quote's own ``priceImpact`` is stored as a diagnostic and is not
-added a second time.
+Jupiter's own ``priceImpact`` (percentage points) is stored as a diagnostic and
+is not added a second time.
 
 When a :class:`~paper_bot.wallet.PaperWallet` is attached, the broker also
 enforces cash and token balances. A partial close sells a fraction of the

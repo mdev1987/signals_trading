@@ -40,6 +40,7 @@ from .quotes import (
     DEFAULT_MAX_SLIPPAGE_BPS,
     QuoteError,
     TokenMetadataResolver,
+    normalize_price_impact_pct,
     slippage_ladder,
 )
 
@@ -588,7 +589,7 @@ class LiveSolanaExecutor:
             source=LIVE_QUOTE_SOURCE,
             in_amount=in_raw,
             out_amount=out_raw,
-            price_impact_pct=_float_or_none(order.get("priceImpact")),
+            price_impact_pct=normalize_price_impact_pct(order),
             router=order.get("router") or "jupiter",
             request_id=order.get("requestId"),
             latency_ms=order.get("_latency_ms"),
@@ -645,7 +646,7 @@ class LiveSolanaExecutor:
             source=LIVE_QUOTE_SOURCE,
             in_amount=in_raw,
             out_amount=out_raw,
-            price_impact_pct=_float_or_none(order.get("priceImpact")),
+            price_impact_pct=normalize_price_impact_pct(order),
             router=order.get("router") or "jupiter",
             request_id=order.get("requestId"),
             latency_ms=order.get("_latency_ms"),
@@ -725,15 +726,6 @@ class LiveQuoteProvider:
 
     async def close(self) -> None:
         await self.executor.close()
-
-
-def _float_or_none(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 __all__ = [
