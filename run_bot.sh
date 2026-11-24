@@ -32,6 +32,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# The package lives under src/ and is not installed as a wheel. oxmgr sets
+# this explicitly for the 24/7 app; a one-off seed or foreground run must use
+# the same import path or `python -m paper_bot` fails with "No module named
+# paper_bot". Keep any PYTHONPATH the caller already set.
+export PYTHONPATH="$SCRIPT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+
 VENV=".venv/bin/python"
 if [[ ! -x "$VENV" ]]; then
   echo "ERROR: $VENV not found. Create the venv first (uv sync / python -m venv .venv)."
