@@ -749,6 +749,15 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
         # A mark is a price observation, not an exit signal.
         self.assertFalse(position.exit_requested)
 
+    async def test_persistence_degraded_blocks_new_entries(self) -> None:
+        engine = self.engine()
+        engine._persistence_healthy = False
+        decision = await engine.on_signal(self.make_signal())
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reasons, ["persistence_degraded"])
+        self.assertEqual(engine.skips[-1].reason, "persistence_degraded")
+        self.assertNotIn(MINT, engine.pending)
+
     async def test_late_card_is_not_traded(self) -> None:
         engine = self.engine(max_delivery_lag_ms=60_000)
         decision = await engine.on_signal(

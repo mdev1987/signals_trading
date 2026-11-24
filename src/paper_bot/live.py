@@ -1293,14 +1293,11 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                     scanner_seen[scanner_key] = None
                     if len(scanner_seen) > config.message_dedup_window:
                         scanner_seen.popitem(last=False)
-                # P0: Block new entries when persistence health is degraded.
-                # This check mirrors the engine's internal check and ensures
-                # the rejection happens before the engine processes the signal.
-                if not lane._persistence_healthy():
-                    LOGGER.warning(
-                        "persistence degraded: skipping signal for %s",
-                        signal.token_address or "<none>")
-                    continue
+                # Persistence health is enforced inside ``engine.on_signal``:
+                # it records a ``persistence_degraded`` skip in the audit trail
+                # and keeps exits running. Do not duplicate that check here —
+                # a signal-level ``continue`` would silently omit both the
+                # signal and the skip from the forward-gate accounting.
                 decision = await lane.engine.on_signal(signal)
             LOGGER.info(
                 "signal lane=%s %s %s allowed=%s lag_ms=%s reasons=%s",
