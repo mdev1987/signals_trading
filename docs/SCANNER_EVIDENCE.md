@@ -27,8 +27,11 @@ controls.
 
 ## Data and method
 
-The only days with scanner-channel history in the replay archive are
-**2026-11-08, 2026-11-18, 2026-11-19 and 2026-11-20**. Raw archives live in
+The scanner-channel history in the replay archive covers **2026-11-08,
+2026-11-18, 2026-11-19 and 2026-11-20** (the headline below), plus
+**2026-11-21 and 2026-11-22**, which were added to the archive on 2026-11-25 and
+are reported in [`STRATEGY_REPORT.md`](STRATEGY_REPORT.md) without changing this
+table. Raw archives live in
 `/mnt/HDD/PumpAPI_Replay_Zst/<day>/*.jsonl.zst` and are streamed, never loaded
 whole.
 
@@ -339,6 +342,21 @@ is −1.81 to +1.66 SOL with P(>0) = 0.49: flat, not evidence of an edge in
 either direction. Keep the lane paper-only until a full 5-day sample clears
 gates 1–5.
 
+### Later paper samples (2026-11-24 → 2026-11-25, not a pass)
+
+Two further runs were reconstructed from the Telegram exports, not from
+`trades.jsonl` (the ledger lives on the VPS):
+
+| sample | closes | win | median | net SOL | catastrophic |
+| --- | --- | --- | --- | --- | --- |
+| 11-24 07:42–17:20, guard 0.90 | 68 | 77.9 % | +23.2 % | +0.135 | 20.6 % |
+| 11-24 19:33–11-25 08:43 | 112 | 78.6 % | +18.9 % | −0.356 | 21.4 % |
+
+Both fail the 16 % tail gate and the coverage gate. They must not be pooled with
+the 2026-11-22 snapshot or with each other. Full breakdown, including the
+break-even-win-rate arithmetic, is in
+[`STRATEGY_REPORT.md`](STRATEGY_REPORT.md).
+
 ## Known limitations
 
 - Four replay days is a small sample and they are consecutive-ish; the day
@@ -351,7 +369,10 @@ gates 1–5.
   the backtest assumes. Those counters are cumulative for the run, not for the
   current process: they are persisted in the recovery store so a restart does
   not reset the participation picture.
-- Replay archives stop at 2026-11-20, so there is no forward out-of-sample
-  day in the archive. The forward paper run is the only OOS test.
+- The headline table covers 2026-11-08 and 18–20. Days 2026-11-21 and
+  2026-11-22 were priced later (2026-11-25) with the same convention and
+  reproduce the pattern (96.5 % / +23.9 % and 97.8 % / +22.5 %), but they are
+  reported separately in `STRATEGY_REPORT.md` so the frozen 1,818-trade
+  headline is not silently restated.
 - Live mode has not been exercised against a funded wallet; the Jupiter
   read-only quote path has been smoke-tested only.
