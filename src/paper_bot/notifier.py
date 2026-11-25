@@ -34,7 +34,7 @@ from .signals import (
     SCANNER_ALLOWED_DEX,
     SCANNER_MAX_LIQUIDITY_USD,
     SCANNER_MIN_LIQUIDITY_USD,
-    SCANNER_RULE,
+    is_scanner_rule,
     normalize_dex,
 )
 
@@ -267,13 +267,13 @@ def _signal_evidence(features: dict[str, Any]) -> list[str]:
     vol_30m = _feature(features, "hist_pre_vol_30m_sol")
     rule = str(features.get("rule") or "")
     lines: list[str] = []
-    if rule == SCANNER_RULE:
+    if is_scanner_rule(rule):
         # The scanner lane's gate is DEX + launch-liquidity band. Flow and
         # pre-signal history are displayed as context only: they must not be
         # labelled as gates the scanner rule does not evaluate.
         dex = features.get("dex")
         dex_ok = normalize_dex(dex) == normalize_dex(SCANNER_ALLOWED_DEX)
-        lines.append(f"• Rule: `{SCANNER_RULE}`")
+        lines.append(f"• Rule: `{rule}`")
         lines.append(
             f"• DEX: `{dex or '—'}` — gate `{SCANNER_ALLOWED_DEX}` · "
             f"{_gate_status(dex_ok)}"

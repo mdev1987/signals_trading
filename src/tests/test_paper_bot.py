@@ -74,8 +74,10 @@ from paper_bot.signal_parser import (  # noqa: E402
 from paper_bot.store import PaperStore  # noqa: E402
 from paper_bot.signals import (  # noqa: E402
     SCANNER_RULE,
+    SCANNER_TP50_RULE,
     GateConfig,
     evaluate_gate,
+    is_scanner_rule,
     parse_signal_text,
 )
 
@@ -184,6 +186,30 @@ class ScannerCardTests(unittest.TestCase):
         self.assertFalse(allowed(dex="Pumpfunamm", liquidity_usd=100_000.0))
         self.assertFalse(allowed(dex="Raydiumclmm", liquidity_usd=50_000.0))
         self.assertFalse(allowed(dex="Pumpfunamm", liquidity_usd=None))
+
+    def test_tp50_variant_uses_the_identical_scanner_entry(self) -> None:
+        def allowed(rule: str, **features: object) -> bool:
+            candidate = signal(features)
+            candidate.message_type = "scanner_pool_launch"
+            return evaluate_gate(candidate, GateConfig(rule=rule)).allowed
+
+        for features in (
+            {"dex": "Pumpfunamm", "liquidity_usd": 20_000.0},
+            {"dex": "Pumpfunamm", "liquidity_usd": 99_999.0},
+            {"dex": "Pumpfunamm", "liquidity_usd": 19_999.0},
+            {"dex": "Pumpfunamm", "liquidity_usd": 100_000.0},
+            {"dex": "Raydiumclmm", "liquidity_usd": 50_000.0},
+            {"dex": "Pumpfunamm", "liquidity_usd": None},
+        ):
+            self.assertEqual(
+                allowed(SCANNER_RULE, **features),
+                allowed(SCANNER_TP50_RULE, **features),
+            )
+
+    def test_both_scanner_lanes_share_first_card_only_handling(self) -> None:
+        self.assertTrue(is_scanner_rule(SCANNER_RULE))
+        self.assertTrue(is_scanner_rule(SCANNER_TP50_RULE))
+        self.assertFalse(is_scanner_rule("baseline"))
 
     def test_dex_match_ignores_case_and_padding_in_both_paths(self) -> None:
         # The live card and the replay CSV go through the same normalizer, so
@@ -1304,6 +1330,108 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
         async with lock:
             await engine.tick()
         self.assertIn("dormant-mint", engine._locks)
+
+
+class TakeProfitExitTests(unittest.IsolatedAsyncioTestCase):
+    """The TP50 variant must sell at the target, not wait for the horizon."""
+
+    NOW_MS = 1_800_000_000_000
+
+    class FakeQuotes:
+        def __init__(self, exit_price: float) -> None:
+            self.exit_price = exit_price
+            self.exit_calls = 0
+
+        async def exit_quote(
+            self,
+            mint: str,
+            size_tokens: float,
+            reference_price_sol: float | None,
+            *,
+            decimals: int | None = None,
+            action: str = "exit",
+        ) -> FillQuote:
+            self.exit_calls += 1
+            return FillQuote(price_sol=self.exit_price, source="test")
+
+    def engine(self, quotes: "TakeProfitExitTests.FakeQuotes") -> PaperEngine:
+        wallet = PaperWallet(WalletConfig(starting_sol=10.0))
+        broker = PaperBroker(BrokerConfig(notional_sol=0.1), wallet=wallet)
+        return PaperEngine(
+            config=EngineConfig(
+                entry_delay_ms=5_000,
+                max_entry_delay_ms=60_000,
+                live=True,
+                horizon_ms=300_000,
+                tp_pct=0.50,
+            ),
+            broker=broker,
+            quotes=quotes,
+            history=MarketHistory(),
+            gate=GateConfig(rule=SCANNER_TP50_RULE),
+            store=None,
+            clock=lambda: self.NOW_MS,
+        )
+
+    def position(self) -> Position:
+        return Position(
+            signal=Signal(
+                token_address=MINT,
+                signal_ts_ms=self.NOW_MS - 130_000,
+                received_ts_ms=self.NOW_MS - 128_000,
+                channel="@test",
+                message_id=1,
+                network="solana",
+                address_status="confirmed",
+                address_type="mint",
+                message_type="scanner_pool_launch",
+                is_buy_signal=True,
+                is_confirmed_buy_signal=True,
+                features={},
+            ),
+            mint=MINT,
+            entry_ts_ms=self.NOW_MS - 120_000,
+            entry_price_sol=1.0,
+            size=100.0,
+            entry_value_sol=0.1,
+            entry_fee_sol=0.00125,
+            entry_impact=0.0,
+            horizon_ts_ms=self.NOW_MS + 180_000,
+            tp_level=1.5,
+            last_price_sol=1.0,
+            decimals=6,
+        )
+
+    async def test_mark_at_the_target_sells_the_whole_position(self) -> None:
+        quotes = self.FakeQuotes(1.5)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+        engine.broker.wallet.token_balances[MINT] = position.size
+
+        await engine._on_position_price(
+            position, self.NOW_MS - 60_000, 1.55, await_actions=True
+        )
+
+        self.assertEqual(position.exit_reason, "take_profit")
+        self.assertEqual(position.size, 0.0)
+        self.assertEqual(quotes.exit_calls, 1)
+        self.assertEqual(engine.closed[-1].exit_status, "tp_hit")
+
+    async def test_mark_below_the_target_keeps_the_position(self) -> None:
+        quotes = self.FakeQuotes(1.2)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+        engine.broker.wallet.token_balances[MINT] = position.size
+
+        await engine._on_position_price(
+            position, self.NOW_MS - 60_000, 1.49, await_actions=True
+        )
+
+        self.assertFalse(position.exit_requested)
+        self.assertEqual(quotes.exit_calls, 0)
+        self.assertEqual(len(engine.closed), 0)
 
 
 class LiveGuardTests(unittest.TestCase):
@@ -2442,6 +2570,21 @@ class ReportTests(unittest.TestCase):
         )
         self.assertIn("Launch liquidity", text)
         self.assertIn("· fail", text)
+
+    def test_tp50_variant_keeps_the_scanner_gate_labels(self) -> None:
+        text = "\n".join(
+            _signal_evidence(
+                {
+                    "rule": SCANNER_TP50_RULE,
+                    "dex": "Pumpfunamm",
+                    "liquidity_usd": 45_000.0,
+                }
+            )
+        )
+        self.assertIn(f"• Rule: `{SCANNER_TP50_RULE}`", text)
+        self.assertIn("Launch liquidity", text)
+        self.assertIn("· pass", text)
+        self.assertNotIn("gate `> 9.46`", text)
 
     def test_flow_gate_label_only_for_hot_money_rule(self) -> None:
         features = {"hist_flow_1m_sol": 1.2, "total_buy_sol": 1.0}

@@ -129,7 +129,7 @@ failing at 17.6–21.4 % against a 16 % bound.
 
 No sample clears the set. The one gate that fails everywhere is the tail.
 
-## 7. Variants: tested and rejected
+## 7. Variants: tested, and one now deployed as an experiment
 
 All three were specified before the test and run on 2026-11-21/22 (982 trades,
 entries unchanged) in [`EXIT_POLICY_STUDY.md`](EXIT_POLICY_STUDY.md):
@@ -146,9 +146,13 @@ entries unchanged) in [`EXIT_POLICY_STUDY.md`](EXIT_POLICY_STUDY.md):
   entry filter, so it needs its own lane and its own pre-registered run.
 
 The only positive policy in the study was selling everything at +50 %
-(+1.76 SOL), and it is three trades: the best 1 % of trades supply 144 % of its
+(+1.76 SOL). It is three trades: the best 1 % of trades supply 144 % of its
 PnL, removing the best three leaves −0.35 SOL, and it turns negative under a
-stricter fill assumption. Not adoptable.
+stricter fill assumption. It is **not** an established edge, but at the
+operator's request it is now wired as a separate pre-registered lane,
+`scanner_pumpfun_amm_tp50`, with its own recovery snapshot and its own
+acceptance gate ([`TP50_VARIANT.md`](TP50_VARIANT.md)). Its results must not be
+pooled with the frozen sample.
 
 A variant earns a paper run only if it is declared with its threshold and its
 acceptance gate before data collection. No variant should be judged on the
@@ -156,11 +160,12 @@ samples in section 4.
 
 ## 8. Recommendation
 
-Keep the lane paper-only. Do not tune the frozen parameters on B/A/E — at 68–335
-trades, all three samples are inside the noise band of a break-even process
-(B's bootstrap P(>0) = 0.49). Trailing stops, absolute stops, partial
+Keep both lanes paper-only. Do not tune the frozen parameters on B/A/E — at
+68–335 trades, all three samples are inside the noise band of a break-even
+process (B's bootstrap P(>0) = 0.49). Trailing stops, absolute stops, partial
 take-profits and dynamic holds were all tested and lost money (section 7), so
-there is no exit variant to adopt.
+the only exit variant running is the +50 % take-profit, and only as a declared
+experiment with a fixed acceptance gate.
 
 Two levers remain, in order of expected value:
 
@@ -169,9 +174,10 @@ Two levers remain, in order of expected value:
    (priority fee, ATA rent, route fee, slippage) of the VPS paper fills before
    changing any rule, and do not lower the 1.25 %/side assumption to flatter a
    result.
-2. **More days of the frozen rule.** The lane is at break-even with a ~20 %
-   tail; only a longer forward sample can tell whether the tape edge survives,
-   and the gates already encode what "survives" means.
+2. **More days on a fixed lane.** The frozen lane is at break-even with a ~20 %
+   tail; the tp50 lane is a fragile positive in the study. Only a longer forward
+   sample can tell whether either survives, and the gates already encode what
+   "survives" means.
 
 ## Reproduction
 

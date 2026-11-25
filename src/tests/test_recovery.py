@@ -276,6 +276,14 @@ class RecoveryStoreTests(unittest.TestCase):
         self.assertEqual(first.parent, Path("output/recovery"))
         self.assertEqual(first.name, "scanner_pumpfun_amm_trade.sqlite3")
 
+    def test_tp50_variant_gets_its_own_recovery_lane(self) -> None:
+        frozen = default_state_db("scanner_pumpfun_amm", "trade")
+        variant = default_state_db("scanner_pumpfun_amm_tp50", "trade")
+        self.assertNotEqual(frozen, variant)
+        self.assertEqual(
+            variant.name, "scanner_pumpfun_amm_tp50_trade.sqlite3"
+        )
+
     def test_aux_counters_survive_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "lane.sqlite3"

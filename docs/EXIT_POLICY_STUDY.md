@@ -129,10 +129,14 @@ reported.
 - Partial take-profit: **rejected** (negative, or positive only via 3 trades;
   can also game the catastrophic gate).
 - Dynamic hold / extend while pumping: **rejected** (−37 SOL; the pools die).
-- Keep the deployed 5-minute full exit.
-- No engine change, no new lane, nothing to pre-register from this study. The
-  next useful experiments are execution-cost measurement and more days of the
-  frozen rule, not a new exit rule.
+- Keep the deployed 5-minute full exit for the frozen lane.
+- The +50 % policy is the only positive one, so it is available as the separate
+  pre-registered lane `scanner_pumpfun_amm_tp50`
+  ([`TP50_VARIANT.md`](TP50_VARIANT.md)). It is an experiment: its PnL is
+  concentrated in three trades and its sign flips under a stricter fill
+  assumption. No engine change was made for it; the engine already supported
+  `--tp-pct`. The next useful experiments are execution-cost measurement and
+  more days on a fixed lane, not another exit rule.
 
 ## Reproduction
 

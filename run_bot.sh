@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 # Start the live/paper bot for 24/7 operation.
 #
-# One channel, one strategy (2026-11-22):
-#   @AveSolanaTokenScanner -> scanner_pumpfun_amm
+# One channel, one lane (2026-11-25):
+#   @AveSolanaTokenScanner -> scanner_pumpfun_amm_tp50
 #   first card per mint, dex == Pumpfunamm, 20k-100k USD launch liquidity,
-#   entry on the first buy print after the card, hard exit at +5 min.
+#   entry on the first buy print after the card, sell 100 % at +50 % if that
+#   mark arrives before +5 min, otherwise hard exit at +5 min.
+#
+# `scanner_pumpfun_amm_tp50` is a pre-registered exit variant of the frozen
+# `scanner_pumpfun_amm` lane: identical entry, only the exit differs. It has
+# its own recovery snapshot, so the two samples can never be pooled. The
+# out-of-sample study that selected it (and its fragility) is in
+# docs/TP50_VARIANT.md and docs/EXIT_POLICY_STUDY.md.
+#
+# To run the frozen lane instead (no take-profit):
+#   RULE=scanner_pumpfun_amm ./run_bot.sh paper
 #
 # The AVE, DRBT and SOLTRENDING lanes are research-only and are NOT started by
 # this script. See docs/SCANNER_EVIDENCE.md.
@@ -21,6 +31,8 @@
 #   LIVE_TRADING_ENABLED=1 — required only for live mode (fails closed otherwise)
 #   LIVE_MAX_SLIPPAGE_BPS  — optional ceiling for the quote widening ladder (default 1000)
 #   DAILY_LOSS_SOL         — live-mode daily realized-loss cap in SOL (default 1.0; 0 disables)
+#   RULE                   — scanner_pumpfun_amm_tp50 (default) or scanner_pumpfun_amm
+#   TP_PCT                 — take-profit fraction; 0.50 for the tp50 lane, empty for frozen
 #   RESUME=1               — paper only: continue the saved wallet, open positions and
 #                            original run directory after a restart (fail-closed if the
 #                            saved state is missing or from another configuration)
@@ -49,6 +61,24 @@ if [[ "$MODE" != "paper" && "$MODE" != "live" ]]; then
   echo "Usage: $0 [paper|live]"
   exit 1
 fi
+
+# Deployed lane: the pre-registered tp50 exit variant. Set RULE to the frozen
+# lane to run without the take-profit. TP_PCT defaults to 0.50 only for the
+# variant; a stray TP_PCT must never silently retune the frozen lane.
+RULE="${RULE:-scanner_pumpfun_amm_tp50}"
+case "$RULE" in
+  scanner_pumpfun_amm_tp50) TP_PCT="${TP_PCT:-0.50}" ;;
+  scanner_pumpfun_amm) TP_PCT="${TP_PCT:-}" ;;
+  *)
+    echo "ERROR: RULE must be scanner_pumpfun_amm_tp50 or scanner_pumpfun_amm."
+    exit 1
+    ;;
+esac
+TP_ARGS=()
+if [[ -n "$TP_PCT" ]]; then
+  TP_ARGS=(--tp-pct "$TP_PCT")
+fi
+STATE_DB="output/recovery/${RULE}_trade.sqlite3"
 
 # Paper stays uncensored so the forward sample measures the raw strategy.
 # Live uses the documented 1 SOL daily realized-loss cap unless overridden.
@@ -82,9 +112,14 @@ fi
 
 echo ">>> Starting paper_bot in $MODE mode"
 echo ">>> CWD: $SCRIPT_DIR"
-echo ">>> Strategy: scanner_pumpfun_amm on @AveSolanaTokenScanner (5 min hold)"
+echo ">>> Strategy: $RULE on @AveSolanaTokenScanner (5 min hold)"
+if [[ -n "$TP_PCT" ]]; then
+  echo ">>> Take profit: sell 100% at +${TP_PCT} (before the 5 min deadline)"
+else
+  echo ">>> Take profit: none (frozen exit)"
+fi
 echo ">>> Daily loss cap: ${DAILY_LOSS_SOL} SOL (0 disables)"
-echo ">>> Restart recovery: ${RESUME:-0} (paper state: output/recovery/scanner_pumpfun_amm_trade.sqlite3)"
+echo ">>> Restart recovery: ${RESUME:-0} (paper state: $STATE_DB)"
 echo ">>> Logs: output/paper/bot_$(date +%Y%m%d).log  (Ctrl-C to stop; systemd restarts on crash)"
 
 mkdir -p output/paper
@@ -96,7 +131,8 @@ mkdir -p output/paper
 exec "$VENV" -m paper_bot live \
   "${RECOVERY_ARGS[@]+"${RECOVERY_ARGS[@]}"}" \
   --mode "$MODE" \
-  --rule scanner_pumpfun_amm \
+  --rule "$RULE" \
+  "${TP_ARGS[@]+"${TP_ARGS[@]}"}" \
   --channel @AveSolanaTokenScanner \
   --entry-mode trade \
   --entry-delay-ms 5_000 \

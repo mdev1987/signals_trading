@@ -32,6 +32,7 @@ SUPPORTED_RULES = (
     "signers_5m_le_147",
     "smart_wallet_only",
     "scanner_pumpfun_amm",
+    "scanner_pumpfun_amm_tp50",
 )
 
 # Human-readable descriptions used by the startup report and meta.json.
@@ -73,6 +74,11 @@ RULE_DESCRIPTIONS = {
         "new Pumpfun AMM pool with 20k-100k USD launch liquidity; exit after "
         "5 min (scanner feed only)"
     ),
+    "scanner_pumpfun_amm_tp50": (
+        "same scanner entry as scanner_pumpfun_amm, but sell the whole "
+        "position at +50% if that mark arrives before the 5 min deadline; "
+        "otherwise exit at 5 min (pre-registered exit variant)"
+    ),
 }
 
 # Scanner-feed strategy (2026-11-22). On the four replay days with scanner
@@ -87,10 +93,21 @@ RULE_DESCRIPTIONS = {
 # are already over a minute stale, so this ships as a paper lane until it is
 # validated forward. See docs/SCANNER_EVIDENCE.md.
 SCANNER_RULE = "scanner_pumpfun_amm"
+# Pre-registered exit variant: identical scanner entry, but the position is
+# sold as soon as the mark reaches +50 %, with the same 5-minute deadline as
+# the frozen rule. See docs/TP50_VARIANT.md. It is a separate lane (its own
+# recovery snapshot) so its results can never be pooled with the frozen sample.
+SCANNER_TP50_RULE = "scanner_pumpfun_amm_tp50"
+SCANNER_RULES = (SCANNER_RULE, SCANNER_TP50_RULE)
 SCANNER_ALLOWED_DEX = "Pumpfunamm"
 SCANNER_MIN_LIQUIDITY_USD = 20_000.0
 SCANNER_MAX_LIQUIDITY_USD = 100_000.0
 SCANNER_MESSAGE_TYPE = "scanner_pool_launch"
+
+
+def is_scanner_rule(rule: str) -> bool:
+    """True for every lane that uses the scanner card entry gates."""
+    return rule in SCANNER_RULES
 
 
 def normalize_dex(value: object) -> str:
@@ -390,7 +407,7 @@ def _rule_decision(signal: Signal, rule: str) -> tuple[bool, str | None]:
             return False, "rule_trades_5m_gt_611"
         return True, None
 
-    if rule == SCANNER_RULE:
+    if rule in SCANNER_RULES:
         dex = signal.features.get("dex")
         if normalize_dex(dex) != normalize_dex(SCANNER_ALLOWED_DEX):
             return False, f"rule_dex_not_{SCANNER_ALLOWED_DEX.lower()}"

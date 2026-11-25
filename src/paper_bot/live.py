@@ -62,9 +62,9 @@ from .signals import (
     SCANNER_MAX_LIQUIDITY_USD,
     SCANNER_MESSAGE_TYPE,
     SCANNER_MIN_LIQUIDITY_USD,
-    SCANNER_RULE,
     SUPPORTED_RULES,
     GateConfig,
+    is_scanner_rule,
     parse_signal_text,
 )
 from .store import PaperStore
@@ -1387,7 +1387,7 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
     # A/B run with two scanner lanes counts each card once, not once per lane.
     scanner_stats: dict[str, int] = {"cards": 0, "duplicates": 0}
     scanner_lane = next(
-        (lane for lane in lanes if lane.rule == SCANNER_RULE), None
+        (lane for lane in lanes if is_scanner_rule(lane.rule)), None
     )
     scanner_counted: OrderedDict[tuple[str, str], None] = OrderedDict()
 
@@ -1482,7 +1482,7 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                         scanner_counted.popitem(last=False)
                 persist_scanner_stats()
             if (
-                lane.rule == SCANNER_RULE
+                is_scanner_rule(lane.rule)
                 and signal.message_type == SCANNER_MESSAGE_TYPE
             ):
                 scanner_key = (lane.name, signal.token_address)
