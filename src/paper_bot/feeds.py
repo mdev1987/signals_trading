@@ -90,6 +90,15 @@ def parse_pump_event(raw: str | bytes, event_index: int) -> TradeEvent | None:
         decimals=_to_int(data.get("decimals")),
         signature=data.get("signature") or data.get("txSignature"),
         pool_id=data.get("poolId") or data.get("pool_id"),
+        pool=(str(data["pool"]).strip().lower() or None) if data.get("pool") else None,
+        tokens_in_pool=_to_float(data.get("tokensInPool")),
+        quote_in_pool=_to_float(data.get("quoteInPool")),
+        virtual_tokens_in_pool=_to_float(data.get("virtualTokensInPool")),
+        virtual_quote_in_pool=_to_float(data.get("virtualQuoteInPool")),
+        v_tokens_in_bonding_curve=_to_float(data.get("vTokensInBondingCurve")),
+        v_quote_in_bonding_curve=_to_float(data.get("vQuoteInBondingCurve")),
+        pool_fee_rate=_to_float(data.get("poolFeeRate")),
+        sol_route_fee_rate=_to_float(data.get("solRouteFeeRate")),
     )
 
 

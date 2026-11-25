@@ -70,6 +70,19 @@ class TradeEvent:
     decimals: int | None = None
     signature: str | None = None
     pool_id: str | None = None
+    # Post-event pool state, kept so a position snapshot can price its own
+    # exit from reserves between quotes. Parsed cheaply here; the constant
+    # product model lives in ``pool_health``. ``None`` means the feed did not
+    # publish that field, never "zero liquidity".
+    pool: str | None = None
+    tokens_in_pool: float | None = None
+    quote_in_pool: float | None = None
+    virtual_tokens_in_pool: float | None = None
+    virtual_quote_in_pool: float | None = None
+    v_tokens_in_bonding_curve: float | None = None
+    v_quote_in_bonding_curve: float | None = None
+    pool_fee_rate: float | None = None
+    sol_route_fee_rate: float | None = None
 
     @property
     def is_buy(self) -> bool:
