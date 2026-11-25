@@ -103,6 +103,10 @@ class LiveConfig:
     horizon_min: float = 5.0
     tp_pct: float | None = None
     sl_pct: float | None = None
+    # Executable-exit guard for docs/QUOTE_GUARD_VARIANT.md. None disables it
+    # (frozen and tp50 lanes). See EngineConfig.quote_guard_ratio.
+    quote_guard_ratio: float | None = None
+    quote_guard_interval_ms: int = 15_000
     fee: float = 0.0125
     slippage: float = 0.0
     notional_sol: float = 0.1
@@ -294,6 +298,12 @@ class LiveConfig:
             raise ValueError(
                 "min_preflight_exit_value_ratio must be in (0, 1]"
             )
+        if self.quote_guard_ratio is not None and not (
+            0.0 < self.quote_guard_ratio < 1.0
+        ):
+            raise ValueError("quote_guard_ratio must be in (0, 1)")
+        if self.quote_guard_interval_ms <= 0:
+            raise ValueError("quote_guard_interval_ms must be positive")
         if self.shutdown_timeout_ms <= 0:
             raise ValueError("shutdown_timeout_ms must be positive")
         if self.tick_interval_s <= 0 or self.dex_interval_s <= 0:
@@ -551,6 +561,8 @@ def _recovery_fingerprint(
         "horizon_settle_ms": config.horizon_settle_ms,
         "tp_pct": config.tp_pct,
         "sl_pct": config.sl_pct,
+        "quote_guard_ratio": config.quote_guard_ratio,
+        "quote_guard_interval_ms": config.quote_guard_interval_ms,
         "exit_quote_timeout_ms": config.exit_quote_timeout_ms,
         "preflight_exit_route": config.preflight_exit_route,
         "min_preflight_exit_value_ratio": (
@@ -860,6 +872,8 @@ def _lane_meta(
         ),
         "tp_pct": config.tp_pct,
         "sl_pct": config.sl_pct,
+        "quote_guard_ratio": config.quote_guard_ratio,
+        "quote_guard_interval_ms": config.quote_guard_interval_ms,
         "fee": config.fee,
         "slippage": config.slippage,
         "slippage_bps": config.slippage_bps,
@@ -968,6 +982,8 @@ def _create_lane(
             horizon_ms=int(config.horizon_min * 60_000),
             tp_pct=config.tp_pct,
             sl_pct=config.sl_pct,
+            quote_guard_ratio=config.quote_guard_ratio,
+            quote_guard_interval_ms=config.quote_guard_interval_ms,
             live=True,
             exit_quote_timeout_ms=config.exit_quote_timeout_ms,
             slippage_bps=config.slippage_bps,

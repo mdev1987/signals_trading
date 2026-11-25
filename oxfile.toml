@@ -11,6 +11,11 @@ version = 1
 # fragility of that choice are in `docs/TP50_VARIANT.md` and
 # `docs/EXIT_POLICY_STUDY.md`.
 #
+# A third, separate pre-registration exists but is NOT deployed here:
+# `scanner_pumpfun_amm_quote50` (docs/QUOTE_GUARD_VARIANT.md) probes a full-size
+# sell quote and exits below 0.50x entry cost. Its results must not be pooled
+# with either lane above. Run it manually only while observing the experiment.
+#
 #   channel  @AveSolanaTokenScanner   first card per mint (the channel re-posts
 #                                    each pool ~3x; only the first is used)
 #   filter   dex == Pumpfunamm  and  20,000 <= liquidity_usd < 100,000

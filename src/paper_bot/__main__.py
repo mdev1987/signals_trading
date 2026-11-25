@@ -102,6 +102,22 @@ def _add_live(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--horizon-min", type=float, default=5.0)
     parser.add_argument("--tp-pct", type=float, default=None)
     parser.add_argument("--sl-pct", type=float, default=None)
+    parser.add_argument(
+        "--quote-guard-ratio",
+        type=float,
+        default=None,
+        help=(
+            "sell the whole position when a full-size exit quote returns less "
+            "than this share of the entry cost (docs/QUOTE_GUARD_VARIANT.md; "
+            "default off). The 5-minute exit remains the fallback."
+        ),
+    )
+    parser.add_argument(
+        "--quote-guard-interval-ms",
+        type=int,
+        default=15_000,
+        help="gap between executable-exit probes for one position (default 15000)",
+    )
     parser.add_argument("--fee", type=float, default=0.0125)
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--notional-sol", type=float, default=0.1)
@@ -505,6 +521,8 @@ def main() -> int:
             horizon_min=args.horizon_min,
             tp_pct=args.tp_pct,
             sl_pct=args.sl_pct,
+            quote_guard_ratio=args.quote_guard_ratio,
+            quote_guard_interval_ms=args.quote_guard_interval_ms,
             fee=args.fee,
             slippage=args.slippage,
             notional_sol=args.notional_sol,

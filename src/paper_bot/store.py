@@ -299,6 +299,7 @@ class PaperStore:
             "exit_quote_raw",
             "exit_quote_raws",
             "exit_fill_evidence",
+            "quote_guard_evidence",
         ):
             value = payload.get(key)
             if isinstance(value, (dict, list)):

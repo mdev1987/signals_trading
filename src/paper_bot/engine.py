@@ -196,6 +196,14 @@ class EngineConfig:
     horizon_ms: int = 900_000
     tp_pct: float | None = None
     sl_pct: float | None = None
+    # Executable-exit guard (docs/QUOTE_GUARD_VARIANT.md). When set, an open
+    # position asks for a full-size Jupiter sell quote every
+    # ``quote_guard_interval_ms`` and sells immediately if the net executable
+    # value falls below this share of the entry cost. ``None`` disables it, so
+    # the frozen and tp50 lanes are unchanged. The guard measures saleability,
+    # not the last trade print: a pool that stops printing is still probed.
+    quote_guard_ratio: float | None = None
+    quote_guard_interval_ms: int = 15_000
     live: bool = False
     exit_quote_timeout_ms: int = 30_000
     slippage_bps: int = 50
@@ -244,6 +252,12 @@ class EngineConfig:
             raise ValueError(
                 "min_preflight_exit_value_ratio must be in (0, 1]"
             )
+        if self.quote_guard_ratio is not None and not (
+            0.0 < self.quote_guard_ratio < 1.0
+        ):
+            raise ValueError("quote_guard_ratio must be in (0, 1)")
+        if self.quote_guard_interval_ms <= 0:
+            raise ValueError("quote_guard_interval_ms must be positive")
 
 
 def preflight_exit_value_ratio(
@@ -652,6 +666,11 @@ class PaperEngine:
             # A crash cannot leave a quote in flight: reset the guard so the
             # ticker may retry the exit instead of waiting forever.
             position.exit_in_flight = False
+            # The guard threshold is configuration, not position state: an
+            # older snapshot has no field for it, and a resumed guard lane must
+            # not silently continue with the probe disabled.
+            position.quote_guard_ratio = self.config.quote_guard_ratio
+            position.quote_guard_in_flight = False
             if key in closed:
                 LOGGER.warning(
                     "recovery skipped already-closed position %s @ %s",
@@ -1776,6 +1795,7 @@ class PaperEngine:
                         horizon_ts_ms=entry_ts + self.config.horizon_ms,
                         tp_level=tp_level,
                         sl_level=sl_level,
+                        quote_guard_ratio=self.config.quote_guard_ratio,
                         last_price_sol=entry.entry_price_sol,
                         last_ts_ms=entry_ts,
                         decimals=decimals,
@@ -1922,6 +1942,127 @@ class PaperEngine:
         # research backtest uses the last trade at or before the horizon, and
         # several events can share that millisecond. ``tick``/``finalize``
         # close after the timestamp batch has been consumed.
+
+    def _quote_guard_due(self, position: Position, now_ms: int) -> bool:
+        """True when the executable-exit guard should probe this position.
+
+        The guard runs from ``tick`` rather than from a price observation on
+        purpose: the pools that hurt most are the ones that stop printing, and
+        a print-driven check would never fire for them.
+        """
+        if position.quote_guard_ratio is None or position.exit_requested:
+            return False
+        if position.quote_guard_in_flight:
+            return False
+        # The horizon close is already due: a probe cannot change the decision
+        # and would race the sale it is about to price.
+        if now_ms >= position.horizon_ts_ms + self.config.horizon_settle_ms:
+            return False
+        last = position.quote_guard_last_ts_ms or position.entry_ts_ms
+        return now_ms - last >= self.config.quote_guard_interval_ms
+
+    async def _check_quote_guard(
+        self, position: Position, now_ms: int
+    ) -> None:
+        """Ask what a full-size sale would actually return right now.
+
+        This is the pre-registered V1 experiment (docs/QUOTE_GUARD_VARIANT.md):
+        a full-size Jupiter sell quote, priced with the broker's own
+        fee/slippage model, compared with the cash the entry cost. A missing
+        route is evidence, not a successful exit: it is counted separately and
+        the position keeps its five-minute fallback.
+        """
+        if self.positions.get(position.mint) is not position:
+            return
+        position.quote_guard_in_flight = True
+        position.quote_guard_last_ts_ms = now_ms
+        try:
+            try:
+                quote = await self.quotes.exit_quote(
+                    position.mint,
+                    position.size,
+                    position.last_price_sol or position.entry_price_sol,
+                    decimals=position.decimals,
+                )
+            except QuoteError as exc:
+                position.quote_guard_unavailable += 1
+                position.quote_guard_evidence.append(
+                    {
+                        "ts_ms": now_ms,
+                        "status": "unavailable",
+                        "reason": exc.reason,
+                        "ratio": None,
+                    }
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a probe must not wedge
+                LOGGER.exception(
+                    "quote guard failed for %s: %s", position.mint, exc
+                )
+                position.quote_guard_unavailable += 1
+                position.quote_guard_evidence.append(
+                    {
+                        "ts_ms": now_ms,
+                        "status": "unavailable",
+                        "reason": f"guard_error:{type(exc).__name__}",
+                        "ratio": None,
+                    }
+                )
+                return
+
+            entry_cost = position.entry_value_sol + position.entry_fee_sol
+            ratio = preflight_exit_value_ratio(
+                entry_cost_sol=entry_cost,
+                size_tokens=position.size,
+                exit_price_sol=quote.price_sol,
+                fee=self.broker.config.fee,
+                slippage=self.broker.config.slippage,
+            )
+            position.quote_guard_checks += 1
+            if ratio is not None and (
+                position.quote_guard_min_ratio is None
+                or ratio < position.quote_guard_min_ratio
+            ):
+                position.quote_guard_min_ratio = ratio
+            position.quote_guard_evidence.append(
+                {
+                    "ts_ms": now_ms,
+                    "status": "ok" if ratio is not None else "invalid",
+                    "reason": None,
+                    "ratio": ratio,
+                    "price_sol": quote.price_sol,
+                    "out_amount": quote.out_amount,
+                    "price_impact_pct": quote.price_impact_pct,
+                    "slippage_bps": quote.slippage_bps,
+                    "quoted_at_ms": quote.quoted_at_ms,
+                }
+            )
+            if len(position.quote_guard_evidence) > 64:
+                del position.quote_guard_evidence[:-64]
+
+            # Fail closed: an unpriceable quote is not proof the position is
+            # still sellable, but it is also not a fill, so it cannot trigger
+            # the sale. Only a measured low ratio does.
+            if ratio is None or ratio >= position.quote_guard_ratio:
+                return
+            if self.positions.get(position.mint) is not position:
+                return
+            await self._trigger_exit(
+                position,
+                "quote_guard",
+                "quote_guard_exit",
+                quote.price_sol,
+                now_ms,
+                await_actions=True,
+                trigger_source="quote_guard",
+                trigger_price=quote.price_sol,
+                trigger_ts_ms=now_ms,
+                reference_kind="trigger_observation",
+            )
+        finally:
+            position.quote_guard_in_flight = False
 
     async def _trigger_exit(
         self,
@@ -2295,6 +2436,11 @@ class PaperEngine:
             exit_quote_fractions=list(position.exit_quote_fractions),
             exit_fill_evidence=list(position.exit_fill_evidence),
             exit_full_size=exit_full_size,
+            quote_guard_ratio=position.quote_guard_ratio,
+            quote_guard_checks=position.quote_guard_checks,
+            quote_guard_unavailable=position.quote_guard_unavailable,
+            quote_guard_min_ratio=position.quote_guard_min_ratio,
+            quote_guard_evidence=list(position.quote_guard_evidence),
             rule=self.gate.rule,
             features=dict(position.signal.features),
             exit_fill_count=position.exit_fill_count,
@@ -2361,6 +2507,11 @@ class PaperEngine:
                     else:
                         self._spawn(self._attempt_exit(position))
                 continue
+            # Executable-exit probe: spawned, never awaited inline, so a slow
+            # Jupiter response cannot stall the shared ticker for other lanes.
+            if self._quote_guard_due(position, now):
+                position.quote_guard_in_flight = True
+                self._spawn(self._check_quote_guard(position, now))
             if now >= position.horizon_ts_ms + self.config.horizon_settle_ms:
                 reference = position.last_price_sol or position.entry_price_sol
                 exit_ts = (

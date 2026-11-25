@@ -272,6 +272,16 @@ class Position:
     last_quote_error: str | None = None
     entry_quote: FillQuote | None = None
     entry_trigger_ts_ms: int | None = None
+    # Executable-exit guard state. ``quote_guard_ratio`` is the pre-registered
+    # threshold (0.50 for the quote50 lane); the counters and evidence below
+    # describe what was actually observed while the position was open.
+    quote_guard_ratio: float | None = None
+    quote_guard_checks: int = 0
+    quote_guard_unavailable: int = 0
+    quote_guard_min_ratio: float | None = None
+    quote_guard_last_ts_ms: int | None = None
+    quote_guard_in_flight: bool = False
+    quote_guard_evidence: list[dict[str, Any]] = field(default_factory=list)
     # Reference price used for the entry decision (timer mode) and how stale
     # it was; the deviation is the actual fill vs that reference.
     reference_price_sol: float | None = None
@@ -391,6 +401,16 @@ class ClosedTrade:
     exit_quote_fractions: list[float] = field(default_factory=list)
     exit_fill_evidence: list[dict[str, Any]] = field(default_factory=list)
     exit_full_size: bool | None = None
+    # Executable-exit guard evidence (quote50 lane). The guard asks whether the
+    # position can still be sold for a meaningful amount, not whether the last
+    # trade print fell. ``quote_guard_evidence`` keeps one compact row per
+    # check (ratio and route status) so unavailable routes are distinguishable
+    # from quotes that routed but were low.
+    quote_guard_ratio: float | None = None
+    quote_guard_checks: int = 0
+    quote_guard_unavailable: int = 0
+    quote_guard_min_ratio: float | None = None
+    quote_guard_evidence: list[dict[str, Any]] = field(default_factory=list)
     # Liquidity at signal, fill and exit time (USD). ``signal_liquidity_usd``
     # comes from the scanner card; the other two from the latest Dexscreener
     # mark, or ``None`` when no mark arrived before the fill/exit.

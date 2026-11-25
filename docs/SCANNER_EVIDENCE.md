@@ -323,6 +323,11 @@ Do not fund this lane until a forward paper run shows **all** of:
 `src/forward_gates.py` evaluates gates 1–5 with these exact thresholds and
 exits `2` while coverage is short.
 
+Pre-registered variants use the same gate but are scored on their own sample
+and never pooled: `scanner_pumpfun_amm_tp50`
+([`TP50_VARIANT.md`](TP50_VARIANT.md)) and
+`scanner_pumpfun_amm_quote50` ([`QUOTE_GUARD_VARIANT.md`](QUOTE_GUARD_VARIANT.md)).
+
 The execution report also exposes context the frozen thresholds do not grade:
 `scanner_cards` (scanner cards in `signals.jsonl`), `scanner_cards_allowed`
 (those that reached the entry gate), `censor_share` (the fraction never offered

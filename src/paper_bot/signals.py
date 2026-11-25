@@ -33,6 +33,7 @@ SUPPORTED_RULES = (
     "smart_wallet_only",
     "scanner_pumpfun_amm",
     "scanner_pumpfun_amm_tp50",
+    "scanner_pumpfun_amm_quote50",
 )
 
 # Human-readable descriptions used by the startup report and meta.json.
@@ -79,6 +80,12 @@ RULE_DESCRIPTIONS = {
         "position at +50% if that mark arrives before the 5 min deadline; "
         "otherwise exit at 5 min (pre-registered exit variant)"
     ),
+    "scanner_pumpfun_amm_quote50": (
+        "same scanner entry as scanner_pumpfun_amm, but sell the whole "
+        "position if a full-size Jupiter sell quote returns less than 0.50x "
+        "the entry cost; otherwise exit at 5 min (pre-registered exit "
+        "variant)"
+    ),
 }
 
 # Scanner-feed strategy (2026-11-22). On the four replay days with scanner
@@ -98,11 +105,24 @@ SCANNER_RULE = "scanner_pumpfun_amm"
 # the frozen rule. See docs/TP50_VARIANT.md. It is a separate lane (its own
 # recovery snapshot) so its results can never be pooled with the frozen sample.
 SCANNER_TP50_RULE = "scanner_pumpfun_amm_tp50"
-SCANNER_RULES = (SCANNER_RULE, SCANNER_TP50_RULE)
+# Pre-registered executable-exit variant: identical scanner entry, but the
+# position is sold when a full-size Jupiter sell quote (the actual sale the
+# broker would price) recovers less than half of the entry cost, instead of
+# waiting for a low trade print. Same 5-minute fallback. See
+# docs/QUOTE_GUARD_VARIANT.md. Its own recovery snapshot keeps the sample
+# separate from both the frozen lane and tp50.
+SCANNER_QUOTE_GUARD_RULE = "scanner_pumpfun_amm_quote50"
+SCANNER_RULES = (
+    SCANNER_RULE,
+    SCANNER_TP50_RULE,
+    SCANNER_QUOTE_GUARD_RULE,
+)
 # Rules that may only run in paper mode. Live execution is refused for these
 # even when the operator supplies the LIVE_TRADING_ENABLED opt-in, because the
 # variant is still an experiment.
-PAPER_ONLY_RULES = frozenset({SCANNER_TP50_RULE})
+PAPER_ONLY_RULES = frozenset(
+    {SCANNER_TP50_RULE, SCANNER_QUOTE_GUARD_RULE}
+)
 SCANNER_ALLOWED_DEX = "Pumpfunamm"
 SCANNER_MIN_LIQUIDITY_USD = 20_000.0
 SCANNER_MAX_LIQUIDITY_USD = 100_000.0

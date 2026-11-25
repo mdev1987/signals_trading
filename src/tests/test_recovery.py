@@ -357,6 +357,33 @@ class EngineStateTests(unittest.TestCase):
         second.restore_state(payload)
         self.assertFalse(second.positions[MINT].exit_in_flight)
 
+    def test_restore_keeps_the_executable_exit_guard_active(self) -> None:
+        # The threshold is configuration, not saved position state. A resumed
+        # quote50 lane must keep probing; silently dropping the guard would
+        # change the experiment mid-run.
+        first = make_engine(quote_guard_ratio=0.50)
+        first.positions[MINT] = make_position()
+        payload = first.export_state()
+        # Simulate a snapshot written before the guard field existed.
+        payload["positions"][0].pop("quote_guard_ratio", None)
+        payload["positions"][0]["quote_guard_in_flight"] = True
+
+        second = make_engine(quote_guard_ratio=0.50)
+        second.restore_state(payload)
+
+        restored = second.positions[MINT]
+        self.assertEqual(restored.quote_guard_ratio, 0.50)
+        self.assertFalse(restored.quote_guard_in_flight)
+
+    def test_restore_does_not_add_a_guard_to_a_rule_without_one(self) -> None:
+        first = make_engine()
+        first.positions[MINT] = make_position()
+        payload = first.export_state()
+
+        second = make_engine()
+        second.restore_state(payload)
+        self.assertIsNone(second.positions[MINT].quote_guard_ratio)
+
     def test_restore_does_not_reclose_a_position_already_in_trades(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"

@@ -175,8 +175,16 @@ Two levers remain, in order of expected value:
    Measure the real cost (priority fee, ATA rent, route fee, slippage) of the
    VPS paper fills before changing any rule, and do not lower the 1.25 %/side
    assumption to flatter a result. Quotes measure modeled cost, not fees
-   actually paid.
-2. **More days on a fixed lane.** The frozen lane is at break-even with a ~20 %
+   actually paid. `src/execution_cost_report.py` produces the quote-derived
+   report and a PnL grid over cost assumptions
+   ([`EXECUTION_COST.md`](EXECUTION_COST.md)).
+2. **Executable exitability, not more price stops.** The loss tail comes from
+   pools that stop printing while the position is open, which a print-based
+   stop cannot see. The separate `scanner_pumpfun_amm_quote50` lane asks what a
+   full-size sale would return every 15 s and sells below `0.50×` entry cost
+   ([`QUOTE_GUARD_VARIANT.md`](QUOTE_GUARD_VARIANT.md)). It is paper-only and
+   has its own sample; it is **not** the deployed lane.
+3. **More days on a fixed lane.** The frozen lane is at break-even with a ~20 %
    tail; the tp50 lane is a fragile positive in the study. Only a longer forward
    sample can tell whether either survives, and the gates already encode what
    "survives" means.
@@ -197,6 +205,10 @@ env PYTHONPATH=src .venv/bin/python src/alert_outcomes.py \
 # gates on a real run directory
 env PYTHONPATH=src .venv/bin/python src/forward_gates.py \
   --run-dir output/paper/live_YYYYMMDD_HHMMSS --starting-sol 10
+
+# quote-derived execution cost + PnL under cost assumptions
+env PYTHONPATH=src .venv/bin/python src/execution_cost_report.py \
+  --run-dir output/paper/live_YYYYMMDD_HHMMSS
 ```
 
 Paper ledger figures for B and A/E come from the Telegram exports; the

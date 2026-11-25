@@ -10,6 +10,10 @@ asked for the best measured policy to run 24/7, **not** because it is an
 established edge. Its result is fragile and must be read against the gate
 below, never against the frozen lane's numbers.
 
+This lane is unchanged by the separate V1 experiment
+([`QUOTE_GUARD_VARIANT.md`](QUOTE_GUARD_VARIANT.md)). The quote-based exitability
+guard is its own rule, recovery snapshot and sample; it is not added here.
+
 ## Rule
 
 | item | value |

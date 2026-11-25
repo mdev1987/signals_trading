@@ -13,8 +13,17 @@
 # out-of-sample study that selected it (and its fragility) is in
 # docs/TP50_VARIANT.md and docs/EXIT_POLICY_STUDY.md.
 #
+# `scanner_pumpfun_amm_quote50` is the separate V1 experiment: identical entry,
+# but it sells when a full-size Jupiter sell quote returns less than half the
+# entry cost, instead of waiting for a low trade print. It is a different
+# pre-registration (docs/QUOTE_GUARD_VARIANT.md) with its own recovery
+# snapshot; never pool its results with either other lane.
+#
 # To run the frozen lane instead (no take-profit):
 #   RULE=scanner_pumpfun_amm ./run_bot.sh paper
+#
+# To run the executable-exit experiment instead:
+#   RULE=scanner_pumpfun_amm_quote50 ./run_bot.sh paper
 #
 # The AVE, DRBT and SOLTRENDING lanes are research-only and are NOT started by
 # this script. See docs/SCANNER_EVIDENCE.md.
@@ -31,8 +40,11 @@
 #   LIVE_TRADING_ENABLED=1 — required only for live mode (fails closed otherwise)
 #   LIVE_MAX_SLIPPAGE_BPS  — optional ceiling for the quote widening ladder (default 1000)
 #   DAILY_LOSS_SOL         — live-mode daily realized-loss cap in SOL (default 1.0; 0 disables)
-#   RULE                   — scanner_pumpfun_amm_tp50 (default) or scanner_pumpfun_amm
+#   RULE                   — scanner_pumpfun_amm_tp50 (default),
+#                            scanner_pumpfun_amm, or scanner_pumpfun_amm_quote50
 #   TP_PCT                 — take-profit fraction; 0.50 for the tp50 lane, empty for frozen
+#   QUOTE_GUARD_RATIO      — quote50 only: exit below this exit-value ratio (default 0.50)
+#   QUOTE_GUARD_INTERVAL_MS— quote50 only: gap between probes (default 15000)
 #   RESUME=1               — paper only: continue the saved wallet, open positions and
 #                            original run directory after a restart (fail-closed if the
 #                            saved state is missing or from another configuration)
@@ -66,11 +78,21 @@ fi
 # lane to run without the take-profit. TP_PCT defaults to 0.50 only for the
 # variant; a stray TP_PCT must never silently retune the frozen lane.
 RULE="${RULE:-scanner_pumpfun_amm_tp50}"
+GUARD_ARGS=()
 case "$RULE" in
   scanner_pumpfun_amm_tp50) TP_PCT="${TP_PCT:-0.50}" ;;
   scanner_pumpfun_amm) TP_PCT="${TP_PCT:-}" ;;
+  scanner_pumpfun_amm_quote50)
+    TP_PCT=""
+    # Pre-registered V1 executable-exit guard (docs/QUOTE_GUARD_VARIANT.md).
+    # A full-size sell quote returning less than 0.50x the entry cost closes
+    # the position; the 5-minute sell remains the fallback.
+    GUARD_ARGS=(--quote-guard-ratio "${QUOTE_GUARD_RATIO:-0.50}"
+                --quote-guard-interval-ms "${QUOTE_GUARD_INTERVAL_MS:-15000}")
+    ;;
   *)
-    echo "ERROR: RULE must be scanner_pumpfun_amm_tp50 or scanner_pumpfun_amm."
+    echo "ERROR: RULE must be scanner_pumpfun_amm_tp50, scanner_pumpfun_amm"
+    echo "       or scanner_pumpfun_amm_quote50."
     exit 1
     ;;
 esac
@@ -79,10 +101,10 @@ if [[ -n "$TP_PCT" ]]; then
   TP_ARGS=(--tp-pct "$TP_PCT")
 fi
 
-# The tp50 exit variant is paper-only (docs/TP50_VARIANT.md). The
-# LIVE_TRADING_ENABLED opt-in protects the wallet, not the experiment, so live
-# mode is refused explicitly rather than inherited from the default rule.
-if [[ "$MODE" == "live" && "$RULE" == "scanner_pumpfun_amm_tp50" ]]; then
+# The pre-registered exit variants are paper-only. The LIVE_TRADING_ENABLED
+# opt-in protects the wallet, not the experiment, so live mode is refused
+# explicitly rather than inherited from the default rule.
+if [[ "$MODE" == "live" && ("$RULE" == "scanner_pumpfun_amm_tp50" || "$RULE" == "scanner_pumpfun_amm_quote50") ]]; then
   echo "ERROR: $RULE is a paper-only pre-registered variant; live mode is refused."
   echo "       Run the frozen lane (RULE=scanner_pumpfun_amm) if live is intended."
   exit 1
@@ -127,6 +149,9 @@ if [[ -n "$TP_PCT" ]]; then
 else
   echo ">>> Take profit: none (frozen exit)"
 fi
+if [[ ${#GUARD_ARGS[@]} -gt 0 ]]; then
+  echo ">>> Quote guard: sell 100% if a full-size quote returns <${QUOTE_GUARD_RATIO:-0.50}x entry cost, probed every ${QUOTE_GUARD_INTERVAL_MS:-15000} ms"
+fi
 echo ">>> Daily loss cap: ${DAILY_LOSS_SOL} SOL (0 disables)"
 echo ">>> Restart recovery: ${RESUME:-0} (paper state: $STATE_DB)"
 echo ">>> Logs: output/paper/bot_$(date +%Y%m%d).log  (Ctrl-C to stop; systemd restarts on crash)"
@@ -142,6 +167,7 @@ exec "$VENV" -m paper_bot live \
   --mode "$MODE" \
   --rule "$RULE" \
   "${TP_ARGS[@]+"${TP_ARGS[@]}"}" \
+  "${GUARD_ARGS[@]+"${GUARD_ARGS[@]}"}" \
   --channel @AveSolanaTokenScanner \
   --entry-mode trade \
   --entry-delay-ms 5_000 \
