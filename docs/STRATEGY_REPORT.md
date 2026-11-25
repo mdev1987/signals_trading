@@ -129,24 +129,26 @@ failing at 17.6–21.4 % against a 16 % bound.
 
 No sample clears the set. The one gate that fails everywhere is the tail.
 
-## 7. Pre-registered variants (not applied)
+## 7. Variants: tested and rejected
 
-These are hypotheses for separate paper lanes with their own rule name and run
-directory. They must not be evaluated on, or pooled with, the frozen sample, and
-the thresholds below must be fixed before the first run.
+All three were specified before the test and run on 2026-11-21/22 (982 trades,
+entries unchanged) in [`EXIT_POLICY_STUDY.md`](EXIT_POLICY_STUDY.md):
 
-- **V1 — pre-horizon liquidity exit (`scanner_pumpfun_amm_tailguard`).** During
-  the hold, if the executable exit quote falls below 0.5× entry value, sell
-  immediately instead of waiting for +5 min. Mechanism: converts part of the
-  20 % −100 % tail into a smaller loss. Risk: it is a stop, and the frozen rule
-  deliberately has none; it must be tested on new days, not on B/A/E.
-- **V2 — quote-gated winner extension.** Sell half at +5 min and trail the
-  remainder only while the exit quote is still executable (no print → exit at
-  the first gap). The naive 15-minute extension is already refuted (−71 SOL
-  written off); this variant only exists to test the conditional form.
-- **V3 — stricter entry-side exit depth.** The preflight already quotes the
-  exit at entry and requires 0.90×; test 0.95× and 0.98× as a separate lane.
-  Tuning 0.90 inside the frozen lane is not allowed.
+- **V1 — pre-horizon liquidity exit: rejected.** A trailing stop is negative with
+  the deployed 5-minute deadline (−3.7 to −4.0 SOL vs −5.1 baseline) and
+  catastrophic with a 15-minute cap (−31 SOL). An absolute −50 % stop never
+  fires usefully (−5.16 SOL, same as baseline): the pools that die stop
+  printing before their collapse is observable.
+- **V2 — winner extension / dynamic hold: rejected.** Holding to 15 minutes
+  costs −37 SOL; extending in 30 s steps while price stays above entry costs
+  −36 to −37 SOL. 60.7 % of pools have no print at 15 minutes.
+- **V3 — stricter entry-side exit depth (0.95×/0.98×): untested.** It is an
+  entry filter, so it needs its own lane and its own pre-registered run.
+
+The only positive policy in the study was selling everything at +50 %
+(+1.76 SOL), and it is three trades: the best 1 % of trades supply 144 % of its
+PnL, removing the best three leaves −0.35 SOL, and it turns negative under a
+stricter fill assumption. Not adoptable.
 
 A variant earns a paper run only if it is declared with its threshold and its
 acceptance gate before data collection. No variant should be judged on the
@@ -156,9 +158,20 @@ samples in section 4.
 
 Keep the lane paper-only. Do not tune the frozen parameters on B/A/E — at 68–335
 trades, all three samples are inside the noise band of a break-even process
-(B's bootstrap P(>0) = 0.49). The only change with a plausible mechanism is
-cutting the catastrophic tail (V1), and it needs its own pre-registered paper
-run before it can be compared with anything here.
+(B's bootstrap P(>0) = 0.49). Trailing stops, absolute stops, partial
+take-profits and dynamic holds were all tested and lost money (section 7), so
+there is no exit variant to adopt.
+
+Two levers remain, in order of expected value:
+
+1. **Execution cost.** At 982 trades, one percentage point of round-trip cost is
+   1.96 SOL — more than every exit policy tested. Measure the real cost
+   (priority fee, ATA rent, route fee, slippage) of the VPS paper fills before
+   changing any rule, and do not lower the 1.25 %/side assumption to flatter a
+   result.
+2. **More days of the frozen rule.** The lane is at break-even with a ~20 %
+   tail; only a longer forward sample can tell whether the tape edge survives,
+   and the gates already encode what "survives" means.
 
 ## Reproduction
 
