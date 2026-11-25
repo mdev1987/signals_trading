@@ -290,7 +290,15 @@ class ForwardGateTests(unittest.TestCase):
         self.assertEqual(first, second)
 
     def _write_run(
-        self, root: Path, *, trades: int, days: int, pnl: float
+        self,
+        root: Path,
+        *,
+        trades: int,
+        days: int,
+        pnl: float,
+        summary_integrity: str | None = "VALID",
+        persistence_degraded: bool | None = False,
+        meta_integrity: str | None = "VALID",
     ) -> None:
         start = datetime(2026, 11, 18, 12, tzinfo=UTC)
         with (root / "trades.jsonl").open("w", encoding="utf-8") as handle:
@@ -317,6 +325,23 @@ class ForwardGateTests(unittest.TestCase):
         with (root / "entries.jsonl").open("w", encoding="utf-8") as handle:
             for _ in range(trades):
                 handle.write("{}\n")
+        # A clean run records its persistence verdict in both files. Tests
+        # that exercise the integrity gate pass ``None`` or a non-VALID value.
+        if summary_integrity is not None or persistence_degraded is not None:
+            (root / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "integrity": summary_integrity,
+                        "persistence_degraded": persistence_degraded,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        if meta_integrity is not None:
+            (root / "meta.json").write_text(
+                json.dumps({"integrity_at_start": meta_integrity}),
+                encoding="utf-8",
+            )
 
     def test_coverage_failure_returns_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -338,6 +363,191 @@ class ForwardGateTests(unittest.TestCase):
         # Report-only: the payoff block is present and agrees with the ledger.
         self.assertAlmostEqual(result["payoff"]["win_rate"], 1.0)
         self.assertAlmostEqual(result["payoff"]["pnl_sol"], 3.0)
+
+    def test_non_valid_integrity_fails_the_run(self) -> None:
+        cases = {
+            "summary INVALID": {"summary_integrity": "INVALID"},
+            "summary DEGRADED": {"summary_integrity": "DEGRADED"},
+            "persistence degraded": {"persistence_degraded": True},
+            "meta INVALID": {"meta_integrity": "INVALID"},
+            "meta DEGRADED": {"meta_integrity": "DEGRADED"},
+            "meta missing": {"meta_integrity": None},
+            "summary missing": {
+                "summary_integrity": None,
+                "persistence_degraded": None,
+            },
+            "summary null integrity": {
+                "summary_integrity": None,
+                "persistence_degraded": False,
+            },
+        }
+        for label, overrides in cases.items():
+            with self.subTest(label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._write_run(
+                        root, trades=300, days=5, pnl=0.01, **overrides
+                    )
+                    result = evaluate(root)
+                gate = result["gates"]["run_integrity"]
+                self.assertFalse(gate["passed"], gate["detail"])
+                self.assertFalse(result["passed"])
+
+    def test_valid_integrity_is_required_by_the_same_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=300, days=5, pnl=0.01)
+            result = evaluate(root)
+        gate = result["gates"]["run_integrity"]
+        self.assertTrue(gate["passed"], gate["detail"])
+        self.assertEqual(gate["summary_integrity"], "VALID")
+        self.assertEqual(gate["meta_integrity_at_start"], "VALID")
+
+    def test_catastrophic_boundary_is_strictly_below_16_percent(self) -> None:
+        for count, expected in ((47, True), (48, False), (49, False)):
+            with self.subTest(count=count):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._write_run(root, trades=300, days=5, pnl=0.01)
+                    rows = [
+                        json.loads(line)
+                        for line in (root / "trades.jsonl")
+                        .read_text()
+                        .splitlines()
+                    ]
+                    for row in rows[:count]:
+                        row["return_pct"] = -0.95
+                    (root / "trades.jsonl").write_text(
+                        "\n".join(json.dumps(row) for row in rows) + "\n"
+                    )
+                    result = evaluate(root)
+                gate = result["gates"]["catastrophic_exits"]
+                self.assertEqual(gate["passed"], expected, gate["detail"])
+
+    def test_write_off_boundary_is_strictly_below_16_percent(self) -> None:
+        for count, expected in ((47, True), (48, False), (49, False)):
+            with self.subTest(count=count):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._write_run(root, trades=300, days=5, pnl=0.01)
+                    rows = [
+                        json.loads(line)
+                        for line in (root / "trades.jsonl")
+                        .read_text()
+                        .splitlines()
+                    ]
+                    for row in rows[:count]:
+                        row["exit_status"] = "no_route"
+                    (root / "trades.jsonl").write_text(
+                        "\n".join(json.dumps(row) for row in rows) + "\n"
+                    )
+                    result = evaluate(root)
+                execution = result["gates"]["execution"]
+                self.assertEqual(
+                    execution["passed"], expected, execution["detail"]
+                )
+
+    def test_preflight_failures_count_as_entry_failures(self) -> None:
+        # 150 of 1000 allowed signals fail the exit-route preflight and are
+        # skipped. The fill rate stays at 85 % (above 80 %), so only a correct
+        # entry-failure numerator can reject this run.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=300, days=5, pnl=0.01)
+            (root / "signals.jsonl").write_text(
+                "".join(
+                    json.dumps({"decision": {"allowed": True}}) + "\n"
+                    for _ in range(1000)
+                ),
+                encoding="utf-8",
+            )
+            (root / "entries.jsonl").write_text(
+                "{}\n" * 850, encoding="utf-8"
+            )
+            (root / "skips.jsonl").write_text(
+                "".join(
+                    json.dumps({"reason": "entry_no_exit_economics"}) + "\n"
+                    for _ in range(150)
+                ),
+                encoding="utf-8",
+            )
+            result = evaluate(root)
+        execution = result["gates"]["execution"]
+        self.assertAlmostEqual(execution["entry_fill_rate"], 0.85)
+        self.assertAlmostEqual(execution["entry_failure_rate"], 0.15)
+        self.assertEqual(
+            execution["entry_failure_reason_counts"],
+            {"entry_no_exit_economics": 150},
+        )
+        self.assertFalse(execution["passed"])
+        self.assertFalse(result["passed"])
+
+    def test_skip_for_a_rejected_signal_is_not_an_entry_failure(self) -> None:
+        # Intake rejections already leave both fill-rate sides; a skip row that
+        # shares only the reason string with an entry failure must not be
+        # counted for a different, disallowed signal.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=300, days=5, pnl=0.01)
+            signals = []
+            for index in range(1000):
+                signals.append(
+                    json.dumps(
+                        {
+                            "signal": {
+                                "message_id": index,
+                                "channel": "@c",
+                                "token_address": f"mint-{index}",
+                                "signal_ts_ms": 1000 + index,
+                            },
+                            "decision": {"allowed": True},
+                        }
+                    )
+                )
+            for index in range(1000, 1150):
+                signals.append(
+                    json.dumps(
+                        {
+                            "signal": {
+                                "message_id": index,
+                                "channel": "@c",
+                                "token_address": f"mint-{index}",
+                                "signal_ts_ms": 1000 + index,
+                            },
+                            "decision": {
+                                "allowed": False,
+                                "reasons": ["entry_window_passed"],
+                            },
+                        }
+                    )
+                )
+            (root / "signals.jsonl").write_text(
+                "\n".join(signals) + "\n", encoding="utf-8"
+            )
+            (root / "entries.jsonl").write_text(
+                "{}\n" * 1000, encoding="utf-8"
+            )
+            (root / "skips.jsonl").write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "reason": "entry_no_exit_economics",
+                            "message_id": index,
+                            "channel": "@c",
+                            "mint": f"mint-{index}",
+                            "signal_ts_ms": 1000 + index,
+                        }
+                    )
+                    + "\n"
+                    for index in range(1000, 1150)
+                ),
+                encoding="utf-8",
+            )
+            result = evaluate(root)
+        execution = result["gates"]["execution"]
+        self.assertEqual(execution["entry_failures"], 0)
+        self.assertEqual(execution["entry_failure_rate"], 0.0)
+        self.assertTrue(execution["passed"])
 
     def test_catastrophic_tail_fails_even_when_total_is_positive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

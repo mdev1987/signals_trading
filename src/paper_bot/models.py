@@ -252,6 +252,22 @@ class Position:
     exit_reference_price: float | None = None
     exit_ts_ms: int | None = None
     exit_requested_ts_ms: int | None = None
+    # PIT exit-trigger evidence. The engine can fire on a PumpAPI trade or a
+    # Dexscreener mark; recording which stream and observation fired the exit
+    # is what lets a run be compared with the replay's first-print model.
+    exit_trigger_source: str | None = None
+    exit_trigger_ts_ms: int | None = None
+    exit_trigger_price_sol: float | None = None
+    # ``trigger_observation`` (the exit price came from the print/mark that
+    # fired the exit) or ``last_in_horizon`` (the horizon close used the last
+    # in-horizon reference; the replay instead uses the first print at or after
+    # the horizon). Not interchangeable, so it is recorded per trade.
+    exit_reference_kind: str | None = None
+    # Per-fill executable-quote evidence. A single full-size quote is visibly
+    # different from the exit-fraction fallback, and each leg keeps the quote
+    # timestamp, raw output amount and simulated fill.
+    exit_quote_fractions: list[float] = field(default_factory=list)
+    exit_fill_evidence: list[dict[str, Any]] = field(default_factory=list)
     exit_quote_attempts: int = 0
     last_quote_error: str | None = None
     entry_quote: FillQuote | None = None
@@ -361,6 +377,20 @@ class ClosedTrade:
     features: dict[str, Any] = field(default_factory=dict)
     exit_fill_count: int = 1
     unsold_size: float = 0.0
+    # The price the PIT exit decision used, and which stream/observation
+    # triggered it. For a horizon exit this is the last in-horizon observation
+    # used as the quote reference, not the first print after the horizon.
+    exit_reference_price_sol: float | None = None
+    exit_trigger_source: str | None = None
+    exit_trigger_ts_ms: int | None = None
+    exit_trigger_price_sol: float | None = None
+    exit_reference_kind: str | None = None
+    # Fraction of the remaining position requested for each executable quote.
+    # ``[1.0]`` is one full-size quote; more/smaller entries mean the
+    # exit-fraction fallback was needed.
+    exit_quote_fractions: list[float] = field(default_factory=list)
+    exit_fill_evidence: list[dict[str, Any]] = field(default_factory=list)
+    exit_full_size: bool | None = None
     # Liquidity at signal, fill and exit time (USD). ``signal_liquidity_usd``
     # comes from the scanner card; the other two from the latest Dexscreener
     # mark, or ``None`` when no mark arrived before the fill/exit.

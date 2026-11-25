@@ -1367,6 +1367,7 @@ class PaperEngine:
                 event.timestamp_ms,
                 float(event.price_sol),
                 await_actions=await_actions,
+                source="pumpapi_trade",
             )
 
     async def on_mark(
@@ -1396,7 +1397,11 @@ class PaperEngine:
             if liquidity_usd is not None and liquidity_usd > 0:
                 position.last_liquidity_usd = float(liquidity_usd)
             await self._on_position_price(
-                position, ts_ms, price_sol, await_actions=await_actions
+                position,
+                ts_ms,
+                price_sol,
+                await_actions=await_actions,
+                source="dexscreener_mark",
             )
 
     # ------------------------------------------------------------------
@@ -1848,7 +1853,15 @@ class PaperEngine:
         price_sol: float,
         *,
         await_actions: bool,
+        source: str = "unknown",
     ) -> None:
+        """Apply one observation to an open position.
+
+        ``source`` names the stream that delivered the price (``pumpapi_trade``
+        or ``dexscreener_mark``). It is persisted on the trade so a TP/horizon
+        exit can be compared with the replay's first-qualifying-print model
+        instead of assumed to be mark-driven.
+        """
         if position.exit_requested:
             return
 
@@ -1869,6 +1882,11 @@ class PaperEngine:
                 reference,
                 exit_ts,
                 await_actions=await_actions,
+                trigger_source=source,
+                # The observation that woke the post-horizon close, kept apart
+                # from ``reference`` (the last in-horizon price that prices it).
+                trigger_price=price_sol,
+                trigger_ts_ms=ts_ms,
             )
             return
 
@@ -1883,6 +1901,8 @@ class PaperEngine:
                 position.tp_level,
                 ts_ms,
                 await_actions=await_actions,
+                trigger_source=source,
+                trigger_price=price_sol,
             )
             return
         if position.sl_level is not None and price_sol <= position.sl_level:
@@ -1893,6 +1913,8 @@ class PaperEngine:
                 position.sl_level,
                 ts_ms,
                 await_actions=await_actions,
+                trigger_source=source,
+                trigger_price=price_sol,
             )
             return
 
@@ -1910,6 +1932,10 @@ class PaperEngine:
         exit_ts_ms: int,
         *,
         await_actions: bool,
+        trigger_source: str = "engine",
+        trigger_price: float | None = None,
+        trigger_ts_ms: int | None = None,
+        reference_kind: str | None = None,
     ) -> None:
         if position.exit_requested:
             return
@@ -1920,6 +1946,27 @@ class PaperEngine:
         position.exit_reference_price = reference_price
         position.exit_ts_ms = exit_ts_ms
         position.exit_requested_ts_ms = self._now()
+        # Provenance of the PIT decision: which stream/observation set it off,
+        # the price it actually saw (which can be above the tp_level) and when.
+        # ``exit_ts_ms`` is the reference timestamp, which for a horizon exit is
+        # the last in-horizon observation rather than the print that woke it.
+        position.exit_trigger_source = trigger_source
+        position.exit_trigger_price_sol = (
+            trigger_price if trigger_price is not None else reference_price
+        )
+        position.exit_trigger_ts_ms = (
+            trigger_ts_ms if trigger_ts_ms is not None else exit_ts_ms
+        )
+        if reference_kind is not None:
+            position.exit_reference_kind = reference_kind
+        elif reason == "horizon":
+            # The running engine uses the last in-horizon observation as the
+            # quote reference; the replay uses the first print at/after the
+            # horizon. Keeping the kind on the row stops the two being read as
+            # the same measurement.
+            position.exit_reference_kind = "last_in_horizon"
+        else:
+            position.exit_reference_kind = "trigger_observation"
         if await_actions:
             await self._attempt_exit(position)
         else:
@@ -1977,6 +2024,10 @@ class PaperEngine:
                     self.broker.settle(position, fill)
                     self._apply_partial(position, fill)
                     position.exit_quote_raws.append(dict(quote.raw))
+                    position.exit_quote_fractions.append(fraction)
+                    position.exit_fill_evidence.append(
+                        self._fill_evidence(quote, fill, fraction)
+                    )
                     last_quote = quote
                     if position.size <= DUST_SIZE:
                         self._commit_close(position, quote)
@@ -2023,6 +2074,33 @@ class PaperEngine:
         finally:
             if self.positions.get(position.mint) is position:
                 position.exit_in_flight = False
+
+    def _fill_evidence(
+        self, quote: FillQuote, fill: ExitFill, fraction: float
+    ) -> dict[str, Any]:
+        """One executable-quote leg, in the form a reviewer can check.
+
+        ``fraction < 1`` means the full remaining size did not route and the
+        exit used the fraction ladder. This is execution fallback evidence,
+        not a partial-take-profit strategy: the remainder is still sold.
+        """
+        return {
+            "fraction": fraction,
+            "full_size": fraction >= 1.0,
+            "quote_ts_ms": quote.quoted_at_ms,
+            "in_amount": quote.in_amount,
+            "out_amount": quote.out_amount,
+            "quote_price_sol": quote.price_sol,
+            "quote_source": quote.source,
+            "router": quote.router,
+            "price_impact_pct": quote.price_impact_pct,
+            "slippage_bps": quote.slippage_bps,
+            "size_sold": fill.size_sold,
+            "exit_price_sol": fill.exit_price_sol,
+            "exit_value_sol": fill.exit_value_sol,
+            "pnl_sol": fill.pnl_sol,
+            "fill_ts_ms": self._now(),
+        }
 
     def _apply_partial(self, position: Position, fill: ExitFill) -> None:
         """Accumulate a priced sale into the position's exit totals."""
@@ -2157,6 +2235,14 @@ class PaperEngine:
             else 0.0
         )
         entry_quote = position.entry_quote
+        # A synthetic/forced close has no executable quote at all, so it is
+        # never a "full-size fill" even when it books one leg.
+        exit_full_size = (
+            position.exit_fill_count == 1
+            and bool(position.exit_quote_fractions)
+            and all(f >= 1.0 for f in position.exit_quote_fractions)
+            and quote.source not in {"fallback_feed", "forced", "no_route"}
+        )
         trade = ClosedTrade(
             mint=position.mint,
             channel=position.signal.channel,
@@ -2201,6 +2287,14 @@ class PaperEngine:
             exit_quote_slippage_bps=quote.slippage_bps,
             exit_quote_attempts=position.exit_quote_attempts,
             last_quote_error=position.last_quote_error,
+            exit_reference_price_sol=position.exit_reference_price,
+            exit_trigger_source=position.exit_trigger_source,
+            exit_trigger_ts_ms=position.exit_trigger_ts_ms,
+            exit_trigger_price_sol=position.exit_trigger_price_sol,
+            exit_reference_kind=position.exit_reference_kind,
+            exit_quote_fractions=list(position.exit_quote_fractions),
+            exit_fill_evidence=list(position.exit_fill_evidence),
+            exit_full_size=exit_full_size,
             rule=self.gate.rule,
             features=dict(position.signal.features),
             exit_fill_count=position.exit_fill_count,
@@ -2282,6 +2376,9 @@ class PaperEngine:
                     reference,
                     exit_ts,
                     await_actions=await_actions,
+                    trigger_source="engine_tick",
+                    trigger_price=reference,
+                    trigger_ts_ms=now,
                 )
 
     async def _drain_tasks(self, timeout_ms: int | None) -> None:
@@ -2354,6 +2451,9 @@ class PaperEngine:
                 reference,
                 exit_ts,
                 await_actions=False,
+                trigger_source="engine_shutdown" if force else "engine_finalize",
+                trigger_price=reference,
+                reference_kind="last_in_horizon",
             )
             if force:
                 # Skip the normal quote-timeout grace period on shutdown.

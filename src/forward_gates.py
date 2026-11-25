@@ -42,6 +42,33 @@ BOOTSTRAP_LOWER_QUANTILE = 0.05
 BOOTSTRAP_LOSS_ALLOWANCE = 0.05
 SCANNER_MESSAGE_TYPE = "scanner_pool_launch"
 
+# Reasons recorded when an *allowed* signal fails to become an entry. Every
+# one of these is emitted by ``PaperEngine._skip_pending`` (or by the expiry
+# classifier), so it is an entry-attempt failure, not a gate rejection. Gate
+# rejections (``allowed=false``) never enter this set: they are measured as
+# censoring, not as execution failures. Used only to attribute a skip row that
+# carries no signal identity (legacy/synthetic data); a real row is joined to
+# its ``signals.jsonl`` decision instead.
+ENTRY_FAILURE_REASONS = frozenset(
+    {
+        "entry_delay_exceeded",
+        "entry_quote_failed",
+        "entry_no_exit_route",
+        "entry_no_exit_economics",
+        "entry_insufficient_sol",
+        "persistence_degraded",
+        "entry_timer_late",
+        "entry_no_reference_price",
+        "entry_reference_age_unknown",
+        "entry_unverified_quote_notional",
+        "entry_dust_prints_only",
+        "no_buy_trade_after_signal",
+        "reference_timestamp_in_future",
+        "stale_reference_price",
+        "rule_crowded_post_signal",
+    }
+)
+
 
 def _read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
     """Return ``(rows, unparsable)``.
@@ -70,6 +97,37 @@ def _read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
             else:
                 corrupt += 1
     return rows, corrupt
+
+
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    """Read a single JSON object, or ``None`` when missing/unreadable."""
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _signal_identity(row: dict[str, Any]) -> tuple[str, ...]:
+    """Identity shared by ``signals.jsonl`` and ``skips.jsonl`` rows.
+
+    ``message_id`` is the natural key; when it is absent (older or synthetic
+    rows) fall back to mint + signal timestamp. An empty tuple means the row
+    carries no identity and cannot be joined.
+    """
+    signal = row.get("signal")
+    source = signal if isinstance(signal, dict) else row
+    message_id = source.get("message_id")
+    channel = str(source.get("channel") or "")
+    if message_id is not None:
+        return ("message", channel, str(message_id))
+    mint = str(source.get("token_address") or source.get("mint") or "")
+    signal_ts_ms = source.get("signal_ts_ms")
+    if mint and signal_ts_ms is not None:
+        return ("mint", channel, mint, str(signal_ts_ms))
+    return ()
 
 
 def _day(ts_ms: Any) -> str | None:
@@ -305,6 +363,17 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
     }
     corrupt_total = sum(corrupt_rows.values())
 
+    summary = _read_json_object(run_dir / "summary.json")
+    meta = _read_json_object(run_dir / "meta.json")
+    summary_integrity = summary.get("integrity") if summary else None
+    summary_degraded = summary.get("persistence_degraded") if summary else None
+    meta_integrity = meta.get("integrity_at_start") if meta else None
+    integrity_ok = (
+        summary_integrity == "VALID"
+        and summary_degraded is False
+        and meta_integrity == "VALID"
+    )
+
     pnls: list[float] = []
     returns: list[float] = []
     mints: list[str] = []
@@ -364,6 +433,26 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         ),
     }
 
+    # The run's own persistence/recovery verdict, not just whether the JSONL
+    # parses. A DEGRADED or INVALID process made decisions from state that was
+    # not durable, so its numbers cannot be pooled with a clean sample even if
+    # every arithmetic gate passes. Missing metadata is a failure, never a
+    # silent pass: an old run without a summary cannot prove its integrity.
+    gates["run_integrity"] = {
+        "passed": integrity_ok,
+        "summary_integrity": summary_integrity,
+        "summary_persistence_degraded": summary_degraded,
+        "meta_integrity_at_start": meta_integrity,
+        "summary_present": summary is not None,
+        "meta_present": meta is not None,
+        "detail": (
+            f"summary.integrity={summary_integrity!s}; "
+            f"summary.persistence_degraded={summary_degraded!s}; "
+            f"meta.integrity_at_start={meta_integrity!s}; "
+            "required: VALID / false / VALID"
+        ),
+    }
+
     coverage_ok = len(trades) >= MIN_TRADES and len(days) >= MIN_DAYS
     gates["coverage"] = {
         "passed": coverage_ok,
@@ -403,12 +492,12 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
     gates["catastrophic_exits"] = {
         "passed": (
             catastrophic_rate is not None
-            and catastrophic_rate <= MAX_CATASTROPHIC_RATE
+            and catastrophic_rate < MAX_CATASTROPHIC_RATE
         ),
         "count": catastrophic,
         "rate": catastrophic_rate,
-        "required_max": MAX_CATASTROPHIC_RATE,
-        "detail": f"{catastrophic}/{len(trades)} <= {MAX_CATASTROPHIC_RATE}",
+        "required_below": MAX_CATASTROPHIC_RATE,
+        "detail": f"{catastrophic}/{len(trades)} < {MAX_CATASTROPHIC_RATE}",
     }
 
     payoff = payoff_summary(pnls, returns)
@@ -418,11 +507,41 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
     skip_counts: dict[str, int] = defaultdict(int)
     for row in skips:
         skip_counts[str(row.get("reason") or "unknown")] += 1
-    entry_delay_failures = skip_counts.get("entry_delay_exceeded", 0)
-    quote_failures = skip_counts.get("entry_quote_failed", 0)
-    entry_failure_rate = (
-        (entry_delay_failures + quote_failures) / allowed if allowed else None
-    )
+
+    # Attribute each skip to the signal decision it belongs to. Only skips for
+    # signals that passed the gate are entry failures; intake rejections
+    # (``allowed=false``) are censoring and are already outside ``allowed``.
+    # This replaces the old two-reason numerator, which missed preflight,
+    # persistence, funding and no-print outcomes entirely.
+    allowed_identities = {
+        identity
+        for row in signals
+        if isinstance(row.get("decision"), dict)
+        and row["decision"].get("allowed")
+        and (identity := _signal_identity(row))
+    }
+    entry_failure_counts: dict[str, int] = defaultdict(int)
+    entry_failures = 0
+    unattributed_skips = 0
+    for row in skips:
+        reason = str(row.get("reason") or "unknown")
+        identity = _signal_identity(row)
+        if identity:
+            if identity not in allowed_identities:
+                continue
+        elif reason not in ENTRY_FAILURE_REASONS:
+            # No identity and not a known entry-attempt outcome: cannot be
+            # attributed safely, so it is not counted as a failure. Real runs
+            # always carry message_id/mint, so this is for legacy data only.
+            continue
+        else:
+            unattributed_skips += 1
+        entry_failure_counts[reason] += 1
+        entry_failures += 1
+
+    entry_delay_failures = entry_failure_counts.get("entry_delay_exceeded", 0)
+    quote_failures = entry_failure_counts.get("entry_quote_failed", 0)
+    entry_failure_rate = entry_failures / allowed if allowed else None
 
     write_off_rate = (write_offs / len(trades)) if trades else None
     entry_ok = fill_rate is not None and fill_rate >= MIN_ENTRY_FILL_RATE
@@ -467,12 +586,13 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
     gates["execution"] = {
         "passed": (
             write_off_rate is not None
-            and write_off_rate <= MAX_WRITE_OFF_RATE
+            and write_off_rate < MAX_WRITE_OFF_RATE
             and entry_ok
             and failure_ok
         ),
         "write_offs": write_offs,
         "write_off_rate": write_off_rate,
+        "required_write_off_below": MAX_WRITE_OFF_RATE,
         "entries": len(entries),
         "signals_allowed": allowed,
         "scanner_cards": scanner_cards,
@@ -483,13 +603,19 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         "required_entry_fill_rate": MIN_ENTRY_FILL_RATE,
         "entry_delay_exceeded": entry_delay_failures,
         "entry_quote_failed": quote_failures,
+        "entry_failures": entry_failures,
+        "entry_failure_reason_counts": dict(
+            sorted(entry_failure_counts.items())
+        ),
+        "unattributed_entry_failures": unattributed_skips,
         "entry_failure_rate": entry_failure_rate,
         "required_entry_failure_below": MAX_ENTRY_FAILURE_RATE,
         "detail": (
-            f"write_offs={write_offs}/{len(trades)}; "
+            f"write_offs={write_offs}/{len(trades)} must be "
+            f"< {MAX_WRITE_OFF_RATE}; "
             f"fill_rate={fill_rate!s}; "
-            f"entry_failures={entry_delay_failures + quote_failures}"
-            f"/{allowed} ({entry_failure_rate!s}) must be "
+            f"entry_failures={entry_failures}/{allowed} "
+            f"({entry_failure_rate!s}) must be "
             f"< {MAX_ENTRY_FAILURE_RATE}; "
             f"traded={allowed_scanner}/{scanner_cards} cards"
         ),

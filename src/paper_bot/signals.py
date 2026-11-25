@@ -99,6 +99,10 @@ SCANNER_RULE = "scanner_pumpfun_amm"
 # recovery snapshot) so its results can never be pooled with the frozen sample.
 SCANNER_TP50_RULE = "scanner_pumpfun_amm_tp50"
 SCANNER_RULES = (SCANNER_RULE, SCANNER_TP50_RULE)
+# Rules that may only run in paper mode. Live execution is refused for these
+# even when the operator supplies the LIVE_TRADING_ENABLED opt-in, because the
+# variant is still an experiment.
+PAPER_ONLY_RULES = frozenset({SCANNER_TP50_RULE})
 SCANNER_ALLOWED_DEX = "Pumpfunamm"
 SCANNER_MIN_LIQUIDITY_USD = 20_000.0
 SCANNER_MAX_LIQUIDITY_USD = 100_000.0

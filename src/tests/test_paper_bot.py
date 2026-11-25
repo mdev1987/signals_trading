@@ -13,7 +13,10 @@ import json
 import sys
 import tempfile
 import unittest
+from collections import OrderedDict
 from pathlib import Path
+
+import polars as pl
 
 SRC_DIR = Path(__file__).resolve().parents[1]
 if str(SRC_DIR) not in sys.path:
@@ -58,6 +61,8 @@ from paper_bot.notifier import (  # noqa: E402
     format_startup,
     format_status,
 )
+from paper_bot.live import _claim_scanner_card  # noqa: E402
+from paper_bot.recovery import RecoveryStore  # noqa: E402
 from paper_bot.quotes import (  # noqa: E402
     QuoteError,
     JupiterQuoteProvider,
@@ -73,6 +78,7 @@ from paper_bot.signal_parser import (  # noqa: E402
 )
 from paper_bot.store import PaperStore  # noqa: E402
 from paper_bot.signals import (  # noqa: E402
+    PAPER_ONLY_RULES,
     SCANNER_RULE,
     SCANNER_TP50_RULE,
     GateConfig,
@@ -1433,8 +1439,265 @@ class TakeProfitExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quotes.exit_calls, 0)
         self.assertEqual(len(engine.closed), 0)
 
+    async def test_trade_trigger_records_its_source_and_quote_leg(self) -> None:
+        quotes = self.FakeQuotes(1.55)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+        engine.broker.wallet.token_balances[MINT] = position.size
+        trigger_ts = self.NOW_MS - 60_000
+
+        await engine.on_trade(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=trigger_ts,
+                event_index=1,
+                action="sell",
+                price_sol=1.55,
+                token_amount=10.0,
+            ),
+            await_actions=True,
+        )
+
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_reason, "take_profit")
+        # The observed print, not the clamped 1.5 target, is the evidence.
+        self.assertEqual(trade.exit_trigger_source, "pumpapi_trade")
+        self.assertEqual(trade.exit_trigger_ts_ms, trigger_ts)
+        self.assertAlmostEqual(trade.exit_trigger_price_sol, 1.55)
+        self.assertEqual(trade.exit_reference_kind, "trigger_observation")
+        self.assertAlmostEqual(trade.exit_reference_price_sol, 1.5)
+        # One full-size quote, and the leg carries the quote timestamp/amounts.
+        self.assertTrue(trade.exit_full_size)
+        self.assertEqual(trade.exit_quote_fractions, [1.0])
+        self.assertEqual(len(trade.exit_fill_evidence), 1)
+        leg = trade.exit_fill_evidence[0]
+        self.assertTrue(leg["full_size"])
+        self.assertEqual(leg["quote_source"], "test")
+        self.assertAlmostEqual(leg["quote_price_sol"], 1.55)
+        self.assertIn("quote_ts_ms", leg)
+        self.assertIn("out_amount", leg)
+
+    async def test_mark_trigger_is_labelled_as_a_dexscreener_mark(self) -> None:
+        quotes = self.FakeQuotes(1.6)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+        engine.broker.wallet.token_balances[MINT] = position.size
+
+        await engine.on_mark(
+            MINT, 1.6, self.NOW_MS - 30_000, await_actions=True
+        )
+
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_trigger_source, "dexscreener_mark")
+        self.assertEqual(trade.exit_trigger_ts_ms, self.NOW_MS - 30_000)
+        self.assertAlmostEqual(trade.exit_trigger_price_sol, 1.6)
+
+    async def test_post_horizon_print_keeps_the_in_horizon_reference(self) -> None:
+        quotes = self.FakeQuotes(1.05)
+        engine = self.engine(quotes)
+        position = self.position()
+        position.last_price_sol = 1.05
+        position.last_ts_ms = self.NOW_MS - 10_000
+        engine.positions[MINT] = position
+        engine.broker.wallet.token_balances[MINT] = position.size
+        woke_at = position.horizon_ts_ms + 1_000
+
+        await engine.on_trade(
+            TradeEvent(
+                mint=MINT,
+                timestamp_ms=woke_at,
+                event_index=1,
+                action="buy",
+                price_sol=1.3,
+                token_amount=10.0,
+            ),
+            await_actions=True,
+        )
+
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_reason, "horizon")
+        self.assertEqual(trade.exit_trigger_source, "pumpapi_trade")
+        # The print that woke the close and the price that priced it are
+        # different observations; both are recorded.
+        self.assertEqual(trade.exit_trigger_ts_ms, woke_at)
+        self.assertAlmostEqual(trade.exit_trigger_price_sol, 1.3)
+        self.assertEqual(trade.exit_ts_ms, self.NOW_MS - 10_000)
+        self.assertAlmostEqual(trade.exit_reference_price_sol, 1.05)
+        self.assertEqual(trade.exit_reference_kind, "last_in_horizon")
+
+    async def test_horizon_tick_uses_the_last_in_horizon_reference(self) -> None:
+        quotes = self.FakeQuotes(1.1)
+        engine = self.engine(quotes)
+        position = self.position()
+        position.last_price_sol = 1.05
+        position.last_ts_ms = self.NOW_MS - 10_000
+        engine.positions[MINT] = position
+        engine.broker.wallet.token_balances[MINT] = position.size
+        settle = engine.config.horizon_settle_ms
+
+        await engine.tick(
+            position.horizon_ts_ms + settle + 1, await_actions=True
+        )
+
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_reason, "horizon")
+        self.assertEqual(trade.exit_trigger_source, "engine_tick")
+        # The engine closes on the last in-horizon observation; the replay
+        # uses the first print at/after the horizon. Different measurement.
+        self.assertEqual(trade.exit_reference_kind, "last_in_horizon")
+        self.assertAlmostEqual(trade.exit_reference_price_sol, 1.05)
+        self.assertEqual(trade.exit_ts_ms, self.NOW_MS - 10_000)
+
+    async def test_fractional_exit_is_visible_in_the_evidence(self) -> None:
+        class LadderQuotes(TakeProfitExitTests.FakeQuotes):
+            async def exit_quote(
+                self,
+                mint: str,
+                size_tokens: float,
+                reference_price_sol: float | None,
+                *,
+                decimals: int | None = None,
+                action: str = "exit",
+            ) -> FillQuote:
+                self.exit_calls += 1
+                if size_tokens > 60.0:
+                    raise QuoteError("quote_no_route", "size")
+                return FillQuote(
+                    price_sol=1.55, source="test", out_amount=1550
+                )
+
+        quotes = LadderQuotes(1.55)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+        engine.broker.wallet.token_balances[MINT] = position.size
+
+        await engine._on_position_price(
+            position, self.NOW_MS - 60_000, 1.55, await_actions=True
+        )
+
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_status, "tp_hit")
+        self.assertEqual(trade.size, position.sold_size)
+        # 50 % first because 100 % did not route, then the remainder in full.
+        self.assertEqual(trade.exit_quote_fractions, [0.5, 1.0])
+        self.assertFalse(trade.exit_full_size)
+        self.assertEqual(trade.exit_fill_count, 2)
+        self.assertFalse(trade.exit_fill_evidence[0]["full_size"])
+        self.assertTrue(trade.exit_fill_evidence[1]["full_size"])
+        self.assertAlmostEqual(trade.unsold_size, 0.0)
+
+
+class ScannerCardDedupTests(unittest.TestCase):
+    """The first card per pool is the only one that may reach the engine."""
+
+    MINT = "ScDedupMint111111111111111111111111111111"
+
+    def claim(
+        self,
+        seen: OrderedDict[tuple[str, str], None],
+        *,
+        recovery: RecoveryStore | None = None,
+        lane: str = "A",
+        mint: str | None = None,
+    ) -> bool:
+        return _claim_scanner_card(
+            lane_name=lane,
+            token_address=self.MINT if mint is None else mint,
+            channel="@AveSolanaTokenScanner",
+            seen=seen,
+            recovery=recovery,
+            window=100,
+        )
+
+    def test_first_card_is_processed_exactly_once(self) -> None:
+        seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.assertTrue(self.claim(seen))
+        # The key is recorded on the first card, so the next repost is
+        # rejected even if the engine no longer has a pending entry or an open
+        # position for the mint.
+        self.assertFalse(self.claim(seen))
+
+    def test_repost_after_the_tp50_position_closed_is_ignored(self) -> None:
+        seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.assertTrue(self.claim(seen))
+        # Simulate the tp50 exit closing the position: the engine forgets the
+        # mint, the dedup set does not.
+        engine_positions: dict[str, object] = {self.MINT: object()}
+        engine_positions.clear()
+        self.assertFalse(self.claim(seen))
+        self.assertEqual(engine_positions, {})
+
+    def test_third_and_later_reposts_are_ignored(self) -> None:
+        seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.assertTrue(self.claim(seen))
+        for _ in range(5):
+            self.assertFalse(self.claim(seen))
+        self.assertEqual(len(seen), 1)
+
+    def test_repost_after_restart_uses_the_durable_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lane.sqlite3"
+            store = RecoveryStore(path)
+            try:
+                self.assertTrue(self.claim(OrderedDict(), recovery=store))
+            finally:
+                store.close()
+            # A restart starts with an empty in-memory set and reopens the
+            # same durable lane state.
+            reopened = RecoveryStore(path)
+            try:
+                self.assertFalse(
+                    self.claim(OrderedDict(), recovery=reopened)
+                )
+            finally:
+                reopened.close()
+
+    def test_a_different_lane_has_its_own_first_card(self) -> None:
+        # A/B lanes share the channel but are separate experiments.
+        seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.assertTrue(self.claim(seen, lane="A"))
+        self.assertTrue(self.claim(seen, lane="B"))
+        self.assertFalse(self.claim(seen, lane="A"))
+
+    def test_frozen_lane_keeps_the_same_first_card_behavior(self) -> None:
+        # The helper is rule-agnostic; the frozen scanner lane (called with
+        # the same lane name in its own run) behaves identically. This pins
+        # that the tp50 fix did not special-case or regress it.
+        seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.assertTrue(self.claim(seen, lane="A"))
+        self.assertFalse(self.claim(seen, lane="A"))
+
+    def test_address_less_card_is_left_to_the_parser(self) -> None:
+        seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.assertTrue(self.claim(seen, mint=""))
+        self.assertTrue(self.claim(seen, mint=""))
+        self.assertEqual(seen, OrderedDict())
+
 
 class LiveGuardTests(unittest.TestCase):
+    def test_live_mode_refuses_the_paper_only_tp50_rule(self) -> None:
+        from paper_bot.live import LiveConfig, run_live
+
+        config = LiveConfig(
+            channels=["@test"],
+            config_path=Path("config.ini"),
+            run_dir=Path("output/paper/run"),
+            mode="live",
+            rule=SCANNER_TP50_RULE,
+        )
+        # Refused before any credential is read, so the live opt-in cannot
+        # turn the experiment into a funded run.
+        with self.assertRaises(ValueError) as caught:
+            asyncio.run(run_live(config))
+        self.assertIn("paper-only", str(caught.exception))
+
+    def test_only_the_variant_is_declared_paper_only(self) -> None:
+        self.assertIn(SCANNER_TP50_RULE, PAPER_ONLY_RULES)
+        self.assertNotIn(SCANNER_RULE, PAPER_ONLY_RULES)
+
     def test_live_config_fails_closed_without_opt_in(self) -> None:
         config = live_config_from_env(
             {"SOLANA_PRIVATE_KEY": "x"}, enabled=True, slippage_bps=50,
@@ -1974,6 +2237,68 @@ class StoreEvidenceTests(unittest.TestCase):
             self.assertEqual(audit["out_usd_value"], 7.2)
             self.assertEqual(audit["swap_usd_value"], 12.5)
             self.assertEqual(audit["router"], "metis")
+
+    def test_exit_fill_evidence_is_json_encoded_and_mixed_runs_finalize(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperStore(Path(tmp))
+            store.record_trade_payload(
+                {
+                    "mint": "mint-a",
+                    "entry_ts_ms": 1,
+                    "exit_ts_ms": 2,
+                    "pnl_sol": 0.0,
+                    "return_pct": 0.0,
+                    "exit_trigger_source": "pumpapi_trade",
+                    "exit_reference_kind": "trigger_observation",
+                    "exit_quote_fractions": [0.5, 1.0],
+                    "exit_full_size": False,
+                    "exit_fill_evidence": [
+                        {"fraction": 0.5, "out_amount": 10},
+                        {"fraction": 1.0, "out_amount": 20},
+                    ],
+                }
+            )
+            # A trade with no fills must not change the parquet schema.
+            store.record_trade_payload(
+                {
+                    "mint": "mint-b",
+                    "entry_ts_ms": 3,
+                    "exit_ts_ms": 4,
+                    "pnl_sol": 0.0,
+                    "return_pct": 0.0,
+                    "exit_quote_fractions": [],
+                    "exit_full_size": None,
+                    "exit_fill_evidence": [],
+                }
+            )
+            parquet = store.finalize()
+            self.assertIsNotNone(parquet)
+            frame = pl.read_parquet(parquet)
+            self.assertEqual(frame.height, 2)
+            self.assertEqual(
+                frame["exit_quote_fractions"].to_list(), [[0.5, 1.0], []]
+            )
+            self.assertEqual(
+                frame["exit_trigger_source"].to_list(),
+                ["pumpapi_trade", None],
+            )
+            rows = [
+                json.loads(line)
+                for line in (Path(tmp) / "trades.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertIsInstance(rows[0]["exit_fill_evidence"], str)
+            self.assertEqual(
+                [
+                    leg["fraction"]
+                    for leg in json.loads(rows[0]["exit_fill_evidence"])
+                ],
+                [0.5, 1.0],
+            )
+            self.assertFalse(rows[0]["exit_full_size"])
 
     def test_summary_ledger_reconciles_entries_trades_and_open_positions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

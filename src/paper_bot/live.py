@@ -57,6 +57,7 @@ from .quotes import DEFAULT_MAX_SLIPPAGE_BPS, JupiterQuoteProvider
 from .recovery import RecoveryStore
 from .signals import (
     DEFAULT_RULE,
+    PAPER_ONLY_RULES,
     RULE_DESCRIPTIONS,
     SCANNER_ALLOWED_DEX,
     SCANNER_MAX_LIQUIDITY_USD,
@@ -1042,6 +1043,56 @@ def _write_ab_summary(
     )
 
 
+def _remember_scanner_seen(
+    seen: OrderedDict[tuple[str, str], None],
+    key: tuple[str, str],
+    window: int,
+) -> None:
+    seen[key] = None
+    if len(seen) > window:
+        seen.popitem(last=False)
+
+
+def _claim_scanner_card(
+    *,
+    lane_name: str,
+    token_address: str | None,
+    channel: str,
+    seen: OrderedDict[tuple[str, str], None],
+    recovery: RecoveryStore | None,
+    window: int,
+) -> bool:
+    """Return True only for the first card of a pool on this lane.
+
+    The in-memory key is recorded on the first card, not only on a rejected
+    repost. That matters because the engine only ignores duplicates while a
+    mint has a pending entry or an open position; once a position closes early
+    (the tp50 lane's whole point) only this set still enforces the documented
+    "first card per pool" rule. The durable ``scanner_trade`` claim covers a
+    repost delivered after a restart.
+    """
+    if not token_address:
+        # Not a pool identity we can deduplicate on; let the parser/engine
+        # reject the card rather than blocking every later address-less card.
+        return True
+    key = (lane_name, token_address)
+    if key in seen:
+        return False
+    if recovery is not None and not recovery.claim_event(
+        f"scanner_trade:{lane_name}:{channel}:{token_address}"
+    ):
+        LOGGER.debug(
+            "scanner card lane=%s %s was traded before the restart; "
+            "ignoring the repost",
+            lane_name,
+            token_address,
+        )
+        _remember_scanner_seen(seen, key, window)
+        return False
+    _remember_scanner_seen(seen, key, window)
+    return True
+
+
 async def run_live(config: LiveConfig) -> dict[str, Any]:
     process_started_at = datetime.now(UTC)
     started_at_ms = int(process_started_at.timestamp() * 1000)
@@ -1055,6 +1106,14 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             "(this is a leak-hunt run, not a gate sample)"
         )
     _MEMORY["peak_mb"] = 0.0
+    # The tp50 exit is a pre-registered paper experiment
+    # (docs/TP50_VARIANT.md). Refuse live before any credentials are read: the
+    # wrapper refuses it too, but this holds for a direct CLI invocation.
+    if config.mode == "live" and config.rule in PAPER_ONLY_RULES:
+        raise ValueError(
+            f"{config.rule} is a paper-only pre-registered variant; "
+            "live execution is refused"
+        )
     env = _load_env(env_file())
     api_key = env.get("JUPITER_API_KEY") or os.environ.get("JUPITER_API_KEY")
     if not api_key:
@@ -1484,38 +1543,27 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
             if (
                 is_scanner_rule(lane.rule)
                 and signal.message_type == SCANNER_MESSAGE_TYPE
+                and not _claim_scanner_card(
+                    lane_name=lane.name,
+                    token_address=signal.token_address,
+                    channel=channel,
+                    seen=scanner_seen,
+                    recovery=recovery,
+                    window=config.message_dedup_window,
+                )
             ):
-                scanner_key = (lane.name, signal.token_address)
-                if scanner_key in scanner_seen:
-                    LOGGER.debug(
-                        "scanner duplicate card lane=%s %s",
-                        lane.name,
-                        signal.token_address,
-                    )
-                    continue
-                if (
-                    recovery is not None
-                    and signal.token_address
-                    and not recovery.claim_event(
-                        f"scanner_trade:{lane.name}:{channel}:"
-                        f"{signal.token_address}"
-                    )
-                ):
-                    LOGGER.debug(
-                        "scanner card lane=%s %s was traded before the "
-                        "restart; ignoring the repost",
-                        lane.name,
-                        signal.token_address,
-                    )
-                    scanner_seen[scanner_key] = None
-                    if len(scanner_seen) > config.message_dedup_window:
-                        scanner_seen.popitem(last=False)
-                # Persistence health is enforced inside ``engine.on_signal``:
-                # it records a ``persistence_degraded`` skip in the audit trail
-                # and keeps exits running. Do not duplicate that check here —
-                # a signal-level ``continue`` would silently omit both the
-                # signal and the skip from the forward-gate accounting.
-                decision = await lane.engine.on_signal(signal)
+                LOGGER.debug(
+                    "scanner duplicate card lane=%s %s",
+                    lane.name,
+                    signal.token_address,
+                )
+                continue
+            # Persistence health is enforced inside ``engine.on_signal``:
+            # it records a ``persistence_degraded`` skip in the audit trail
+            # and keeps exits running. Do not duplicate that check here —
+            # a signal-level ``continue`` would silently omit both the
+            # signal and the skip from the forward-gate accounting.
+            decision = await lane.engine.on_signal(signal)
             LOGGER.info(
                 "signal lane=%s %s %s allowed=%s lag_ms=%s reasons=%s",
                 lane.name,

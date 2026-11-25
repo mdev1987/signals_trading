@@ -78,6 +78,15 @@ TP_ARGS=()
 if [[ -n "$TP_PCT" ]]; then
   TP_ARGS=(--tp-pct "$TP_PCT")
 fi
+
+# The tp50 exit variant is paper-only (docs/TP50_VARIANT.md). The
+# LIVE_TRADING_ENABLED opt-in protects the wallet, not the experiment, so live
+# mode is refused explicitly rather than inherited from the default rule.
+if [[ "$MODE" == "live" && "$RULE" == "scanner_pumpfun_amm_tp50" ]]; then
+  echo "ERROR: $RULE is a paper-only pre-registered variant; live mode is refused."
+  echo "       Run the frozen lane (RULE=scanner_pumpfun_amm) if live is intended."
+  exit 1
+fi
 STATE_DB="output/recovery/${RULE}_trade.sqlite3"
 
 # Paper stays uncensored so the forward sample measures the raw strategy.

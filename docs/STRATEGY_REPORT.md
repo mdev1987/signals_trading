@@ -169,11 +169,13 @@ experiment with a fixed acceptance gate.
 
 Two levers remain, in order of expected value:
 
-1. **Execution cost.** At 982 trades, one percentage point of round-trip cost is
-   1.96 SOL — more than every exit policy tested. Measure the real cost
-   (priority fee, ATA rent, route fee, slippage) of the VPS paper fills before
-   changing any rule, and do not lower the 1.25 %/side assumption to flatter a
-   result.
+1. **Execution cost.** At 982 trades, one percentage point on each side (two
+   points of round-trip cost) is 1.96 SOL, and one point of total round-trip
+   cost is about 0.98 SOL — either is larger than every exit policy tested.
+   Measure the real cost (priority fee, ATA rent, route fee, slippage) of the
+   VPS paper fills before changing any rule, and do not lower the 1.25 %/side
+   assumption to flatter a result. Quotes measure modeled cost, not fees
+   actually paid.
 2. **More days on a fixed lane.** The frozen lane is at break-even with a ~20 %
    tail; the tp50 lane is a fragile positive in the study. Only a longer forward
    sample can tell whether either survives, and the gates already encode what

@@ -299,19 +299,26 @@ Do not fund this lane until a forward paper run shows **all** of:
    `exit_reason == "no_route"` alone understates the loss tail: the first
    forward run had **0** `no_route` exits and **17.6 %** catastrophic exits.
 5. **No systematic entry failure.** At least **80 %** of allowed signals must
-   fill (`entries.jsonl` / allowed `signals.jsonl`), **and**
-   `entry_delay_exceeded + entry_quote_failed` must stay strictly below
-   **10 %** of allowed signals (exactly 10 % fails). The fill rate alone can
-   look healthy while a separate tenth of the cards is abandoned by quote or
-   timing failures; either one means the bot is not taking the trades the
-   backtest measured, regardless of the realized win rate.
-   `entry_dust_prints_only`, `entry_unverified_quote_notional`,
-   `entry_missed_eligible_print`, `entry_window_passed`, `entry_timer_late`,
-   `signal_timestamp_in_future` and `stale_reference_price` are fidelity skips
-   (the live convention refused a print the replay would not have used), not
-   backtested trades. `signal_timestamp_in_future` specifically means the host
-   clock is behind Telegram's server time; fix the clock rather than relaxing
-   the guard.
+   fill (`entries.jsonl` / allowed `signals.jsonl`), **and** the share of
+   allowed signals that failed during the entry attempt must stay strictly
+   below **10 %** (exactly 10 % fails). The numerator is every entry-attempt
+   outcome recorded against an allowed signal: `entry_delay_exceeded`,
+   `entry_quote_failed`, `entry_no_exit_route`, `entry_no_exit_economics`,
+   `entry_insufficient_sol`, `persistence_degraded`, `entry_timer_late`,
+   missing/stale-reference outcomes, and the trade-mode expiries
+   `no_buy_trade_after_signal`, `entry_dust_prints_only` and
+   `entry_unverified_quote_notional`. The fill rate alone can look healthy
+   while a separate tenth of the cards is abandoned by quote, preflight,
+   persistence or timing failure; either one means the bot is not taking the
+   trades the backtest measured, regardless of the realized win rate.
+   Skips attached to a signal that the gate rejected (`allowed=false`) are
+   censoring, not entry failures, and are outside both sides of the ratio.
+   `entry_missed_eligible_print`, `entry_window_passed`,
+   `signal_timestamp_in_future` and `stale_reference_price` usually reject the
+   card before it is `allowed`; when one is nevertheless recorded against an
+   allowed signal, it counts. `signal_timestamp_in_future` specifically means
+   the host clock is behind Telegram's server time; fix the clock rather than
+   relaxing the guard.
 
 `src/forward_gates.py` evaluates gates 1–5 with these exact thresholds and
 exits `2` while coverage is short.
@@ -326,7 +333,10 @@ gate. `censor_share` is reported so a high fill rate on a thin slice of the
 scanner population cannot be mistaken for full participation; it changes no
 threshold. Separately, `input_integrity` fails the run when a `*.jsonl` row
 cannot be parsed or a trade lacks a finite `pnl_sol`/`return_pct`, rather than
-silently dropping it. Neither addition retunes the strategy.
+silently dropping it, and `run_integrity` fails it unless `summary.json` says
+`integrity == "VALID"` / `persistence_degraded == false` and `meta.json` says
+`integrity_at_start == "VALID"`. Missing or malformed metadata is a failure,
+never a silent pass. Neither addition retunes the strategy.
 
 If 2, 3 or 4 fails while 5 passes, the edge did not survive the move from
 replay to live and the lane should be retired, not retuned. Do not re-fit the

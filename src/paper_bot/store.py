@@ -294,7 +294,12 @@ class PaperStore:
         # Raw quote bodies are nested structures with provider-specific keys;
         # serializing them keeps the parquet schema stable while the JSONL
         # still carries the evidence (as a readable JSON string).
-        for key in ("entry_quote_raw", "exit_quote_raw", "exit_quote_raws"):
+        for key in (
+            "entry_quote_raw",
+            "exit_quote_raw",
+            "exit_quote_raws",
+            "exit_fill_evidence",
+        ):
             value = payload.get(key)
             if isinstance(value, (dict, list)):
                 payload = dict(payload)

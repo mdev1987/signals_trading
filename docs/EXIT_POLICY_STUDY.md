@@ -3,6 +3,9 @@
 Status: **research only. No engine or strategy change.** Run 2026-11-25 on the two
 replay days that did not exist when the rule was frozen (2026-11-21 and
 2026-11-22), so the entry cohort is out of sample for every policy tested here.
+The exit policy itself was selected on these same days, so for the chosen
+policy they are selection data, not an out-of-sample test; only the forward
+paper lane is independent.
 
 Question: can the exit be improved enough to turn the lane positive, and do
 trailing stops, partial take-profits or a dynamic hold capture the pumps better
@@ -114,13 +117,48 @@ unchanged.
 
 The baseline model here is harsher than the paper bot (75 % vs 78.6–79.7 % win)
 because a market sell needs a print, not a quote. That makes the comparison
-conservative, but it also points at the cheapest lever: at 982 trades, **1
-percentage point of round-trip cost is 1.96 SOL** — more than every exit policy
-tested. Before changing any rule, measure the real round-trip cost (priority
-fee, ATA rent, Jupiter route fee, slippage) of the paper fills on the VPS. If
-the realized cost is below the 1.25 %/side assumption, the frozen rule earns
-more without a single parameter change; if it is above, the lane is worse than
-reported.
+conservative, but it also points at the cheapest lever: at 982 trades, **one
+percentage point on each side (two points of round-trip cost) is 1.96 SOL**;
+one point of total round-trip cost is about 0.98 SOL. Both are larger than every
+exit policy's measured effect. Before changing any rule, measure the real
+round-trip cost (priority fee, ATA rent, Jupiter route fee, slippage) of the
+paper fills on the VPS. If the realized cost is below the 1.25 %/side
+assumption, the frozen rule earns more without a single parameter change; if it
+is above, the lane is worse than reported.
+
+Quote-derived cost is not paid cost: this lane uses read-only Jupiter quotes,
+so it measures output, price impact and modeled fees. Priority fees, Jito tips,
+ATA rent and transaction fees only become observable with executed on-chain
+transactions.
+
+## Reproducibility
+
+`src/exit_policy_study.py` now writes the study artifact the table above is
+checked against:
+
+```bash
+env PYTHONPATH=src .venv/bin/python src/exit_policy_study.py \
+  --days 2026-11-21 2026-11-22 --fresh-ms 60000 \
+  --artifact output/backtest/exit_study/artifact_fresh60s.json
+# sensitivity run, same inputs
+env PYTHONPATH=src .venv/bin/python src/exit_policy_study.py \
+  --days 2026-11-21 2026-11-22 --fresh-ms 5000 \
+  --artifact output/backtest/exit_study/artifact_fresh5s.json
+```
+
+The artifact contains, per policy and per trade: `mint`, entry timestamp and
+price, exit timestamp and price, exit reason, freshness outcome and net return
+(plus per-leg weights for partial exits). It also records the summary metrics
+and a mint-cluster percentile bootstrap (statistic: total net SOL; interval:
+5th–95th percentile; seed `20261121`; 10,000 resamples) — the same
+`forward_gates.cluster_bootstrap` implementation the acceptance gate uses.
+`--bootstrap-seed` and `--bootstrap-resamples` override the defaults.
+
+The replay inputs (`output/backtest/signals_channels/<day>/alerts_priced_canon.csv`
+and `/mnt/HDD/PumpAPI_Replay_Zst/<day>/`) are not in this repository. With those
+inputs present, the command regenerates the engine-side numbers exactly; without
+them, the values in this document remain the recorded VPS run rather than an
+independently re-derived result.
 
 ## Verdict
 
