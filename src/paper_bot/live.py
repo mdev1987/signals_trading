@@ -1573,6 +1573,7 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                     ),
                     equity_sol=equity,
                     open_positions=len(lane.engine.positions),
+                    max_positions=config.max_concurrent_positions,
                     session_pnl_sol=session_pnl,
                     recovery_status=(
                         "recovered" if resumed_at is not None else "fresh"

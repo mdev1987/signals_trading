@@ -207,6 +207,24 @@ def fmt_observed_liquidity(value: float | None) -> str:
     return fmt_mc(value) if value is not None else "Not observed"
 
 
+def fmt_open_positions(
+    open_positions: int | None, max_positions: int | None
+) -> str | None:
+    """Render the live concurrency against the configured cap, if known."""
+    if open_positions is None:
+        return None
+    if max_positions is not None:
+        return f"{open_positions} / {max_positions}"
+    return str(open_positions)
+
+
+def _positions_line(
+    open_positions: int | None, max_positions: int | None
+) -> str | None:
+    text = fmt_open_positions(open_positions, max_positions)
+    return f"📌 **Open positions:** `{text}`" if text else None
+
+
 def fmt_ratio(value: float | None) -> str:
     if value is None:
         return "—"
@@ -517,6 +535,8 @@ def format_entry(
     position: Position,
     before: dict[str, Any] | None,
     after: dict[str, Any] | None,
+    open_positions: int | None = None,
+    max_positions: int | None = None,
 ) -> str:
     signal = position.signal
     symbol = symbol_of(signal)
@@ -582,6 +602,9 @@ def format_entry(
             else ""
         )
         lines.append(f"🛣 **Router:** `{entry_quote.router}`{latency}")
+    positions_line = _positions_line(open_positions, max_positions)
+    if positions_line:
+        lines.append(positions_line)
     lines.append(_divider())
     lines.extend(_wallet_block(before, after, position.mint))
     lines.append(
@@ -596,6 +619,8 @@ def format_exit(
     before: dict[str, Any] | None,
     after: dict[str, Any] | None,
     stats: ReporterStats,
+    open_positions: int | None = None,
+    max_positions: int | None = None,
 ) -> str:
     symbol = symbol_of_trade(trade)
     pnl = float(trade.pnl_sol)
@@ -672,6 +697,9 @@ def format_exit(
         lines.append(
             f"Token balance: `{fmt_int(_wallet_token(after, trade.mint))}`"
         )
+    positions_line = _positions_line(open_positions, max_positions)
+    if positions_line:
+        lines.append(positions_line)
     lines.extend(
         [
             _divider(),
@@ -717,6 +745,7 @@ def format_startup(
     recovered_cash_sol: float | None = None,
     equity_sol: float | None = None,
     open_positions: int | None = None,
+    max_positions: int | None = None,
     session_pnl_sol: float | None = None,
     recovery_status: str | None = None,
     min_preflight_exit_value_ratio: float | None = None,
@@ -762,7 +791,9 @@ def format_startup(
     if recovered is not None:
         lines.append(f"💵 **Recovered cash:** `{fmt_sol(recovered)} SOL`")
     if open_positions is not None:
-        lines.append(f"📌 **Open positions:** `{open_positions}`")
+        positions_line = _positions_line(open_positions, max_positions)
+        if positions_line:
+            lines.append(positions_line)
     if session_pnl_sol is not None:
         lines.append(
             f"📈 **Session realized PnL:** "
@@ -879,13 +910,15 @@ def format_status(
     positions: list[dict[str, Any]],
     pending: int,
     rule: str,
+    max_positions: int | None = None,
 ) -> str:
+    open_text = fmt_open_positions(len(positions), max_positions)
     lines = [
         "📊 **PAPER BOT STATUS**",
         _divider(),
         f"⚙️ **Rule:** `{rule}`",
         f"💼 **Balance:** `{fmt_sol(_wallet_sol(wallet))} SOL`",
-        f"🪙 **Open positions:** `{len(positions)}` · **Pending:** `{pending}`",
+        f"🪙 **Open positions:** `{open_text}` · **Pending:** `{pending}`",
         f"📈 **Total PnL:** `{fmt_signed_sol(stats.total_pnl_sol)} SOL`",
         f"🎯 **Win rate:** `{fmt_pct(stats.win_rate)}` "
         f"(`{stats.wins}`W / `{stats.losses}`L / `{stats.trades}` trades)",
@@ -1010,6 +1043,17 @@ class TelegramReporter:
             self.stats = stats
         if rule is not None:
             self.rule = rule
+
+    def _position_counts(self) -> tuple[int | None, int | None]:
+        """Current open positions and the configured concurrency cap."""
+        engine = self.engine
+        if engine is None:
+            return None, None
+        positions = getattr(engine, "positions", None)
+        open_positions = len(positions) if positions is not None else None
+        config = getattr(engine, "config", None)
+        max_positions = getattr(config, "max_concurrent_positions", None)
+        return open_positions, max_positions
 
     def wallet_snapshot(self) -> dict[str, Any] | None:
         """Cash plus open token balances marked at the last feed price.
@@ -1192,6 +1236,7 @@ class TelegramReporter:
         recovered_cash_sol: float | None = None,
         equity_sol: float | None = None,
         open_positions: int | None = None,
+        max_positions: int | None = None,
         session_pnl_sol: float | None = None,
         recovery_status: str | None = None,
         min_preflight_exit_value_ratio: float | None = None,
@@ -1217,6 +1262,7 @@ class TelegramReporter:
                 recovered_cash_sol=recovered_cash_sol,
                 equity_sol=equity_sol,
                 open_positions=open_positions,
+                max_positions=max_positions,
                 session_pnl_sol=session_pnl_sol,
                 recovery_status=recovery_status,
                 min_preflight_exit_value_ratio=min_preflight_exit_value_ratio,
@@ -1229,7 +1275,16 @@ class TelegramReporter:
         before: dict[str, Any] | None,
         after: dict[str, Any] | None,
     ) -> bool:
-        return await self.send_markdown(format_entry(position, before, after))
+        open_positions, max_positions = self._position_counts()
+        return await self.send_markdown(
+            format_entry(
+                position,
+                before,
+                after,
+                open_positions=open_positions,
+                max_positions=max_positions,
+            )
+        )
 
     async def notify_exit(
         self,
@@ -1240,7 +1295,17 @@ class TelegramReporter:
         if self.stats is None:
             self.stats = ReporterStats(starting_sol=0.0)
         self.stats.record(trade)
-        return await self.send_markdown(format_exit(trade, before, after, self.stats))
+        open_positions, max_positions = self._position_counts()
+        return await self.send_markdown(
+            format_exit(
+                trade,
+                before,
+                after,
+                self.stats,
+                open_positions=open_positions,
+                max_positions=max_positions,
+            )
+        )
 
     async def notify_shutdown(
         self,
@@ -1310,6 +1375,7 @@ class TelegramReporter:
                 positions=positions,
                 pending=pending,
                 rule=self.rule,
+                max_positions=self._position_counts()[1],
             )
         )
 

@@ -51,10 +51,12 @@ from paper_bot.models import (  # noqa: E402
 )
 from paper_bot.notifier import (  # noqa: E402
     ReporterConfig,
+    ReporterStats,
     TelegramReporter,
     _signal_evidence,
     format_entry,
     format_startup,
+    format_status,
 )
 from paper_bot.quotes import (  # noqa: E402
     QuoteError,
@@ -2331,6 +2333,47 @@ class ReportTests(unittest.TestCase):
         self.assertIn("min exit value 0.90x", text)
         self.assertNotIn("Recovered cash", text)
 
+    def test_open_positions_render_against_the_configured_cap(self) -> None:
+        text = format_startup(
+            rule="scanner_pumpfun_amm",
+            horizon_min=5,
+            notional_sol=0.1,
+            starting_sol=10.0,
+            fee=0.0125,
+            slippage=0.0,
+            channels=["@ave"],
+            session_file="bot.session",
+            preflight_exit_route=True,
+            mode="paper",
+            recovery_status="fresh",
+            open_positions=3,
+            max_positions=10,
+        )
+        self.assertIn("Open positions:** `3 / 10`", text)
+
+    def test_status_reports_open_positions_against_the_cap(self) -> None:
+        text = format_status(
+            stats=ReporterStats(starting_sol=10.0),
+            wallet=None,
+            positions=[],
+            pending=0,
+            rule="scanner_pumpfun_amm",
+            max_positions=10,
+        )
+        self.assertIn("Open positions:** `0 / 10`", text)
+
+    def test_reporter_reads_open_and_max_positions_from_engine(self) -> None:
+        class _Config:
+            max_concurrent_positions = 10
+
+        class _Engine:
+            config = _Config()
+            positions = {"a": object(), "b": object()}
+
+        reporter = TelegramReporter(ReporterConfig(enabled=False))
+        reporter.bind(engine=_Engine())
+        self.assertEqual(reporter._position_counts(), (2, 10))
+
     def test_entry_notification_does_not_copy_signal_liquidity(self) -> None:
         position = Position(
             signal=signal(
@@ -2363,6 +2406,8 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Modeled slippage", text)
         self.assertIn("Price impact", text)
         self.assertIn("1.25%", text)
+        capped = format_entry(position, None, None, open_positions=4, max_positions=10)
+        self.assertIn("Open positions:** `4 / 10`", capped)
 
     def test_scanner_evidence_shows_only_scanner_gates(self) -> None:
         text = "\n".join(
