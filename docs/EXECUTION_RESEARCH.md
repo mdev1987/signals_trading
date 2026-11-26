@@ -47,11 +47,14 @@ Four results, in order of decision value:
    win rate at its own payoff (+24.4 % / −92.1 %) is 79.0 %: a margin of
    **0.7 pp**. The tail rate is 18.6 % (Wilson 16.2–21.3 %) against a
    break-even of 19.3 %; **one extra point of tail rate costs 1.1 SOL**, more
-   than the whole profit. The live tp50 lane sits **0.7 pp below** its own
-   break-even (104 verified closes), or 1.5 pp below if the next close is a
-   tail — the same one-trade-wide noise band, not a separable difference. It
-   has not yet triggered its own rule: **0 TP exits in 104 closes**. The
-   win rate is the least informative number in the report (§2.5).
+   than the whole profit. The live tp50 lane sits on the same line and crossed
+   it in both directions inside two hours of wall-clock: **−0.7 pp** at 104
+   closes, **+1.1 pp** at 120, **−0.25 pp** at 122. The last leg was two
+   catastrophic tails. That is the noise band measured on the live lane, not
+   asserted. Its four TP triggers are the first evidence on the rule itself,
+   and one of them filled at **−100 %** because the +50 % mark was not
+   executable (§2.5.5). The win rate is the least informative number in the
+   report.
 
 What follows is the pre-registration for the parts that remain, and the
 evidence that closes the rest.
@@ -199,34 +202,51 @@ break-even win rate = |avg loss| / (avg win + |avg loss|)
 
 | sample | n | win | avg win | avg loss | break-even win | margin | PnL | P(PnL>0) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `scanner_pumpfun_amm` (fixed), host ledger 11-22 → 11-25 | 870 | 79.8 % | +24.4 % | −92.1 % | 79.0 % | **+0.7 pp** | +0.757 | 0.69 |
+| `scanner_pumpfun_amm` (fixed), 6 restarted runs 11-22 → 11-25 | 870 | 79.8 % | +24.4 % | −92.1 % | 79.0 % | **+0.7 pp** | +0.757 | 0.69 |
 | `scanner_pumpfun_amm_tp50`, **separate cohort** (source run not recorded) | 105 | 79.0 % | +23.0 % | −96.7 % | 80.8 % | **−1.7 pp** | −0.222 | 0.34 |
-| `scanner_pumpfun_amm_tp50`, **live lane** to 11-26 02:25 UTC | 104 | 79.8 % | +23.4 % | −96.6 % | 80.5 % | **−0.7 pp** | −0.090 | 0.44 |
+| `scanner_pumpfun_amm_tp50`, **live lane**, snapshot 11-26 04:07 UTC | 122 | 80.3 % | +23.4 % | −97.0 % | 80.6 % | **−0.25 pp** | −0.037 | 0.48 |
 
 **Provenance.** Each row is only decision-grade with the data that produced
-it. `forward_gates.py` now stamps its JSON and its human report with a
+it. `forward_gates.py` stamps its JSON and its human report with a
 `provenance` block — run directory, rule, lane, mode, run start, recovery
 status, trade count, and the first/last `exit_ts_ms` — so a quoted row can be
-tied back to one `trades.jsonl`. The live row above was regenerated from the
-lane's Telegram card ledger: 104 closes, 83 W / 21 L, 20 tails, last exit
-2026-11-26 02:25:59 UTC, every card's running total reconciling with the sum
-of its printed PnL. The 105-trade row is a **separate cohort whose source run
-directory was not recorded**; an earlier draft of this table presented it as
-the running lane, which it is not (it contains three TP exits — the live lane
-has none). It is kept only because it is the one sample in which the TP rule
-actually fired. **A row without a stated source and last close is not
-evidence** — two snapshots of the same running lane differ by more than the
-margin over break-even.
+tied back to one `trades.jsonl`.
 
-The tp50 case is the one worth stating plainly: 79 % of trades win and the
-ledger is still negative, because the lane sits about **0.7 pp below
-break-even** — inside the same noise band as the fixed lane's +0.7 pp. The
-fixed lane's leave-one-run-out margin is **−0.2 to +1.5 pp** with PnL
-**−0.160 to +1.440 SOL**; one of six subsets is negative. Neither lane's edge
-is separable from zero at this sample size, and the live tp50 lane's verdict
-is "indistinguishable from the frozen lane so far", not "1.7 pp worse": it has
-**0 TP triggers in 104 closes**, because no mark reached +50 % before the
-horizon.
+The fixed row is the union of six `scanner_pumpfun_amm` runs, not one file
+(the bot restarted, and each restart opens a new directory):
+
+| run dir | trades |
+| --- | --- |
+| `live_20261122_055930` | 76 |
+| `live_20261122_094804` | 348 |
+| `live_20261123_052635` | 76 |
+| `live_20261123_122916` | 122 |
+| `live_20261124_045122` | 87 |
+| `live_20261124_160122` | 161 |
+
+Concatenated, they reproduce every figure above exactly: 870 trades,
++0.7569 SOL, 79.77 % win, 162 tails, break-even 79.03 %, margin +0.74 pp,
+`P(PnL>0) = 0.6865`, best mint +0.2415 SOL, and the four day rows of §2.5.3.
+
+The live row is a **frozen copy** of
+`output/paper/live_20261125_121607/trades.jsonl` taken at 2026-11-26
+04:07:38 UTC: 122 closes, 98 W / 24 L, 23 tails, −0.0365 SOL, bootstrap
+`P(PnL>0) = 0.48` (5th percentile −0.944 SOL). The lane kept trading while
+this was written — its margin had already gone −0.7 pp (n=104) → +1.1 pp
+(n=120) → −0.25 pp (n=122) in under two hours — so this row is a snapshot,
+not the lane's state; re-run the command for the current one. The 105-trade
+row is a **separate cohort whose source run directory was not recorded**; an
+earlier draft presented it as the running lane, which it is not. It is kept
+only because it is the one sample in which the TP rule fired before the live
+lane did. **A row without a stated source and last close is not evidence.**
+
+The tp50 case is the one worth stating plainly: the live margin has already
+read −0.7 pp, +1.1 pp and −0.25 pp on the same rule, and the last leg was two
+catastrophic tails. That is the same one-trade-wide variance the fixed lane
+shows, now demonstrated on the live lane; the verdict is "indistinguishable
+from the frozen lane so far", not "1.7 pp worse". The fixed lane's
+leave-one-run-out margin is **−0.2 to +1.5 pp** with PnL **−0.160 to +1.440
+SOL**; one of six subsets is negative.
 
 The small-loss band is only **1.6 %** of trades (79.8 % wins + 18.6 %
 catastrophic = 98.4 %), so the win rate is almost exactly
@@ -260,25 +280,29 @@ break-even of 18.3 %. The live tp50 lane: 19.2 % tail, 20 in 104 (12.8 % –
 break-even and the point estimate is on the wrong side by less than one tail;
 that is a warning, not a measurement.
 
+The live lane has since moved to 23 tails in 122 (**18.9 %**, Wilson
+12.9 % – 26.7 %, break-even 18.6 %) — back across break-even without leaving
+the interval. That is what an interval that wide means in practice.
+
 ### 2.5.2 Tail-rate sensitivity
 
 Holding the observed non-tail payoff fixed (`m = +23.9 %`) and replacing trades
 at random with the observed catastrophe (`t = −99.9 %`), expectancy is
 `(1−q)·m + q·t`:
 
-| tail rate | fixed lane (870) | tp50 cohort (105) | tp50 live lane (104) |
+| tail rate | fixed lane (870) | tp50 cohort (105) | tp50 live lane (122) |
 | --- | --- | --- | --- |
-| observed (18.6 / 20.0 / 19.2 %) | **+0.86 %**/trade (+0.757 SOL) | −2.09 %/trade (−0.222 SOL) | −0.86 %/trade (−0.090 SOL) |
-| +1 pp | −0.38 %/trade (−0.334 SOL) | −3.31 %/trade (−0.352 SOL) | −2.08 %/trade (−0.219 SOL) |
-| +2 pp | −1.62 %/trade (−1.425 SOL) | −4.53 %/trade (−0.482 SOL) | −3.31 %/trade (−0.349 SOL) |
-| +3 pp | −2.86 %/trade (−2.516 SOL) | −5.75 %/trade (−0.611 SOL) | −4.53 %/trade (−0.478 SOL) |
-| break-even | 19.3 % | 18.3 % | 18.5 % |
+| observed (18.6 / 20.0 / 18.9 %) | **+0.86 %**/trade (+0.757 SOL) | −2.09 %/trade (−0.222 SOL) | −0.30 %/trade (−0.036 SOL) |
+| +1 pp | −0.38 %/trade (−0.334 SOL) | −3.31 %/trade (−0.352 SOL) | −1.52 %/trade (−0.188 SOL) |
+| +2 pp | −1.62 %/trade (−1.425 SOL) | −4.53 %/trade (−0.482 SOL) | −2.75 %/trade (−0.340 SOL) |
+| +3 pp | −2.86 %/trade (−2.516 SOL) | −5.75 %/trade (−0.611 SOL) | −3.98 %/trade (−0.491 SOL) |
+| break-even | 19.3 % | 18.3 % | 18.6 % |
 
 One extra point of tail rate costs about **1.1 SOL per 870 trades** — more than
 the entire recorded profit. The fixed lane is profitable in exactly one
-0.7-pp-wide band. The live tp50 ledger (`m = +22.7 %`, `t = −99.8 %`, 10.5 SOL
-book) has the same width: one extra point costs **0.13 SOL per 104 trades**,
-more than the lane's current loss of 0.090 SOL.
+0.7-pp-wide band. The live tp50 ledger (`m = +22.8 %`, `t = −99.8 %`, 12.3 SOL
+book) sits on the other side of the same break-even: one extra point costs
+**0.15 SOL per 122 trades**, four times its current loss of 0.036 SOL.
 
 ### 2.5.3 Concentration: days and mints
 
@@ -299,9 +323,11 @@ best single mint (+0.242) is a third of the profit — without it the lane is
 The tp50 samples are worse on every one of these axes. Separate cohort: 1 of 2
 days profitable, the profitable day (11-26, +0.021) is **negative without its
 best trade**, and removing the best mint turns the lane from −0.222 to −0.273
-SOL. Live lane: 1 of 2 profitable days, 11-26 at +0.018 is **negative without
-its best trade** (−0.023), and without the best mint the lane goes from −0.090
-to −0.141 SOL. In both, whatever profit exists is one day and one mint.
+SOL. Live lane: 1 of 2 profitable days (11-25 −0.108, 11-26 +0.072), neither
+flipped by its best trade. Without the best mint the lane goes from −0.037 to
+−0.087 SOL — the best mint halves the loss but there is no profit for it to
+concentrate. In the separate cohort whatever profit exists is one day and one
+mint.
 
 **pp convention.** "pp" here means percentage points of traded notional
 (median **0.101 SOL** per trade), not of starting capital. On the 88 SOL
@@ -327,18 +353,47 @@ signal set while also rejecting some winners is worth far less, and the
 preflight work (§3.3) already shows the available ratio has no predictive
 power (AUC 0.458).
 
-The tp50 variant is **not** disproven by either sample. In the separate
-cohort TP fired 3 times for +0.124 SOL (non-TP mean −3.39 %). In the live lane it
-fired **0 times in 104 closes**, so the deployed lane has not yet exercised
-its own rule and is behaviourally the frozen lane. At n=105 / n=104 neither
-sample is evidence for or against the +50 % exit; the live lane becomes
-informative only once TP has actually fired, or once enough trades have
-accrued to narrow the tail interval below the 1-pp margin.
+The tp50 variant is **not** disproven by either sample, and it is no longer
+unexercised. In the separate cohort TP fired 3 times for +0.124 SOL (non-TP
+mean −3.39 %). In the live lane it fired **4 times in 122 closes for +0.023
+SOL net**, because one of the four filled at −100 % (§2.5.5). Neither sample
+is evidence for or against the +50 % exit on its own.
 
-`forward_gates.py` prints the payoff line, the Wilson interval, the tail
-sensitivity table and the concentration summary for every run, and the
-per-day/per-mint tables with `--detail`, all as **report only**; no gate or
-threshold changes.
+### 2.5.5 What a TP trigger actually realizes
+
+The engine fires `take_profit` when the *mark* crosses +50 %, then sells at the
+next full-size quote. Those are not the same price. The live lane's four TP
+exits:
+
+| mint | mark at trigger | realized | hold |
+| --- | --- | --- | --- |
+| `9NXD…` | +51.0 % | +45.7 % | 3m43s |
+| `7LgW…` | +54.5 % | +50.0 % | 1m38s |
+| `2HHE…` | +50.4 % | +26.6 % | 4m18s |
+| `3WdJ…` | +38,400 % (one print) | **−100.0 %** | 4m04s |
+
+Net across the four: **+0.023 SOL**. Three filled 4–24 pp below their trigger.
+The fourth is the one that matters: a single print marked the mint at ~384×
+entry, TP fired, and the sell quote returned ~0 (`exit_price_sol` fell to
+~4×10⁻¹¹, `exit_quote_price_impact_pct = −99.98 %`) while `exit_liquidity_usd`
+still read **$31k**. That field is not the SOL side of the pool; rank exits by
+quoted out amount, never by reported liquidity. Two consequences:
+
+1. The +50 % rule is not a +50 % realization. Comparing it to the 5-minute
+   fallback must use realised returns, as every table above does.
+2. The tail TP was meant to avoid can still be taken **on the TP path**,
+   through a mark that cannot be sold. That is exactly the quantity the V1
+   quote guard measures. It is a reason to measure the guard, not to change a
+   frozen rule.
+
+A `no_route` write-off in the same sample (488k tokens unsold, 10 quote
+attempts, `quote_bad_request`) is counted separately by the write-off gate:
+1 in 122.
+
+`forward_gates.py` prints the payoff line, the exit-reason table, the Wilson
+interval, the tail sensitivity table and the concentration summary for every
+run, and the per-day/per-mint tables with `--detail`, all as **report only**;
+no gate or threshold changes.
 
 ---
 
@@ -543,8 +598,9 @@ this phase.
 ## 7. Reproduction
 
 ```bash
-# every row of §2.5 comes from one run directory and prints its own source:
-# rule, lane, mode, run start, trade count and last exit timestamp.
+# every row of §2.5 is a `forward_gates.py` report over stated data: the
+# provenance block prints rule, lane, mode, run start, trade count and last
+# exit timestamp, so a quoted row can be tied back to one ledger.
 env PYTHONPATH=src .venv/bin/python src/forward_gates.py \
   --run-dir output/paper/<run> --starting-sol 10 --detail
 env PYTHONPATH=src .venv/bin/python src/forward_gates.py \
@@ -563,6 +619,11 @@ env PYTHONPATH=src .venv/bin/python src/preflight_study.py --json
 env PYTHONPATH=src .venv/bin/python -m pytest -q \
   src/tests/test_cost_audit.py src/tests/test_preflight_study.py
 ```
+
+On a **running** lane `run_integrity` fails by design: `summary.json` is
+written only at shutdown, so a live directory has no final integrity verdict
+and cannot pass the acceptance gate. Its provenance and report blocks are
+still valid; read those, not the overall verdict, until the lane stops.
 
 ---
 

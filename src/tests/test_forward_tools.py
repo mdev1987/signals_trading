@@ -25,6 +25,7 @@ from forward_gates import (  # noqa: E402
     cluster_bootstrap,
     concentration_summary,
     evaluate,
+    exit_summary,
     payoff_summary,
     tail_sensitivity,
     wilson_interval,
@@ -272,6 +273,45 @@ class ConcentrationTests(unittest.TestCase):
     def test_malformed_rows_are_skipped(self) -> None:
         summary = concentration_summary([{"mint": "x", "pnl_sol": "bad"}])
         self.assertIsNone(summary)
+
+
+class ExitSummaryTests(unittest.TestCase):
+    def _row(self, reason: str | None, ret: float) -> dict[str, object]:
+        row: dict[str, object] = {"return_pct": ret, "pnl_sol": ret * 0.101}
+        if reason is not None:
+            row["exit_reason"] = reason
+        return row
+
+    def test_groups_by_reason_and_counts_trigger_failures(self) -> None:
+        summary = exit_summary(
+            [
+                self._row("horizon", 0.2),
+                self._row("horizon", -1.0),
+                self._row("take_profit", 0.5),
+                self._row("take_profit", -1.0),
+                self._row("no_route", -1.0),
+            ]
+        )
+        assert summary is not None
+        self.assertEqual(summary["total"], 5)
+        tp = summary["by_reason"]["take_profit"]
+        self.assertEqual(tp["n"], 2)
+        self.assertAlmostEqual(tp["share"], 0.4)
+        self.assertAlmostEqual(tp["mean_return"], -0.25)
+        self.assertAlmostEqual(tp["worst_return"], -1.0)
+        # A take_profit that realized -100 % is the mark-not-executable case.
+        self.assertEqual(tp["catastrophic"], 1)
+        self.assertEqual(summary["by_reason"]["horizon"]["catastrophic"], 1)
+        self.assertEqual(summary["by_reason"]["no_route"]["catastrophic"], 1)
+
+    def test_missing_reason_is_unknown(self) -> None:
+        summary = exit_summary([self._row(None, 0.1)])
+        assert summary is not None
+        self.assertEqual(list(summary["by_reason"]), ["unknown"])
+
+    def test_malformed_rows_and_empty_input(self) -> None:
+        self.assertIsNone(exit_summary([]))
+        self.assertIsNone(exit_summary([{"return_pct": "bad"}]))
 
 
 class ForwardGateTests(unittest.TestCase):

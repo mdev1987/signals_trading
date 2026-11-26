@@ -318,6 +318,43 @@ def tail_sensitivity(
     }
 
 
+def exit_summary(trades: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Outcome per exit reason, including exits whose fill contradicted the trigger.
+
+    A ``take_profit`` row that realized <= -90 % is not a winning exit with a
+    bad price: the mark crossed the threshold but the full-size sale filled
+    into a collapsed quote. Counting those separately is what separates "the
+    rule fired" from "the rule was executable". A catastrophic horizon or
+    ``no_route`` exit is a real collapse or a write-off, not a trigger failure.
+    Report only.
+    """
+    groups: dict[str, list[float]] = defaultdict(list)
+    for row in trades:
+        try:
+            value = float(row["return_pct"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        groups[str(row.get("exit_reason") or "unknown")].append(value)
+    if not groups:
+        return None
+
+    total = sum(len(values) for values in groups.values())
+    by_reason: dict[str, dict[str, Any]] = {}
+    for reason in sorted(groups):
+        values = groups[reason]
+        by_reason[reason] = {
+            "n": len(values),
+            "share": len(values) / total,
+            "mean_return": float(np.mean(values)),
+            "median_return": float(np.median(values)),
+            "worst_return": min(values),
+            "catastrophic": sum(1 for value in values if value <= -0.9),
+        }
+    return {"total": total, "by_reason": by_reason}
+
+
 def concentration_summary(trades: list[dict[str, Any]]) -> dict[str, Any] | None:
     """How much of the ledger rests on a few days and a few mints.
 
@@ -525,6 +562,7 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
 
     payoff = payoff_summary(pnls, returns)
     tail = tail_sensitivity(returns, pnls)
+    exits = exit_summary(valid_trades)
     concentration = concentration_summary(valid_trades)
 
     skip_counts: dict[str, int] = defaultdict(int)
@@ -675,6 +713,7 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         "malformed_trades": malformed_trades,
         "skip_reason_counts": dict(sorted(skip_counts.items())),
         "payoff": payoff,
+        "exits": exits,
         "tail_sensitivity": tail,
         "concentration": concentration,
         "gates": gates,
@@ -745,6 +784,19 @@ def main(argv: list[str] | None = None) -> int:
                     f"{ci['low'] * 100:.1f}%-{ci['high'] * 100:.1f}%; "
                     "clustered launches make the true interval wider"
                 )
+        exits = result.get("exits")
+        if exits:
+            print("exits (report only):")
+            for reason, block in exits["by_reason"].items():
+                line = (
+                    f"  {reason:12s} n={block['n']:4d} "
+                    f"({block['share'] * 100:5.1f}%) "
+                    f"mean={block['mean_return'] * 100:+6.2f}% "
+                    f"worst={block['worst_return'] * 100:+7.2f}%"
+                )
+                if block["catastrophic"]:
+                    line += f" catastrophic={block['catastrophic']}"
+                print(line)
         tail = result.get("tail_sensitivity")
         if tail and tail.get("rows"):
             print("tail sensitivity (report only, non-tail payoff held fixed):")

@@ -74,6 +74,31 @@ Limits, all of which are why this is an experiment:
   +29.6 SOL versus −5.11 for the fixed exit, so the take-profit deliberately
   gives up most of that ceiling in exchange for a smaller left tail.
 
+### First forward evidence (still inside the sample window)
+
+As of 2026-11-26 04:07 UTC the live lane had 122 closes: 98 W / 24 L,
+−0.0365 SOL, 23 catastrophic (18.9 %), 1 write-off, and a −0.25 pp margin over
+its 80.6 % break-even. Gates 1 and 2 are still open (122 < 300 trades,
+2 < 5 days; bootstrap P(PnL>0) = 0.48, 5th percentile −0.94 SOL), so none of
+this is decision-grade.
+
+Four trades exited by this rule rather than at the horizon:
+
+| mark at trigger | realized | note |
+| --- | --- | --- |
+| +51.0 % | +45.7 % | |
+| +54.5 % | +50.0 % | |
+| +50.4 % | +26.6 % | quote moved between trigger and fill |
+| +38,400 % (one print) | **−100.0 %** | sell quote returned ~0 at $31k reported liquidity |
+
+The last row is the structural warning: a TP trigger is a **mark**, and the sale
+is priced by the next full-size Jupiter quote, so an unexecutable spike still
+produces a −100 % trade on this path. "TP fired" is not "TP realized". The
+live lane's margin has already read −0.7 pp (n=104), +1.1 pp (n=120) and
+−0.25 pp (n=122) on the same rule, inside two hours; the last leg was two
+catastrophic tails. Read the gate, not the snapshot. See
+[`EXECUTION_RESEARCH.md`](EXECUTION_RESEARCH.md) §2.5.5.
+
 ## Pre-registered acceptance gate
 
 Fixed before the first trade. Evaluated on the lane's own forward sample only;
