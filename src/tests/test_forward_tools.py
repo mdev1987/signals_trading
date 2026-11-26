@@ -744,5 +744,110 @@ class ForwardGateTests(unittest.TestCase):
         self.assertFalse(result["passed"])
 
 
+class ProvenanceTests(unittest.TestCase):
+    """A reported row must name the ledger it was computed from.
+
+    The lane table in ``docs/EXECUTION_RESEARCH.md`` is only reproducible if
+    every row carries the run directory, the rule/lane and the last close it
+    was computed from. Without that, two snapshots of a running lane look
+    interchangeable while differing by more than the margin over break-even.
+    """
+
+    def _write_run(
+        self,
+        root: Path,
+        *,
+        trades: int,
+        meta: dict | None,
+        last_exit: datetime | None = None,
+    ) -> None:
+        start = datetime(2026, 11, 25, 12, tzinfo=UTC)
+        rows = []
+        for index in range(trades):
+            when = last_exit or (start + timedelta(minutes=index))
+            rows.append(
+                json.dumps(
+                    {
+                        "mint": f"mint-{index}",
+                        "exit_ts_ms": int(when.timestamp() * 1000),
+                        "pnl_sol": 0.01,
+                        "return_pct": 0.1,
+                        "exit_status": "horizon_complete",
+                        "unsold_size": 0.0,
+                    }
+                )
+            )
+        (root / "trades.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        if meta is not None:
+            (root / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    def test_provenance_pins_rule_lane_and_last_exit(self) -> None:
+        last_exit = datetime(2026, 11, 26, 2, 25, 59, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(
+                root,
+                trades=4,
+                meta={
+                    "rule": "scanner_pumpfun_amm_tp50",
+                    "lane": "A",
+                    "mode": "live_paper",
+                    "entry_mode": "trade",
+                    "started_at": "2026-11-25T12:16:07+00:00",
+                    "recovery_status": "recovered",
+                    "integrity_at_start": "VALID",
+                },
+                last_exit=last_exit,
+            )
+            result = evaluate(root)
+        provenance = result["provenance"]
+        self.assertEqual(provenance["run_dir"], str(root))
+        self.assertEqual(provenance["rule"], "scanner_pumpfun_amm_tp50")
+        self.assertEqual(provenance["lane"], "A")
+        self.assertEqual(provenance["mode"], "live_paper")
+        self.assertEqual(provenance["recovery_status"], "recovered")
+        self.assertTrue(provenance["meta_present"])
+        self.assertEqual(provenance["trades"], 4)
+        self.assertEqual(
+            provenance["last_exit_ts_ms"], int(last_exit.timestamp() * 1000)
+        )
+        self.assertEqual(
+            provenance["last_exit_at"], last_exit.isoformat()
+        )
+        # The stamp travels with the JSON the doc quotes from.
+        self.assertEqual(provenance["generated_at"], result["generated_at"])
+
+    def test_provenance_survives_a_missing_meta_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=2, meta=None)
+            result = evaluate(root)
+        provenance = result["provenance"]
+        self.assertFalse(provenance["meta_present"])
+        self.assertIsNone(provenance["rule"])
+        self.assertIsNone(provenance["lane"])
+        # The ledger half is still pinned, so a source-less row is obvious.
+        self.assertEqual(provenance["trades"], 2)
+        self.assertIsNotNone(provenance["last_exit_at"])
+
+    def test_corrupt_exit_timestamps_do_not_drop_the_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_run(root, trades=3, meta=None)
+            rows = [
+                json.loads(line)
+                for line in (root / "trades.jsonl").read_text().splitlines()
+            ]
+            rows[0]["exit_ts_ms"] = "not-a-timestamp"
+            (root / "trades.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            result = evaluate(root)
+        provenance = result["provenance"]
+        self.assertEqual(provenance["trades"], 3)
+        self.assertIsNotNone(provenance["last_exit_at"])
+
+
 if __name__ == "__main__":
     unittest.main()

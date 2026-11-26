@@ -137,6 +137,29 @@ def _day(ts_ms: Any) -> str | None:
         return None
 
 
+def _timestamp(ts_ms: Any) -> str | None:
+    try:
+        return datetime.fromtimestamp(int(ts_ms) / 1000, UTC).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _exit_ts_bounds(trades: list[dict[str, Any]]) -> tuple[int | None, int | None]:
+    """First and last ``exit_ts_ms`` in the ledger.
+
+    The bounds pin a reported row to the trades it was computed from: two
+    snapshots of the same running lane differ in PnL and in their ratios, so a
+    row without its last close cannot be reproduced.
+    """
+    values: list[int] = []
+    for row in trades:
+        try:
+            values.append(int(row["exit_ts_ms"]))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return (min(values), max(values)) if values else (None, None)
+
+
 def cluster_bootstrap(
     pnls: list[float],
     mints: list[str],
@@ -622,9 +645,29 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
     }
 
     passed = all(gate["passed"] for gate in gates.values())
+    generated_at = datetime.now(UTC).isoformat()
+    first_exit_ms, last_exit_ms = _exit_ts_bounds(trades)
+    provenance = {
+        "run_dir": str(run_dir),
+        "generated_at": generated_at,
+        "meta_present": meta is not None,
+        "rule": meta.get("rule") if meta else None,
+        "lane": meta.get("lane") if meta else None,
+        "mode": meta.get("mode") if meta else None,
+        "entry_mode": meta.get("entry_mode") if meta else None,
+        "started_at": meta.get("started_at") if meta else None,
+        "resumed_at": meta.get("resumed_at") if meta else None,
+        "recovery_status": meta.get("recovery_status") if meta else None,
+        "trades": len(trades),
+        "first_exit_ts_ms": first_exit_ms,
+        "last_exit_ts_ms": last_exit_ms,
+        "first_exit_at": _timestamp(first_exit_ms),
+        "last_exit_at": _timestamp(last_exit_ms),
+    }
     return {
         "run_dir": str(run_dir),
-        "generated_at": datetime.now(UTC).isoformat(),
+        "generated_at": generated_at,
+        "provenance": provenance,
         "starting_sol": starting_sol,
         "trades": len(trades),
         "days": days,
@@ -656,9 +699,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
+        provenance = result.get("provenance") or {}
         print(f"run: {result['run_dir']}")
         print(
-            f"trades: {result['trades']} over {len(result['days'])} days"
+            f"provenance: rule={provenance.get('rule') or '?'} "
+            f"lane={provenance.get('lane') or '?'} "
+            f"mode={provenance.get('mode') or '?'} "
+            f"entry={provenance.get('entry_mode') or '?'}"
+        )
+        print(
+            f"  started={provenance.get('started_at') or '?'} "
+            f"recovery={provenance.get('recovery_status') or '?'} "
+            f"meta={'present' if provenance.get('meta_present') else 'missing'}"
+        )
+        print(
+            f"  trades={result['trades']} over {len(result['days'])} days; "
+            f"last exit={provenance.get('last_exit_at') or 'n/a'}; "
+            f"generated={provenance.get('generated_at') or '?'}"
         )
         for name, gate in result["gates"].items():
             mark = "PASS" if gate["passed"] else "FAIL"

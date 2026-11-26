@@ -142,8 +142,11 @@ entries unchanged) in [`EXIT_POLICY_STUDY.md`](EXIT_POLICY_STUDY.md):
 - **V2 — winner extension / dynamic hold: rejected.** Holding to 15 minutes
   costs −37 SOL; extending in 30 s steps while price stays above entry costs
   −36 to −37 SOL. 60.7 % of pools have no print at 15 minutes.
-- **V3 — stricter entry-side exit depth (0.95×/0.98×): untested.** It is an
-  entry filter, so it needs its own lane and its own pre-registered run.
+- **V3 — stricter entry-side exit depth (0.95×/0.98×): rejected before a lane.**
+  The feasibility screen in `docs/EXECUTION_RESEARCH.md` §3 shows `0.95` sits
+  below the fee floor and rejects nothing, `0.98` rejects 94.8 % of entries
+  while leaving a 33 % catastrophic rate among survivors, and the ratio itself
+  is not predictive (AUC 0.458). No V3 lane will be built.
 
 The only positive policy in the study was selling everything at +50 %
 (+1.76 SOL). It is three trades: the best 1 % of trades supply 144 % of its

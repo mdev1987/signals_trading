@@ -47,7 +47,10 @@ Four results, in order of decision value:
    win rate at its own payoff (+24.4 % / −92.1 %) is 79.0 %: a margin of
    **0.7 pp**. The tail rate is 18.6 % (Wilson 16.2–21.3 %) against a
    break-even of 19.3 %; **one extra point of tail rate costs 1.1 SOL**, more
-   than the whole profit. The tp50 lane is 1.7 pp *below* its break-even. The
+   than the whole profit. The live tp50 lane sits **0.7 pp below** its own
+   break-even (104 verified closes), or 1.5 pp below if the next close is a
+   tail — the same one-trade-wide noise band, not a separable difference. It
+   has not yet triggered its own rule: **0 TP exits in 104 closes**. The
    win rate is the least informative number in the report (§2.5).
 
 What follows is the pre-registration for the parts that remain, and the
@@ -194,19 +197,36 @@ average win:
 break-even win rate = |avg loss| / (avg win + |avg loss|)
 ```
 
-| lane | n | win | avg win | avg loss | break-even win | margin | PnL | P(PnL>0) |
+| sample | n | win | avg win | avg loss | break-even win | margin | PnL | P(PnL>0) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `scanner_pumpfun_amm` (fixed) | 870 | 79.8 % | +24.4 % | −92.1 % | 79.0 % | **+0.7 pp** | +0.757 | 0.69 |
-| `scanner_pumpfun_amm_tp50` | 105 | 79.0 % | +23.0 % | −96.7 % | 80.8 % | **−1.7 pp** | −0.222 | 0.34 |
+| `scanner_pumpfun_amm` (fixed), host ledger 11-22 → 11-25 | 870 | 79.8 % | +24.4 % | −92.1 % | 79.0 % | **+0.7 pp** | +0.757 | 0.69 |
+| `scanner_pumpfun_amm_tp50`, **separate cohort** (source run not recorded) | 105 | 79.0 % | +23.0 % | −96.7 % | 80.8 % | **−1.7 pp** | −0.222 | 0.34 |
+| `scanner_pumpfun_amm_tp50`, **live lane** to 11-26 02:25 UTC | 104 | 79.8 % | +23.4 % | −96.6 % | 80.5 % | **−0.7 pp** | −0.090 | 0.44 |
 
-Snapshot 2026-11-26, while the tp50 lane is still running (it gains trades
-between evaluations; the fixed lane is closed). The tp50 lane is exactly
-the case being asked about: 79 % of trades win, and the ledger is negative,
-because the lane sits **1.7 pp below break-even**. The fixed lane sits 0.7 pp
-above it — inside the noise. Dropping any single run from the fixed lane gives
-a leave-one-run-out margin of **−0.2 to +1.5 pp** and PnL of **−0.160 to
-+1.440 SOL**; one of the six subsets is negative. The edge is therefore real in
-sign but not separable from zero at this sample size.
+**Provenance.** Each row is only decision-grade with the data that produced
+it. `forward_gates.py` now stamps its JSON and its human report with a
+`provenance` block — run directory, rule, lane, mode, run start, recovery
+status, trade count, and the first/last `exit_ts_ms` — so a quoted row can be
+tied back to one `trades.jsonl`. The live row above was regenerated from the
+lane's Telegram card ledger: 104 closes, 83 W / 21 L, 20 tails, last exit
+2026-11-26 02:25:59 UTC, every card's running total reconciling with the sum
+of its printed PnL. The 105-trade row is a **separate cohort whose source run
+directory was not recorded**; an earlier draft of this table presented it as
+the running lane, which it is not (it contains three TP exits — the live lane
+has none). It is kept only because it is the one sample in which the TP rule
+actually fired. **A row without a stated source and last close is not
+evidence** — two snapshots of the same running lane differ by more than the
+margin over break-even.
+
+The tp50 case is the one worth stating plainly: 79 % of trades win and the
+ledger is still negative, because the lane sits about **0.7 pp below
+break-even** — inside the same noise band as the fixed lane's +0.7 pp. The
+fixed lane's leave-one-run-out margin is **−0.2 to +1.5 pp** with PnL
+**−0.160 to +1.440 SOL**; one of six subsets is negative. Neither lane's edge
+is separable from zero at this sample size, and the live tp50 lane's verdict
+is "indistinguishable from the frozen lane so far", not "1.7 pp worse": it has
+**0 TP triggers in 104 closes**, because no mark reached +50 % before the
+horizon.
 
 The small-loss band is only **1.6 %** of trades (79.8 % wins + 18.6 %
 catastrophic = 98.4 %), so the win rate is almost exactly
@@ -234,9 +254,11 @@ Two caveats on the interval:
   average loss (−92.1 %, small losers included) while this one assumes every
   catastrophe is total. The tail-rate version is the conservative one.
 
-The tp50 lane: 20.0 % tail (13.5 % – 28.6 % Wilson) against a break-even of
-18.3 % — the interval straddles break-even, and its point estimate is already
-on the wrong side.
+The tp50 separate cohort: 20.0 % tail (13.5 % – 28.6 % Wilson) against a
+break-even of 18.3 %. The live tp50 lane: 19.2 % tail, 20 in 104 (12.8 % –
+27.9 % Wilson), against a break-even of 18.5 %. In both the interval straddles
+break-even and the point estimate is on the wrong side by less than one tail;
+that is a warning, not a measurement.
 
 ### 2.5.2 Tail-rate sensitivity
 
@@ -244,17 +266,19 @@ Holding the observed non-tail payoff fixed (`m = +23.9 %`) and replacing trades
 at random with the observed catastrophe (`t = −99.9 %`), expectancy is
 `(1−q)·m + q·t`:
 
-| tail rate | fixed lane | tp50 lane |
-| --- | --- | --- |
-| observed (18.6 % / 20.0 %) | **+0.86 %**/trade (+0.757 SOL) | −2.09 %/trade (−0.222 SOL) |
-| +1 pp | −0.38 %/trade (−0.334 SOL) | −3.31 %/trade (−0.352 SOL) |
-| +2 pp | −1.62 %/trade (−1.425 SOL) | −4.53 %/trade (−0.482 SOL) |
-| +3 pp | −2.86 %/trade (−2.516 SOL) | −5.75 %/trade (−0.611 SOL) |
-| break-even | 19.3 % | 18.3 % |
+| tail rate | fixed lane (870) | tp50 cohort (105) | tp50 live lane (104) |
+| --- | --- | --- | --- |
+| observed (18.6 / 20.0 / 19.2 %) | **+0.86 %**/trade (+0.757 SOL) | −2.09 %/trade (−0.222 SOL) | −0.86 %/trade (−0.090 SOL) |
+| +1 pp | −0.38 %/trade (−0.334 SOL) | −3.31 %/trade (−0.352 SOL) | −2.08 %/trade (−0.219 SOL) |
+| +2 pp | −1.62 %/trade (−1.425 SOL) | −4.53 %/trade (−0.482 SOL) | −3.31 %/trade (−0.349 SOL) |
+| +3 pp | −2.86 %/trade (−2.516 SOL) | −5.75 %/trade (−0.611 SOL) | −4.53 %/trade (−0.478 SOL) |
+| break-even | 19.3 % | 18.3 % | 18.5 % |
 
 One extra point of tail rate costs about **1.1 SOL per 870 trades** — more than
 the entire recorded profit. The fixed lane is profitable in exactly one
-0.7-pp-wide band.
+0.7-pp-wide band. The live tp50 ledger (`m = +22.7 %`, `t = −99.8 %`, 10.5 SOL
+book) has the same width: one extra point costs **0.13 SOL per 104 trades**,
+more than the lane's current loss of 0.090 SOL.
 
 ### 2.5.3 Concentration: days and mints
 
@@ -272,9 +296,12 @@ Fixed lane, four days (11-22 → 11-25):
 best single mint (+0.242) is a third of the profit — without it the lane is
 +0.515 SOL. The positive result is one good day plus one good mint.
 
-The tp50 lane is worse on every one of these axes: 1 of 2 days profitable, the
-profitable day (11-26, +0.021) is **negative without its best trade**, and
-removing the best mint turns the lane from −0.222 to −0.273 SOL.
+The tp50 samples are worse on every one of these axes. Separate cohort: 1 of 2
+days profitable, the profitable day (11-26, +0.021) is **negative without its
+best trade**, and removing the best mint turns the lane from −0.222 to −0.273
+SOL. Live lane: 1 of 2 profitable days, 11-26 at +0.018 is **negative without
+its best trade** (−0.023), and without the best mint the lane goes from −0.090
+to −0.141 SOL. In both, whatever profit exists is one day and one mint.
 
 **pp convention.** "pp" here means percentage points of traded notional
 (median **0.101 SOL** per trade), not of starting capital. On the 88 SOL
@@ -300,10 +327,13 @@ signal set while also rejecting some winners is worth far less, and the
 preflight work (§3.3) already shows the available ratio has no predictive
 power (AUC 0.458).
 
-The tp50 variant is **not** disproven by its −0.222 SOL: TP fired 3 times for
-+0.124 SOL, the non-TP mean is −3.39 %, and its tail rate (20.0 %) is worse
-than the fixed lane's (18.6 %) because it ran on a different cohort. At n=105
-it is not evidence either way.
+The tp50 variant is **not** disproven by either sample. In the separate
+cohort TP fired 3 times for +0.124 SOL (non-TP mean −3.39 %). In the live lane it
+fired **0 times in 104 closes**, so the deployed lane has not yet exercised
+its own rule and is behaviourally the frozen lane. At n=105 / n=104 neither
+sample is evidence for or against the +50 % exit; the live lane becomes
+informative only once TP has actually fired, or once enough trades have
+accrued to narrow the tail interval below the 1-pp margin.
 
 `forward_gates.py` prints the payoff line, the Wilson interval, the tail
 sensitivity table and the concentration summary for every run, and the
@@ -472,13 +502,19 @@ feature is not a candidate.
 
 ### 5.3 Data prerequisites
 
-Not yet satisfied, and the honest blocker:
+Partly satisfied. The parsing half landed; the collection half has not.
 
-- `TradeEvent` carries no reserves; `parse_pump_event` drops `tokensInPool`,
-  `quoteInPool` and the virtual reserves.
+- **Done** (`a94db30`): `TradeEvent` and `parse_pump_event` now carry the
+  post-event reserves (`tokens_in_pool`, `quote_in_pool`, the virtual reserves
+  and the pool/route fee rates), and `paper_bot.pool_health` turns them into a
+  constant-product `ReserveState` with `sell_quote_sol()` and `classify_exit()`.
+  Nothing in the engine imports it yet; it is observational only.
+- **Still missing:** a writer. No code appends `snapshots.jsonl`, so the
+  dataset is not being collected by the running lane.
 - `entry_liquidity_usd` is populated on **2 of 197** pre-existing entries.
-- No historical snapshot file exists, so the dataset must be collected forward
-  or replayed from raw archives on the research host.
+- No historical snapshot file exists — the parser arrived after the recorded
+  runs — so the dataset must be collected forward or replayed from raw
+  archives on the research host.
 
 ---
 
@@ -507,6 +543,13 @@ this phase.
 ## 7. Reproduction
 
 ```bash
+# every row of §2.5 comes from one run directory and prints its own source:
+# rule, lane, mode, run start, trade count and last exit timestamp.
+env PYTHONPATH=src .venv/bin/python src/forward_gates.py \
+  --run-dir output/paper/<run> --starting-sol 10 --detail
+env PYTHONPATH=src .venv/bin/python src/forward_gates.py \
+  --run-dir output/paper/<run> --starting-sol 10 --json
+
 # cost decomposition over every recorded run
 env PYTHONPATH=src .venv/bin/python src/cost_audit.py
 env PYTHONPATH=src .venv/bin/python src/cost_audit.py --json
