@@ -21,7 +21,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from compare_channels import deployed_scanner_rule  # noqa: E402
-from forward_gates import cluster_bootstrap, evaluate  # noqa: E402
+from forward_gates import cluster_bootstrap, evaluate, payoff_summary  # noqa: E402
 from paper_bot.models import canonical_quote_notional_sol  # noqa: E402
 
 WSOL = "So11111111111111111111111111111111111111112"
@@ -131,6 +131,51 @@ class ScannerRuleTests(unittest.TestCase):
         self.assertTrue((result["liquidity_usd"] < 100_000).all())
 
 
+class PayoffSummaryTests(unittest.TestCase):
+    def test_break_even_win_rate_tracks_the_payoff(self) -> None:
+        summary = payoff_summary(
+            [0.02, 0.02, 0.02, 0.02, -0.1],
+            [0.2, 0.2, 0.2, 0.2, -1.0],
+        )
+        assert summary is not None
+        self.assertAlmostEqual(summary["win_rate"], 0.8)
+        self.assertAlmostEqual(summary["avg_win_return"], 0.2)
+        self.assertAlmostEqual(summary["avg_loss_return"], -1.0)
+        # 1.0 / (0.2 + 1.0): an 80 % win rate is below break-even here.
+        self.assertAlmostEqual(summary["break_even_win_rate"], 1.0 / 1.2)
+        self.assertAlmostEqual(summary["win_rate_margin"], 0.8 - 1.0 / 1.2)
+        self.assertTrue(summary["win_rate_margin"] < 0)
+
+    def test_high_win_rate_can_still_have_negative_pnl(self) -> None:
+        # 4 small wins, 1 total loss: 80 % wins, negative total.
+        summary = payoff_summary(
+            [0.02, 0.02, 0.02, 0.02, -0.1],
+            [0.2, 0.2, 0.2, 0.2, -1.0],
+        )
+        assert summary is not None
+        self.assertAlmostEqual(summary["pnl_sol"], -0.02)
+        self.assertLess(summary["pnl_sol"], 0)
+
+    def test_concentration_reports_pnl_without_the_best_trades(self) -> None:
+        summary = payoff_summary(
+            [0.5, 0.02, 0.02, -0.1],
+            [5.0, 0.2, 0.2, -1.0],
+        )
+        assert summary is not None
+        self.assertAlmostEqual(summary["pnl_sol"], 0.44)
+        self.assertAlmostEqual(summary["pnl_without_best_1_sol"], -0.06)
+        self.assertAlmostEqual(summary["pnl_without_best_3_sol"], -0.1)
+
+    def test_no_losses_has_zero_break_even(self) -> None:
+        summary = payoff_summary([0.01, 0.01], [0.1, 0.1])
+        assert summary is not None
+        self.assertEqual(summary["break_even_win_rate"], 0.0)
+        self.assertAlmostEqual(summary["win_rate_margin"], 1.0)
+
+    def test_empty_returns_is_none(self) -> None:
+        self.assertIsNone(payoff_summary([], []))
+
+
 class ForwardGateTests(unittest.TestCase):
     def test_bootstrap_does_not_split_trades_from_one_mint(self) -> None:
         # One cluster: every resample must contain both legs, so the total is
@@ -192,6 +237,9 @@ class ForwardGateTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertGreater(result["gates"]["realized_pnl"]["pnl_sol"], 0)
         self.assertEqual(result["gates"]["catastrophic_exits"]["count"], 0)
+        # Report-only: the payoff block is present and agrees with the ledger.
+        self.assertAlmostEqual(result["payoff"]["win_rate"], 1.0)
+        self.assertAlmostEqual(result["payoff"]["pnl_sol"], 3.0)
 
     def test_catastrophic_tail_fails_even_when_total_is_positive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

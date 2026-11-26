@@ -115,6 +115,41 @@ def cluster_bootstrap(
     }
 
 
+def payoff_summary(
+    pnls: list[float], returns: list[float]
+) -> dict[str, Any] | None:
+    """Win rate against the payoff it has to overcome.
+
+    A high win rate is compatible with a negative ledger when the average loss
+    is several times the average win. The break-even win rate is
+    ``|avg loss| / (avg win + |avg loss|)``; the margin is the observed win
+    rate minus it. This block is report-only and never changes a gate.
+    """
+    if not returns:
+        return None
+    wins = [value for value in returns if value > 0]
+    losses = [value for value in returns if value <= 0]
+    tails = [value for value in returns if value <= -0.9]
+    win_rate = len(wins) / len(returns)
+    avg_win = float(np.mean(wins)) if wins else 0.0
+    avg_loss = float(np.mean(losses)) if losses else 0.0
+    denominator = avg_win + abs(avg_loss)
+    break_even = (abs(avg_loss) / denominator) if denominator > 0 else None
+    total = sum(pnls)
+    ranked = sorted(pnls, reverse=True)
+    return {
+        "win_rate": win_rate,
+        "break_even_win_rate": break_even,
+        "win_rate_margin": (win_rate - break_even) if break_even is not None else None,
+        "avg_win_return": avg_win,
+        "avg_loss_return": avg_loss,
+        "catastrophic_rate": len(tails) / len(returns),
+        "pnl_sol": total,
+        "pnl_without_best_1_sol": sum(ranked[1:]),
+        "pnl_without_best_3_sol": sum(ranked[3:]),
+    }
+
+
 def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
     trades, corrupt_trades = _read_jsonl(run_dir / "trades.jsonl")
     skips, corrupt_skips = _read_jsonl(run_dir / "skips.jsonl")
@@ -232,6 +267,8 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         "detail": f"{catastrophic}/{len(trades)} <= {MAX_CATASTROPHIC_RATE}",
     }
 
+    payoff = payoff_summary(pnls, returns)
+
     skip_counts: dict[str, int] = defaultdict(int)
     for row in skips:
         skip_counts[str(row.get("reason") or "unknown")] += 1
@@ -322,6 +359,7 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         "corrupt_rows": corrupt_rows,
         "malformed_trades": malformed_trades,
         "skip_reason_counts": dict(sorted(skip_counts.items())),
+        "payoff": payoff,
         "gates": gates,
         "passed": passed,
         "coverage_met": coverage_ok,
@@ -347,6 +385,23 @@ def main(argv: list[str] | None = None) -> int:
             mark = "PASS" if gate["passed"] else "FAIL"
             print(f"[{mark}] {name}: {gate['detail']}")
         print(f"overall: {'PASS' if result['passed'] else 'FAIL'}")
+        payoff = result.get("payoff")
+        if payoff:
+            break_even = payoff["break_even_win_rate"]
+            margin = payoff["win_rate_margin"]
+            break_even_text = "  n/a" if break_even is None else f"{break_even * 100:.1f}%"
+            margin_text = "  n/a" if margin is None else f"{margin * 100:+.1f}"
+            print(
+                f"payoff (report only): win={payoff['win_rate'] * 100:.1f}% "
+                f"break-even={break_even_text} margin={margin_text} pp; "
+                f"avg win={payoff['avg_win_return'] * 100:+.1f}% "
+                f"avg loss={payoff['avg_loss_return'] * 100:+.1f}% "
+                f"cat={payoff['catastrophic_rate'] * 100:.1f}%"
+            )
+            print(
+                f"  PnL={payoff['pnl_sol']:+.4f} "
+                f"without best 3={payoff['pnl_without_best_3_sol']:+.4f} SOL"
+            )
         if result["skip_reason_counts"]:
             print("skips:")
             for reason, count in result["skip_reason_counts"].items():

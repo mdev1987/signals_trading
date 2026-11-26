@@ -176,6 +176,52 @@ ATA rent is `0.00204 SOL` per trade if the account is neither reused nor
 closed: **1.95 SOL locked** across 954 trades. It is recoverable capital, not
 an expense, but it is real working capital at 0.1 SOL/trade.
 
+### 2.5 Why a 79 % win rate is compatible with a negative ledger
+
+The recurring observation — median trade +20 %, win rate 79 %, PnL negative —
+is arithmetically consistent, because the average loss is about **3.8×** the
+average win:
+
+```
+break-even win rate = |avg loss| / (avg win + |avg loss|)
+```
+
+| lane | n | win | avg win | avg loss | break-even win | margin | PnL | P(PnL>0) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `scanner_pumpfun_amm` (fixed) | 870 | 79.8 % | +24.4 % | −92.1 % | 79.0 % | **+0.7 pp** | +0.757 | 0.69 |
+| `scanner_pumpfun_amm_tp50` | 100 | 79.0 % | +23.1 % | −96.6 % | 80.7 % | **−1.7 pp** | −0.209 | 0.34 |
+
+The tp50 lane is exactly the case being asked about: 79 % of trades win, and
+the ledger is negative, because the lane sits **1.7 pp below break-even**. The
+fixed lane sits 0.7 pp above it — inside the noise. Dropping any single run
+from the fixed lane gives a leave-one-run-out margin of **−0.2 to +1.5 pp** and
+PnL of **−0.160 to +1.440 SOL**; one of the six subsets is negative. The edge
+is therefore real in sign but not separable from zero at this sample size.
+
+The small-loss band is only **1.6 %** of trades (79.8 % wins + 18.6 %
+catastrophic = 98.4 %), so the win rate is almost exactly
+`1 − catastrophic rate`. Reporting both is redundant; the only informative
+number is the margin over break-even.
+
+Consequences (870 trades ≈ 88 SOL notional at 0.10 SOL/trade):
+
+- A **0.7 pp rise** in the tail rate — about 6 more catastrophes in 870
+  trades — erases the fixed lane's whole edge. The observed day-to-day rate
+  already spans 17.9–20.8 %, so this is inside normal variation.
+- Reaching the frozen **16 %** tail gate is worth about **+2.6 pp** of margin,
+  ≈ +2.3 SOL per 870 trades (upper bound: assumes each avoided tail exits flat
+  instead of −100 %).
+- A **1.5 pp** round-trip cost cut is worth about **+1.3 SOL** per 870 trades,
+  and it is the only one of the three that can be measured today (§2.4).
+
+The tp50 variant is **not** disproven by its −0.209 SOL: TP fired 3 times for
++0.124 SOL, the non-TP mean is −3.39 %, and its tail rate (20.0 %) is worse
+than the fixed lane's (18.6 %) because it ran on a different cohort. At n=100
+it is not evidence either way.
+
+`forward_gates.py` now prints this payoff line for every run as **report only**;
+it does not change any gate or threshold.
+
 ---
 
 ## 3. Measured: preflight exit depth (V3 feasibility screen)
