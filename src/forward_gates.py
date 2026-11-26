@@ -115,6 +115,32 @@ def cluster_bootstrap(
     }
 
 
+def wilson_interval(
+    successes: int, total: int, *, z: float = 1.96
+) -> dict[str, float] | None:
+    """Wilson score interval for one proportion.
+
+    Trades are *not* independent — several share a launch hour and a market
+    regime — so this interval is optimistic by construction. It is reported to
+    bound sampling noise, not to certify the tail rate.
+    """
+    if total <= 0:
+        return None
+    p = successes / total
+    denominator = 1.0 + (z * z) / total
+    centre = (p + (z * z) / (2.0 * total)) / denominator
+    half = (
+        z * math.sqrt(p * (1.0 - p) / total + (z * z) / (4.0 * total * total))
+    ) / denominator
+    return {
+        "p": p,
+        "low": max(0.0, centre - half),
+        "high": min(1.0, centre + half),
+        "z": z,
+        "n": float(total),
+    }
+
+
 def payoff_summary(
     pnls: list[float], returns: list[float]
 ) -> dict[str, Any] | None:
@@ -130,11 +156,20 @@ def payoff_summary(
     wins = [value for value in returns if value > 0]
     losses = [value for value in returns if value <= 0]
     tails = [value for value in returns if value <= -0.9]
+    non_tails = [value for value in returns if value > -0.9]
     win_rate = len(wins) / len(returns)
     avg_win = float(np.mean(wins)) if wins else 0.0
     avg_loss = float(np.mean(losses)) if losses else 0.0
     denominator = avg_win + abs(avg_loss)
     break_even = (abs(avg_loss) / denominator) if denominator > 0 else None
+    # Per-trade expectancy as a function of the tail rate: (1 - q) * m + q * t.
+    non_tail_mean = float(np.mean(non_tails)) if non_tails else None
+    tail_mean = float(np.mean(tails)) if tails else -1.0
+    break_even_tail = (
+        non_tail_mean / (non_tail_mean - tail_mean)
+        if non_tail_mean is not None and (non_tail_mean - tail_mean) > 0
+        else None
+    )
     total = sum(pnls)
     ranked = sorted(pnls, reverse=True)
     return {
@@ -144,9 +179,116 @@ def payoff_summary(
         "avg_win_return": avg_win,
         "avg_loss_return": avg_loss,
         "catastrophic_rate": len(tails) / len(returns),
+        "catastrophic_rate_ci": wilson_interval(len(tails), len(returns)),
+        "non_tail_mean_return": non_tail_mean,
+        "tail_mean_return": tail_mean,
+        "break_even_tail_rate": break_even_tail,
         "pnl_sol": total,
         "pnl_without_best_1_sol": sum(ranked[1:]),
         "pnl_without_best_3_sol": sum(ranked[3:]),
+    }
+
+
+def tail_sensitivity(
+    returns: list[float],
+    pnls: list[float],
+    *,
+    steps: tuple[float, ...] = (0.0, 0.01, 0.02, 0.03),
+) -> dict[str, Any] | None:
+    """Expectancy if the tail rate rises by a few percentage points.
+
+    Holds the observed non-tail payoff fixed and replaces trades at random with
+    the observed average catastrophe. ``expected_pnl_sol`` rescales this run's
+    book by the ratio of expected to observed mean return, which assumes a
+    constant notional per trade. Report only.
+    """
+    summary = payoff_summary(pnls, returns)
+    if summary is None:
+        return None
+    q_hat = summary["catastrophic_rate"]
+    non_tail_mean = summary["non_tail_mean_return"]
+    tail_mean = summary["tail_mean_return"]
+    break_even = summary["break_even_tail_rate"]
+    if non_tail_mean is None or tail_mean is None:
+        return None
+    observed_mean = float(np.mean(returns))
+    observed_pnl = float(sum(pnls))
+    scale = observed_pnl / observed_mean if abs(observed_mean) > 1e-9 else None
+
+    def row(rate: float) -> dict[str, float | None]:
+        bounded = min(rate, 1.0)
+        mean_return = (1.0 - bounded) * non_tail_mean + bounded * tail_mean
+        expected = scale * mean_return if scale is not None else None
+        return {
+            "tail_rate": bounded,
+            "mean_return": mean_return,
+            "expected_pnl_sol": expected,
+        }
+
+    rows = [row(q_hat + step) for step in steps]
+    if break_even is not None and break_even <= 1.0:
+        rows.append(row(break_even))
+    return {
+        "observed_tail_rate": q_hat,
+        "non_tail_mean_return": non_tail_mean,
+        "tail_mean_return": tail_mean,
+        "break_even_tail_rate": break_even,
+        "rows": rows,
+    }
+
+
+def concentration_summary(trades: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """How much of the ledger rests on a few days and a few mints.
+
+    A day counts as *flipped* when it is profitable only because of its single
+    best trade. Report only.
+    """
+    entries: list[tuple[str, str, float]] = []
+    for row in trades:
+        try:
+            pnl = float(row["pnl_sol"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(pnl):
+            continue
+        mint = str(row.get("mint") or "unknown")
+        entries.append((_day(row.get("exit_ts_ms")) or "unknown", mint, pnl))
+    if not entries:
+        return None
+
+    by_day: dict[str, list[float]] = defaultdict(list)
+    by_mint: dict[str, float] = defaultdict(float)
+    for day, mint, pnl in entries:
+        by_day[day].append(pnl)
+        by_mint[mint] += pnl
+
+    days: list[dict[str, Any]] = []
+    for day in sorted(by_day):
+        values = by_day[day]
+        total = sum(values)
+        without_best = total - max(values)
+        days.append(
+            {
+                "day": day,
+                "trades": len(values),
+                "pnl_sol": total,
+                "pnl_without_best_1_sol": without_best,
+                "flipped_by_best_1": total > 0.0 and without_best <= 0.0,
+            }
+        )
+    ranked_mints = sorted(by_mint.items(), key=lambda item: item[1], reverse=True)
+    return {
+        "days": days,
+        "total_days": len(days),
+        "profitable_days": sum(1 for day in days if day["pnl_sol"] > 0.0),
+        "days_flipped_by_best_1": sum(1 for day in days if day["flipped_by_best_1"]),
+        "unique_mints": len(by_mint),
+        "best_mint": ranked_mints[0][0],
+        "best_mint_pnl_sol": ranked_mints[0][1],
+        "pnl_without_best_mint_sol": sum(pnl for _, pnl in ranked_mints[1:]),
+        "top_mints": [
+            {"mint": mint, "pnl_sol": pnl} for mint, pnl in ranked_mints[:5]
+        ],
     }
 
 
@@ -166,6 +308,7 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
     pnls: list[float] = []
     returns: list[float] = []
     mints: list[str] = []
+    valid_trades: list[dict[str, Any]] = []
     malformed_trades = 0
     for row in trades:
         try:
@@ -180,6 +323,7 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         pnls.append(pnl)
         returns.append(ret)
         mints.append(str(row.get("mint") or "unknown"))
+        valid_trades.append(row)
     days = sorted(
         {
             day
@@ -268,6 +412,8 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
     }
 
     payoff = payoff_summary(pnls, returns)
+    tail = tail_sensitivity(returns, pnls)
+    concentration = concentration_summary(valid_trades)
 
     skip_counts: dict[str, int] = defaultdict(int)
     for row in skips:
@@ -360,6 +506,8 @@ def evaluate(run_dir: Path, *, starting_sol: float = 10.0) -> dict[str, Any]:
         "malformed_trades": malformed_trades,
         "skip_reason_counts": dict(sorted(skip_counts.items())),
         "payoff": payoff,
+        "tail_sensitivity": tail,
+        "concentration": concentration,
         "gates": gates,
         "passed": passed,
         "coverage_met": coverage_ok,
@@ -371,6 +519,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--starting-sol", type=float, default=10.0)
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--detail",
+        action="store_true",
+        help="print the per-day and per-mint concentration tables",
+    )
     args = parser.parse_args(argv)
 
     result = evaluate(args.run_dir, starting_sol=args.starting_sol)
@@ -402,6 +555,49 @@ def main(argv: list[str] | None = None) -> int:
                 f"  PnL={payoff['pnl_sol']:+.4f} "
                 f"without best 3={payoff['pnl_without_best_3_sol']:+.4f} SOL"
             )
+            ci = payoff.get("catastrophic_rate_ci")
+            if ci:
+                print(
+                    f"  tail-rate 95% CI (Wilson, independent trades): "
+                    f"{ci['low'] * 100:.1f}%-{ci['high'] * 100:.1f}%; "
+                    "clustered launches make the true interval wider"
+                )
+        tail = result.get("tail_sensitivity")
+        if tail and tail.get("rows"):
+            print("tail sensitivity (report only, non-tail payoff held fixed):")
+            for row in tail["rows"]:
+                expected = row["expected_pnl_sol"]
+                expected_text = "     n/a" if expected is None else f"{expected:+7.3f}"
+                tag = (
+                    "break-even"
+                    if abs(row["mean_return"]) < 1e-9
+                    else f"{row['tail_rate'] * 100:5.1f}%"
+                )
+                print(
+                    f"  tail={tag:>10s} mean={row['mean_return'] * 100:+6.2f}%/trade "
+                    f"PnL={expected_text} SOL"
+                )
+        concentration = result.get("concentration")
+        if concentration:
+            print(
+                f"concentration (report only): "
+                f"{concentration['profitable_days']}/{concentration['total_days']} "
+                f"profitable days, {concentration['days_flipped_by_best_1']} flipped "
+                f"by their best trade; best mint {concentration['best_mint'][:12]} "
+                f"{concentration['best_mint_pnl_sol']:+.4f} SOL, without it "
+                f"{concentration['pnl_without_best_mint_sol']:+.4f} SOL"
+            )
+            if args.detail:
+                print("  day        trades      pnl   w/o best1  flipped")
+                for day in concentration["days"]:
+                    print(
+                        f"  {day['day']:10s} {day['trades']:6d} "
+                        f"{day['pnl_sol']:+8.4f} {day['pnl_without_best_1_sol']:+11.4f} "
+                        f"{'yes' if day['flipped_by_best_1'] else 'no':>7s}"
+                    )
+                print("  top mints by PnL")
+                for mint in concentration["top_mints"]:
+                    print(f"    {mint['mint'][:20]:22s} {mint['pnl_sol']:+8.4f} SOL")
         if result["skip_reason_counts"]:
             print("skips:")
             for reason, count in result["skip_reason_counts"].items():

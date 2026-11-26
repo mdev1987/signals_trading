@@ -21,7 +21,14 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from compare_channels import deployed_scanner_rule  # noqa: E402
-from forward_gates import cluster_bootstrap, evaluate, payoff_summary  # noqa: E402
+from forward_gates import (  # noqa: E402
+    cluster_bootstrap,
+    concentration_summary,
+    evaluate,
+    payoff_summary,
+    tail_sensitivity,
+    wilson_interval,
+)
 from paper_bot.models import canonical_quote_notional_sol  # noqa: E402
 
 WSOL = "So11111111111111111111111111111111111111112"
@@ -174,6 +181,97 @@ class PayoffSummaryTests(unittest.TestCase):
 
     def test_empty_returns_is_none(self) -> None:
         self.assertIsNone(payoff_summary([], []))
+
+
+class WilsonIntervalTests(unittest.TestCase):
+    def test_matches_the_reference_interval(self) -> None:
+        ci = wilson_interval(162, 870)
+        assert ci is not None
+        self.assertAlmostEqual(ci["p"], 162 / 870)
+        self.assertAlmostEqual(ci["low"], 0.1617, places=4)
+        self.assertAlmostEqual(ci["high"], 0.2134, places=4)
+
+    def test_zero_successes_starts_at_zero(self) -> None:
+        ci = wilson_interval(0, 40)
+        assert ci is not None
+        self.assertEqual(ci["low"], 0.0)
+        self.assertGreater(ci["high"], 0.0)
+
+    def test_no_trades_is_none(self) -> None:
+        self.assertIsNone(wilson_interval(0, 0))
+
+
+class TailSensitivityTests(unittest.TestCase):
+    def test_break_even_row_is_where_expectancy_hits_zero(self) -> None:
+        # Non-tail trades return +25 %, tails lose everything.
+        returns = [0.25] * 75 + [-1.0] * 25
+        pnls = [0.025] * 100
+        sensitivity = tail_sensitivity(returns, pnls, steps=(0.0,))
+        assert sensitivity is not None
+        self.assertAlmostEqual(sensitivity["break_even_tail_rate"], 0.2)
+        break_even_rows = [
+            row for row in sensitivity["rows"] if abs(row["mean_return"]) < 1e-12
+        ]
+        self.assertEqual(len(break_even_rows), 1)
+        self.assertAlmostEqual(break_even_rows[0]["expected_pnl_sol"], 0.0)
+
+    def test_higher_tail_rate_reduces_expectancy(self) -> None:
+        returns = [0.25] * 78 + [-1.0] * 22
+        pnls = [0.025] * 100
+        sensitivity = tail_sensitivity(returns, pnls)
+        assert sensitivity is not None
+        # Steps first (descending expectancy), then the break-even row at 0.
+        steps = [row["mean_return"] for row in sensitivity["rows"][:-1]]
+        self.assertEqual(steps, sorted(steps, reverse=True))
+        self.assertLess(steps[-1], steps[0])
+        self.assertAlmostEqual(sensitivity["rows"][-1]["mean_return"], 0.0)
+
+    def test_empty_returns_is_none(self) -> None:
+        self.assertIsNone(tail_sensitivity([], []))
+
+
+class ConcentrationTests(unittest.TestCase):
+    def _trade(self, day: int, mint: str, pnl: float) -> dict[str, object]:
+        stamp = datetime(2026, 11, 20 + day, 12, tzinfo=UTC)
+        return {
+            "mint": mint,
+            "pnl_sol": pnl,
+            "return_pct": 0.2 if pnl > 0 else -1.0,
+            "exit_ts_ms": int(stamp.timestamp() * 1000),
+        }
+
+    def test_day_flips_when_its_best_trade_is_removed(self) -> None:
+        trades = [
+            self._trade(1, "a", 0.5),
+            self._trade(1, "b", -0.4),
+            self._trade(2, "c", 0.1),
+            self._trade(2, "d", 0.2),
+        ]
+        summary = concentration_summary(trades)
+        assert summary is not None
+        self.assertEqual(summary["total_days"], 2)
+        self.assertEqual(summary["profitable_days"], 2)
+        self.assertEqual(summary["days_flipped_by_best_1"], 1)
+        flipped = [day for day in summary["days"] if day["flipped_by_best_1"]]
+        self.assertEqual(len(flipped), 1)
+        self.assertAlmostEqual(flipped[0]["pnl_without_best_1_sol"], -0.4)
+
+    def test_best_mint_is_excluded_from_the_remainder(self) -> None:
+        trades = [
+            self._trade(1, "big", 0.9),
+            self._trade(1, "small", 0.1),
+            self._trade(2, "small", 0.05),
+        ]
+        summary = concentration_summary(trades)
+        assert summary is not None
+        self.assertEqual(summary["best_mint"], "big")
+        self.assertAlmostEqual(summary["best_mint_pnl_sol"], 0.9)
+        self.assertAlmostEqual(summary["pnl_without_best_mint_sol"], 0.15)
+        self.assertEqual(summary["unique_mints"], 2)
+
+    def test_malformed_rows_are_skipped(self) -> None:
+        summary = concentration_summary([{"mint": "x", "pnl_sol": "bad"}])
+        self.assertIsNone(summary)
 
 
 class ForwardGateTests(unittest.TestCase):

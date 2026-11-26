@@ -17,7 +17,7 @@ Neither tool changes a strategy field. Both are deterministic over existing
 
 ## 0. Summary
 
-Three results, in order of decision value:
+Four results, in order of decision value:
 
 1. **The strategy's sign depends on the broker fee overlay, not on the exits.**
    Across 954 recorded trades the gross edge before the modeled broker fee is
@@ -41,6 +41,14 @@ Three results, in order of decision value:
    94.8 % of entries and still leaves a **33 %** catastrophic rate among the
    survivors. No threshold in the observed range lowers the tail while keeping
    the opportunity set.
+
+4. **The recorded profit is a knife-edge, not an edge.** The fixed lane wins
+   79.8 % of trades and still earns only +0.757 SOL, because the break-even
+   win rate at its own payoff (+24.4 % / −92.1 %) is 79.0 %: a margin of
+   **0.7 pp**. The tail rate is 18.6 % (Wilson 16.2–21.3 %) against a
+   break-even of 19.3 %; **one extra point of tail rate costs 1.1 SOL**, more
+   than the whole profit. The tp50 lane is 1.7 pp *below* its break-even. The
+   win rate is the least informative number in the report (§2.5).
 
 What follows is the pre-registration for the parts that remain, and the
 evidence that closes the rest.
@@ -189,38 +197,118 @@ break-even win rate = |avg loss| / (avg win + |avg loss|)
 | lane | n | win | avg win | avg loss | break-even win | margin | PnL | P(PnL>0) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `scanner_pumpfun_amm` (fixed) | 870 | 79.8 % | +24.4 % | −92.1 % | 79.0 % | **+0.7 pp** | +0.757 | 0.69 |
-| `scanner_pumpfun_amm_tp50` | 100 | 79.0 % | +23.1 % | −96.6 % | 80.7 % | **−1.7 pp** | −0.209 | 0.34 |
+| `scanner_pumpfun_amm_tp50` | 105 | 79.0 % | +23.0 % | −96.7 % | 80.8 % | **−1.7 pp** | −0.222 | 0.34 |
 
-The tp50 lane is exactly the case being asked about: 79 % of trades win, and
-the ledger is negative, because the lane sits **1.7 pp below break-even**. The
-fixed lane sits 0.7 pp above it — inside the noise. Dropping any single run
-from the fixed lane gives a leave-one-run-out margin of **−0.2 to +1.5 pp** and
-PnL of **−0.160 to +1.440 SOL**; one of the six subsets is negative. The edge
-is therefore real in sign but not separable from zero at this sample size.
+Snapshot 2026-11-26, while the tp50 lane is still running (it gains trades
+between evaluations; the fixed lane is closed). The tp50 lane is exactly
+the case being asked about: 79 % of trades win, and the ledger is negative,
+because the lane sits **1.7 pp below break-even**. The fixed lane sits 0.7 pp
+above it — inside the noise. Dropping any single run from the fixed lane gives
+a leave-one-run-out margin of **−0.2 to +1.5 pp** and PnL of **−0.160 to
++1.440 SOL**; one of the six subsets is negative. The edge is therefore real in
+sign but not separable from zero at this sample size.
 
 The small-loss band is only **1.6 %** of trades (79.8 % wins + 18.6 %
 catastrophic = 98.4 %), so the win rate is almost exactly
 `1 − catastrophic rate`. Reporting both is redundant; the only informative
 number is the margin over break-even.
 
-Consequences (870 trades ≈ 88 SOL notional at 0.10 SOL/trade):
+`P(PnL>0)` comes from resampling **mints** on one forward sample. It is not a
+calibrated probability of future profitability: trades inside a day share a
+regime that mint clustering does not remove, so the true uncertainty is wider.
 
-- A **0.7 pp rise** in the tail rate — about 6 more catastrophes in 870
-  trades — erases the fixed lane's whole edge. The observed day-to-day rate
-  already spans 17.9–20.8 %, so this is inside normal variation.
-- Reaching the frozen **16 %** tail gate is worth about **+2.6 pp** of margin,
-  ≈ +2.3 SOL per 870 trades (upper bound: assumes each avoided tail exits flat
-  instead of −100 %).
-- A **1.5 pp** round-trip cost cut is worth about **+1.3 SOL** per 870 trades,
-  and it is the only one of the three that can be measured today (§2.4).
+### 2.5.1 How precisely is the tail rate known?
 
-The tp50 variant is **not** disproven by its −0.209 SOL: TP fired 3 times for
+Fixed lane: 162 catastrophes in 870 trades, `q = 18.62 %`. Wilson 95 % interval
+(independent trades): **16.2 % – 21.3 %**. The break-even tail rate is
+**19.3 %**, so the interval straddles break-even and its upper half is
+unprofitable. That is the whole fragility in one line.
+
+Two caveats on the interval:
+
+- Wilson assumes independent trades. Catastrophes are not independent — they
+  cluster in hours and launches — so the effective sample is smaller and the
+  true interval is **wider**, not narrower.
+- The break-even tail rate (19.3 %) differs from the win-rate break-even
+  (79.0 % ⇒ 21.0 % of tails) because the win-rate version uses the empirical
+  average loss (−92.1 %, small losers included) while this one assumes every
+  catastrophe is total. The tail-rate version is the conservative one.
+
+The tp50 lane: 20.0 % tail (13.5 % – 28.6 % Wilson) against a break-even of
+18.3 % — the interval straddles break-even, and its point estimate is already
+on the wrong side.
+
+### 2.5.2 Tail-rate sensitivity
+
+Holding the observed non-tail payoff fixed (`m = +23.9 %`) and replacing trades
+at random with the observed catastrophe (`t = −99.9 %`), expectancy is
+`(1−q)·m + q·t`:
+
+| tail rate | fixed lane | tp50 lane |
+| --- | --- | --- |
+| observed (18.6 % / 20.0 %) | **+0.86 %**/trade (+0.757 SOL) | −2.09 %/trade (−0.222 SOL) |
+| +1 pp | −0.38 %/trade (−0.334 SOL) | −3.31 %/trade (−0.352 SOL) |
+| +2 pp | −1.62 %/trade (−1.425 SOL) | −4.53 %/trade (−0.482 SOL) |
+| +3 pp | −2.86 %/trade (−2.516 SOL) | −5.75 %/trade (−0.611 SOL) |
+| break-even | 19.3 % | 18.3 % |
+
+One extra point of tail rate costs about **1.1 SOL per 870 trades** — more than
+the entire recorded profit. The fixed lane is profitable in exactly one
+0.7-pp-wide band.
+
+### 2.5.3 Concentration: days and mints
+
+Fixed lane, four days (11-22 → 11-25):
+
+| day | trades | PnL | PnL without best trade | profitable only via its best trade |
+| --- | --- | --- | --- | --- |
+| 11-22 | 340 | −0.364 | −0.483 | no |
+| 11-23 | 255 | +0.823 | +0.582 | no |
+| 11-24 | 183 | −0.044 | −0.166 | no |
+| 11-25 | 92 | +0.342 | +0.249 | no |
+
+**2 of 4 days are profitable**; no day depends on a single trade. But the
+11-23 day alone (+0.823) is larger than the whole lane's net (+0.757), and the
+best single mint (+0.242) is a third of the profit — without it the lane is
++0.515 SOL. The positive result is one good day plus one good mint.
+
+The tp50 lane is worse on every one of these axes: 1 of 2 days profitable, the
+profitable day (11-26, +0.021) is **negative without its best trade**, and
+removing the best mint turns the lane from −0.222 to −0.273 SOL.
+
+**pp convention.** "pp" here means percentage points of traded notional
+(median **0.101 SOL** per trade), not of starting capital. On the 88 SOL
+fixed-lane book, 1 pp ≈ 0.88 SOL; the 1.5 pp cost cut is 1.32 SOL, and the
+0.5 pp cut is 0.44 SOL.
+
+Finer launch cohorts (hour of entry) are **not** reported: 870 trades over four
+days is ~9 trades per hour, below any resolution that could separate signal
+from noise. Day is the coarsest split that is still meaningful, mint the
+finest.
+
+### 2.5.4 The levers, with assumptions stated
+
+| lever | upper bound | assumptions it needs |
+| --- | --- | --- |
+| exit half the tail at −50 % | +8.2 SOL | exits actually fill at −50 % during the collapse — unproven, and the thing the pool-health dataset must test |
+| 16 % tail gate | +2.3 SOL | every rejected trade would have lost 100 % of notional; every rejected trade exits at 0 %, not at a partial loss; **no rejected winner**; no added cost from the gate |
+| 0.5 pp round-trip cost cut | +0.44 SOL | the 1.25 %/side buffer overstates the real all-in cost |
+
+Every row is an **upper bound, not an expected improvement**. The gate row in
+particular assumes a perfect classifier: a gate that rejects a 20 % tail of the
+signal set while also rejecting some winners is worth far less, and the
+preflight work (§3.3) already shows the available ratio has no predictive
+power (AUC 0.458).
+
+The tp50 variant is **not** disproven by its −0.222 SOL: TP fired 3 times for
 +0.124 SOL, the non-TP mean is −3.39 %, and its tail rate (20.0 %) is worse
-than the fixed lane's (18.6 %) because it ran on a different cohort. At n=100
+than the fixed lane's (18.6 %) because it ran on a different cohort. At n=105
 it is not evidence either way.
 
-`forward_gates.py` now prints this payoff line for every run as **report only**;
-it does not change any gate or threshold.
+`forward_gates.py` prints the payoff line, the Wilson interval, the tail
+sensitivity table and the concentration summary for every run, and the
+per-day/per-mint tables with `--detail`, all as **report only**; no gate or
+threshold changes.
 
 ---
 
