@@ -394,6 +394,13 @@ estimate, but it fixes the sign of the correction: the live tail makes the
 channel lane worse, and the tail — not the TP level — is what a filter would
 have to predict.
 
+The lane was stopped at a clean shutdown on 2026-11-28 01:12 UTC with **525
+closed trades** (integrity VALID): −1.334 SOL, −2.51 %/trade, median +20.87 %,
+21.5 % catastrophic exits, exits 383 horizon / 102 near-zero / 34 tp_hit /
+4 no_route / 2 forced shutdown. The 447-trade cut above is the snapshot the study was written
+against; the final cut does not change its verdict. The archived copy is
+`output/paper/tp50_baseline_20261128_0112/`.
+
 ---
 
 ## 7. Verdict
@@ -421,12 +428,15 @@ have to predict.
   feature predicted them. An entry gate that cannot see the tail is not a fix,
   and the fee is larger than the gross point estimate.
 * **Decision:** do not wire this strategy to the live channel and do not
-  retune the entry gates. The one pre-registered experiment aimed at the
-  actual loss mechanism is `scanner_pumpfun_amm_quote50`: a full-size
-  executable-exit quote every 15 s, selling below 0.50× the entry cost. It has
-  not been run. That — not another entry filter — is the next experiment, and
-  it stays a separate paper lane with its own recovery snapshot.
-* **TP50 is untouched** and remains the deployed paper lane.
+  retune the entry gates. The pre-registered experiment aimed at the actual
+  loss mechanism is the executable-exit guard: V1
+  `scanner_pumpfun_amm_quote50` (never run) and its combined successor
+  `scanner_pumpfun_amm_tp50_quote_guard`, deployed as the sole paper lane on
+  2026-11-28. That — not another entry filter — is the next experiment, and it
+  stays a separate paper lane with its own recovery snapshot.
+* **TP50 keeps its completed sample** (525 closed trades at a clean shutdown,
+  archived with its recovery DB) and its snapshot. The deployed paper lane is
+  now the combined V2 guard; the two samples are never pooled.
 
 ---
 

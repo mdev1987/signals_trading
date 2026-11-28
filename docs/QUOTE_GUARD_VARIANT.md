@@ -123,10 +123,12 @@ snapshot; the three samples are never merged.
 
 # V2: `scanner_pumpfun_amm_tp50_quote_guard` (combined TP + guard)
 
-Status: **declared 2026-11-27, paper only, experiment. Not yet run.** This is a
-new pre-registration; it is not a retune of V1 and its sample is never pooled
-with `scanner_pumpfun_amm_tp50`, `scanner_pumpfun_amm_quote50` or the frozen
-lane.
+Status: **declared 2026-11-27, paper only, experiment.** Deployed as the sole
+paper lane on the VPS on 2026-11-28 01:13 UTC, after the tp50 lane was stopped
+at a clean shutdown (its 525-trade sample and recovery snapshot are archived
+and untouched). This is a new pre-registration; it is not a retune of V1 and
+its sample is never pooled with `scanner_pumpfun_amm_tp50`,
+`scanner_pumpfun_amm_quote50` or the frozen lane.
 
 ## Why combine them
 
