@@ -3,18 +3,20 @@ version = 1
 # signals-trading — Pumpfun scanner Telegram listener (paper, 24/7).
 #
 # One channel, one lane. The deployed lane is the pre-registered
-# `scanner_pumpfun_amm_tp50` variant (identical entry to the frozen
-# `scanner_pumpfun_amm`, but the position is sold at +50 % if that mark
-# arrives before the 5-minute deadline). The frozen lane remains available
-# with `--rule scanner_pumpfun_amm` and its own recovery snapshot; results of
-# the two lanes must never be pooled. Evidence, the selection study and the
-# fragility of that choice are in `docs/TP50_VARIANT.md` and
-# `docs/EXIT_POLICY_STUDY.md`.
+# `scanner_pumpfun_amm_tp50_quote_guard` variant (identical entry to the frozen
+# `scanner_pumpfun_amm`). It keeps the +50 % take-profit but only takes it when
+# a full-size sell quote still recovers the entry cost, sells when the
+# executable quote drops below 0.50x entry cost, and salvages a disappeared
+# full-size route through the exit-fraction ladder. The earlier
+# `scanner_pumpfun_amm_tp50` lane keeps its own sample and recovery snapshot
+# (447 closed trades); the two samples are never pooled. Evidence, the
+# selection study and the fragility of that choice are in
+# `docs/TP50_VARIANT.md`, `docs/EXIT_POLICY_STUDY.md` and
+# `docs/QUOTE_GUARD_VARIANT.md`.
 #
-# A third, separate pre-registration exists but is NOT deployed here:
-# `scanner_pumpfun_amm_quote50` (docs/QUOTE_GUARD_VARIANT.md) probes a full-size
-# sell quote and exits below 0.50x entry cost. Its results must not be pooled
-# with either lane above. Run it manually only while observing the experiment.
+# The guard-only V1 pre-registration `scanner_pumpfun_amm_quote50`
+# (docs/QUOTE_GUARD_VARIANT.md) is NOT deployed here. Run it manually only
+# while observing the experiment; its sample is separate again.
 #
 #   channel  @AveSolanaTokenScanner   first card per mint (the channel re-posts
 #                                    each pool ~3x; only the first is used)
@@ -22,8 +24,11 @@ version = 1
 #   entry    market buy on the first BUY print at/after the card + 5 s; retry
 #            on later prints (at most one attempt per mint per second) and
 #            give up at 60 s
-#   exit     sell 100 % at the first mark >= entry x 1.50 before entry + 5 min;
-#            otherwise hard market sell at entry + 5 min; no stop, no trail
+#   exit     a mark >= entry x 1.50 is confirmed with a full-size sell quote:
+#            sell 100 % only if that quote recovers >= 1.00x entry cost; sell
+#            when the full-size quote falls below 0.50x entry cost (probed
+#            every 15 s); when the full-size route disappears, walk the
+#            0.5 / 0.25 / 0.1 / 0.01 ladder; otherwise hard sell at +5 min
 #   size     0.1 SOL of a 10 SOL paper wallet; measured overlap is at most
 #            9 open positions in any 5-minute window (median 2)
 #
@@ -88,8 +93,8 @@ version = 1
 # it is a risk control, not part of the backtested edge.
 #
 # Restart continuity (paper only): every paper start writes
-# output/recovery/scanner_pumpfun_amm_tp50_trade.sqlite3 (SQLite, WAL,
-# synchronous=FULL) with the wallet, open positions, the original run
+# output/recovery/scanner_pumpfun_amm_tp50_quote_guard_trade.sqlite3 (SQLite,
+# WAL, synchronous=FULL) with the wallet, open positions, the original run
 # directory, the run's original started_at, durable scanner counters and the
 # set of processed Telegram/scanner ids (so a redelivered message or a reposted
 # pool is not traded twice after a restart). A legacy `.json` snapshot from an
@@ -104,11 +109,12 @@ version = 1
 # First install of a new sample: the snapshot does not exist yet, so `--resume`
 # would refuse to start. Seed it by removing `--resume` for one start (or run
 # `run_bot.sh` once without RESUME=1), let the bot write its first snapshot,
-# then restore `--resume`. The frozen lane's snapshot
-# (scanner_pumpfun_amm_trade.sqlite3) is a different file and is left intact;
-# switching RULE back to scanner_pumpfun_amm resumes that sample instead. To
-# start a *new* sample after the five-day gates are evaluated, stop the app and
-# delete output/recovery/scanner_pumpfun_amm_tp50_trade.sqlite3 and its
+# then restore `--resume`. The earlier lanes' snapshots
+# (scanner_pumpfun_amm_trade.sqlite3 and scanner_pumpfun_amm_tp50_trade.sqlite3)
+# are different files and are left intact; switching RULE back resumes that
+# sample instead. To start a *new* sample after the five-day gates are
+# evaluated, stop the app and delete
+# output/recovery/scanner_pumpfun_amm_tp50_quote_guard_trade.sqlite3 and its
 # `.degraded` sidecar marker (and the old risk state if a different day should
 # start clean). Never delete the snapshot unless you intend to end the current
 # sample. A run whose summary says DEGRADED or INVALID is not valid for the
@@ -131,7 +137,7 @@ name = "paper-bot"
 # The package lives under `src/`, so PYTHONPATH is set here instead of
 # installing the research repo as a wheel. `--no-sync` is unnecessary because
 # this runs the venv directly, so a restart never touches the network.
-command = "env PYTHONPATH=/home/mdev/Programming/signals_trading/src /home/mdev/Programming/signals_trading/.venv/bin/python -m paper_bot live --mode paper --rule scanner_pumpfun_amm_tp50 --tp-pct 0.50 --channel @AveSolanaTokenScanner --entry-mode trade --entry-delay-ms 5000 --max-entry-delay-ms 60000 --max-delivery-lag-ms 60000 --max-concurrent-positions 10 --entry-retry-backoff-ms 1000 --min-entry-quote-sol 0.01 --max-reference-age-ms 30000 --max-mark-age-ms 120000 --timer-late-tolerance-ms 1000 --max-future-skew-ms 5000 --risk-state-dir output/risk --horizon-min 5 --notional-sol 0.1 --starting-sol 10 --slippage-bps 50 --max-slippage-bps 1000 --priority-fee-lamports 2000 --jito-tip-lamports 10000 --fee 0.0125 --history-horizon-min 10 --history-max-mints 10000 --history-max-events-per-mint 3000 --history-max-total-events 150000 --tick-interval 1.0 --dex-interval 2.0 --memory-limit-mb 550 --memory-report-s 300 --shutdown-timeout-ms 25000 --resume"
+command = "env PYTHONPATH=/home/mdev/Programming/signals_trading/src /home/mdev/Programming/signals_trading/.venv/bin/python -m paper_bot live --mode paper --rule scanner_pumpfun_amm_tp50_quote_guard --tp-pct 0.50 --quote-guard-ratio 0.50 --quote-guard-interval-ms 15000 --channel @AveSolanaTokenScanner --entry-mode trade --entry-delay-ms 5000 --max-entry-delay-ms 60000 --max-delivery-lag-ms 60000 --max-concurrent-positions 10 --entry-retry-backoff-ms 1000 --min-entry-quote-sol 0.01 --max-reference-age-ms 30000 --max-mark-age-ms 120000 --timer-late-tolerance-ms 1000 --max-future-skew-ms 5000 --risk-state-dir output/risk --horizon-min 5 --notional-sol 0.1 --starting-sol 10 --slippage-bps 50 --max-slippage-bps 1000 --priority-fee-lamports 2000 --jito-tip-lamports 10000 --fee 0.0125 --history-horizon-min 10 --history-max-mints 10000 --history-max-events-per-mint 3000 --history-max-total-events 150000 --tick-interval 1.0 --dex-interval 2.0 --memory-limit-mb 550 --memory-report-s 300 --shutdown-timeout-ms 25000 --resume"
 cwd = "/home/mdev/Programming/signals_trading"
 restart_policy = "always"
 max_restarts = 100
