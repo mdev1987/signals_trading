@@ -55,6 +55,36 @@ accounts and the mint itself are never wallets.
 = `high` if any dev wallet is high-confidence, `medium` if any dev wallet,
 `unknown` otherwise.
 
+## Results on the 300-rug cohort (2026-11-28 run)
+
+300 catastrophic mints labeled; **300 with ≥1 dev/insider wallet**, avg 1.01
+dev wallets/mint. **`creator == launcher == pool_seeder` on 297/300** — exactly
+the Pump AMM pattern "creator holds no bag; it mints 100 % into the pool", so
+the *same* wallet is labeled all three ways and it is usually **not** an
+early seller. But:
+
+- `funded_sniper`: **0**
+- `insider_transfer_recipient`: **0**
+- `possible_lp_puller`: **0**
+- `funded_recipient_unconfirmed` (received SOL from launcher; no early sell;
+  not a dev label): 86 mints
+- `no_early_distribution`: 5 mints
+
+**Pervasive early selling, no dev overlap.** 279/300 have an early seller in
+the first 15 s; 295/300 in the first 60 s (3 096 wallet-entries). But none of
+those sellers is structurally a creator/launcher/funded sniper under the
+conservative rules. This matches `docs/EARLY_FLOW_STUDY.md`: early
+distribution is **not a robust filter**, and "who sold early" ≠ "dev." The
+earlier on-chain note "launcher funds snipers at create; bundle sells
+t+16…42 s" is a *specific* pattern that does **not** fire on this rug cohort;
+we did not loosen the rule to manufacture `funded_sniper` labels. Early
+sellers remain labeled `early_seller` only.
+
+So, honestly, on this cohort the tool's reliable output is the **creation
+dev wallet** (one address, usually not a seller) + an explicit, *unconflated*
+`early_seller` set + `sold_pre`/`sold_15s` (from `early_flow_study`), not a
+robust `funded_sniper`/insider filter.
+
 ## Explicit non-claims (honesty)
 
 - **Wallet ≠ person.** No identity resolution; no claims about who owns a wallet.
