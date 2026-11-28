@@ -1,0 +1,804 @@
+1
+00:00:00,000 --> 00:00:05,820
+In this course, you'll learn how to build a fully automated trading bot that detects
+
+2
+00:00:05,820 --> 00:00:11,800
+new token launches on pump.fun in under one second, buys them via Jupyter, monitors the
+
+3
+00:00:11,800 --> 00:00:14,680
+price and sells at 2x profit.
+
+4
+00:00:14,680 --> 00:00:19,360
+The bot runs 24-7, compounding your gains automatically while you sleep.
+
+5
+00:00:19,360 --> 00:00:22,760
+By the end of this course, you'll have a battle-tested Python application running
+
+6
+00:00:22,760 --> 00:00:26,480
+on Ubuntu 22.04, ready to deploy.
+
+7
+00:00:26,480 --> 00:00:27,840
+Let's get started.
+
+1
+00:00:00,000 --> 00:00:05,680
+here's what's included with this course. First, you get a proven tested source code trading application.
+
+2
+00:00:05,680 --> 00:00:10,800
+This is not a tutorial project, it's a real bot that has been validated in live market conditions.
+
+3
+00:00:10,800 --> 00:00:16,240
+Second, it's built entirely in Python 3, clean, readable and well documented code
+
+4
+00:00:16,240 --> 00:00:22,800
+you can understand and modify yourself. Third, it's deployed and tested on Ubuntu 22.04,
+
+5
+00:00:22,800 --> 00:00:27,760
+the most popular server operating system, production ready from day one. And fourth,
+
+6
+00:00:27,760 --> 00:00:31,600
+this bot was dry run tested for at least one month before release.
+
+7
+00:00:31,600 --> 00:00:36,160
+It wasn't thrown together yesterday, it ran in simulation for over 30 days,
+
+8
+00:00:36,160 --> 00:00:40,480
+proving its logic works before you ever see it. You're getting something real.
+
+9
+00:00:40,480 --> 00:00:41,040
+Slide through
+
+1
+00:00:00,000 --> 00:00:01,840
+We'll cover across 12 modules.
+
+2
+00:00:01,840 --> 00:00:04,240
+First, we'll look at the overall architecture,
+
+3
+00:00:04,240 --> 00:00:06,400
+how the two Python scripts work together,
+
+4
+00:00:06,400 --> 00:00:07,920
+then we'll set up your environment,
+
+5
+00:00:07,920 --> 00:00:10,080
+your wallet, and your RPC connection.
+
+6
+00:00:10,080 --> 00:00:13,080
+Next, we dive deep into the token scanner.
+
+7
+00:00:13,080 --> 00:00:16,640
+The web socket listener that catches launches in seconds.
+
+8
+00:00:16,640 --> 00:00:18,680
+We'll build rug detection filters,
+
+9
+00:00:18,680 --> 00:00:22,240
+a scoring algorithm, and Jupyter swap execution.
+
+10
+00:00:22,240 --> 00:00:25,440
+Then we cover price monitoring, exit strategies,
+
+11
+00:00:25,440 --> 00:00:27,820
+the compounding system, risk management,
+
+12
+00:00:27,820 --> 00:00:32,020
+and finally how to run this thing 24-7 on a VPS.
+
+13
+00:00:32,020 --> 00:00:33,860
+Each module builds on the last,
+
+14
+00:00:33,860 --> 00:00:36,780
+so by the end you'll understand every line of code.
+
+1
+00:00:00,000 --> 00:00:04,400
+Slide 4. System Architecture. The bot is built from two python scripts.
+
+2
+00:00:04,400 --> 00:00:10,960
+Token scanner.py connects to the pump portal web socket and listens for brand new token launches.
+
+3
+00:00:10,960 --> 00:00:15,360
+When it detects one, it waits 25 seconds for DexScreener to index the pair,
+
+4
+00:00:15,360 --> 00:00:20,320
+then runs it through rug detection, safety filters and scoring. If the token passes,
+
+5
+00:00:20,320 --> 00:00:26,800
+it hands it to bot.py, which buys it via Jupyter's Swap API, monitors the price every
+
+6
+00:00:26,800 --> 00:00:33,040
+8 seconds using DexScreener and sells when it hits 2x or stops out at 18% loss.
+
+7
+00:00:33,040 --> 00:00:39,360
+After a win, 60% gets reinvested and 40% is saved. That's the full loop.
+
+8
+00:00:39,360 --> 00:00:40,000
+Slide 5.
+
+1
+00:00:00,000 --> 00:00:02,280
+Let's set up your development environment.
+
+2
+00:00:02,280 --> 00:00:04,920
+You'll need Python 3.10 or higher.
+
+3
+00:00:04,920 --> 00:00:06,760
+Create a virtual environment,
+
+4
+00:00:06,760 --> 00:00:09,120
+then install the dependencies solders
+
+5
+00:00:09,120 --> 00:00:12,680
+for Solana transaction signing, requests for API calls,
+
+6
+00:00:12,680 --> 00:00:16,720
+Python.10 for configuration, base 58 for key encoding,
+
+7
+00:00:16,720 --> 00:00:18,720
+and web sockets for the real-time connection
+
+8
+00:00:18,720 --> 00:00:19,960
+to pump portal.
+
+9
+00:00:19,960 --> 00:00:22,560
+All of this installs with a single pip command.
+
+10
+00:00:22,560 --> 00:00:25,480
+Your configuration lives in a .env file,
+
+11
+00:00:25,480 --> 00:00:26,760
+which we'll set up next.
+
+1
+00:00:00,000 --> 00:00:05,680
+The .envave file is your bot's control panel.
+
+2
+00:00:05,680 --> 00:00:10,440
+Starting amount is $2 USDC, a safe amount to learn with.
+
+3
+00:00:10,440 --> 00:00:17,960
+Stop loss is set to 0.82, meaning you'll exit if the token drops 18% from your entry.
+
+4
+00:00:17,960 --> 00:00:25,200
+Slippage is 150 basis points or 1.5%, the bot polls price every 8 seconds.
+
+5
+00:00:25,200 --> 00:00:31,200
+After 2 consecutive losses, it pauses for 5 minutes to avoid bleeding in bad market conditions.
+
+6
+00:00:31,200 --> 00:00:36,680
+And the play floor of $1 prevents the death spiral, where one early loss permanently cripples
+
+7
+00:00:36,680 --> 00:00:37,680
+your bankroll.
+
+8
+00:00:37,680 --> 00:00:40,040
+Always start with dry run set to true.
+
+1
+00:00:00,000 --> 00:00:05,600
+RPC setup. You need a dedicated Solana wallet for the bot. Never use your main wallet.
+
+2
+00:00:05,600 --> 00:00:11,760
+Create one with Phantom or the Solana CLI. Export the private key as a base 58 string
+
+3
+00:00:11,760 --> 00:00:18,720
+and paste it in your .nv file. For your RPC endpoint get a free tier from Alchemy Orhelius.
+
+4
+00:00:18,720 --> 00:00:23,840
+Don't use the default mainnet beta endpoint. It's rate limited and slow. Fund the wallet
+
+5
+00:00:23,840 --> 00:00:28,080
+with a small amount of USDC for trades and sold for gas fees.
+
+1
+00:00:00,000 --> 00:00:04,240
+Slide 8 Token Scanner WebSocket. This is where the magic happens.
+
+2
+00:00:04,240 --> 00:00:09,360
+The Token Scanner connects to the Pump Portal WebSocket and subscribes to new token events.
+
+3
+00:00:09,360 --> 00:00:15,040
+The moment someone creates a new token on Pump.fun, we get notified with the mint address, name,
+
+4
+00:00:15,040 --> 00:00:20,320
+symbol and how much SOL the developer bought at launch. This happens in under one second.
+
+5
+00:00:20,320 --> 00:00:25,360
+Compare that to polling deck screener every 30 seconds where you'd miss the first wave of
+
+6
+00:00:25,360 --> 00:00:28,880
+buyers entirely. Speed is everything in this game.
+
+1
+00:00:00,050 --> 00:00:02,050
+Let's talk about the timing.
+
+2
+00:00:02,050 --> 00:00:06,050
+Token detection happens in under 1 second via WebSocket.
+
+3
+00:00:06,050 --> 00:00:11,050
+Then we wait 25 seconds for DeX screener to index the pair and give us liquidity and volume data.
+
+4
+00:00:11,050 --> 00:00:14,050
+The entire scan window is up to 15 minutes.
+
+5
+00:00:14,050 --> 00:00:19,050
+If no qualifying token is found in that time, the bot starts a new scan cycle.
+
+6
+00:00:19,050 --> 00:00:24,050
+If the WebSocket disconnects, it automatically reconnects with exponential backoff,
+
+7
+00:00:24,050 --> 00:00:26,050
+cycling through multiple endpoints.
+
+8
+00:00:26,050 --> 00:00:29,050
+It never silently falls asleep.
+
+1
+00:00:00,000 --> 00:00:04,720
+Rug detection. Before buying anything, the bot runs four safety checks.
+
+2
+00:00:04,720 --> 00:00:09,200
+First, scam name detection. If the token name contains words like guaranteed,
+
+3
+00:00:09,200 --> 00:00:13,760
+100x, airdrop or safe moon, it skipped immediately.
+
+4
+00:00:13,760 --> 00:00:18,960
+Second, honeypot detection. If there are 50 plus buys but fewer than two cells,
+
+5
+00:00:18,960 --> 00:00:23,440
+that means nobody can sell, it's a trap. Third, wash trading.
+
+6
+00:00:23,440 --> 00:00:28,320
+If the 5 minute volume is 50 times the liquidity, that activity is fake.
+
+7
+00:00:28,320 --> 00:00:33,120
+Fourth, dev dump check. If the developer bought more than 20 sol at launch,
+
+8
+00:00:33,120 --> 00:00:36,240
+they loaded their bag and will likely dump on everyone else.
+
+9
+00:00:36,800 --> 00:00:39,840
+Any one of these flags means we skipped the token.
+
+1
+00:00:00,000 --> 00:00:05,520
+Filter thresholds. Even after passing rug checks, tokens must meet strict criteria.
+
+2
+00:00:05,520 --> 00:00:10,400
+Maximum age, 5 minutes. If it's been around longer, the easy gains are gone.
+
+3
+00:00:10,400 --> 00:00:17,440
+Liquidity must be between $2,500,000, enough to trade, but not so much that we're late.
+
+4
+00:00:17,440 --> 00:00:23,200
+Minimum 5 minute volume is $500. We need at least 12 transactions in 5 minutes,
+
+5
+00:00:23,200 --> 00:00:29,120
+with at least 8 of those being buys. The buy to sell ratio must be at least 1.3x,
+
+6
+00:00:29,120 --> 00:00:34,720
+meaning buyers are dominating and market cap can't exceed 10 million. We want to be early.
+
+1
+00:00:00,000 --> 00:00:01,840
+Slide 12, token scoring.
+
+2
+00:00:01,840 --> 00:00:04,200
+Not all qualifying tokens are equal,
+
+3
+00:00:04,200 --> 00:00:06,480
+so we score them from zero to 100.
+
+4
+00:00:06,480 --> 00:00:08,680
+Freshness gives up to 10 points.
+
+5
+00:00:08,680 --> 00:00:11,360
+Tokens under two minutes old get the maximum.
+
+6
+00:00:11,360 --> 00:00:13,680
+Bipressure is worth up to 25 points
+
+7
+00:00:13,680 --> 00:00:15,480
+based on the buy-sell ratio.
+
+8
+00:00:15,480 --> 00:00:17,400
+Volume contributes up to 20 points
+
+9
+00:00:17,400 --> 00:00:18,800
+on a logarithmic scale.
+
+10
+00:00:18,800 --> 00:00:22,280
+Liquidity in the sweet spot of $5,000 to $50,000
+
+11
+00:00:22,280 --> 00:00:23,840
+earns 15 points.
+
+12
+00:00:23,840 --> 00:00:26,760
+An affair launch where the developer bought little
+
+13
+00:00:26,760 --> 00:00:30,000
+or no sell initially adds up to 10 points.
+
+14
+00:00:30,000 --> 00:00:31,040
+The higher the score,
+
+15
+00:00:31,040 --> 00:00:33,240
+the stronger our conviction in the trade.
+
+1
+00:00:00,000 --> 00:00:02,600
+Slide 13 – Jupiter Swaps
+
+2
+00:00:02,600 --> 00:00:05,120
+Jupiter is Solana Swap Aggregator.
+
+3
+00:00:05,120 --> 00:00:12,520
+It finds the best route across all DEXs, Radium, Orca, Meteora and more for a single transaction.
+
+4
+00:00:12,520 --> 00:00:14,320
+Our buy flow has four steps.
+
+5
+00:00:14,320 --> 00:00:18,320
+One, get a quote, how many tokens we'll receive for our USDC.
+
+6
+00:00:18,320 --> 00:00:20,080
+Two, build the swap transaction.
+
+7
+00:00:20,080 --> 00:00:23,560
+Three, sign it with our private key and broadcast to the network.
+
+8
+00:00:23,560 --> 00:00:26,480
+Four, confirm the transaction landed on chain.
+
+9
+00:00:26,480 --> 00:00:29,000
+For sales, it's the same process in reverse.
+
+10
+00:00:29,000 --> 00:00:36,400
+If a cell fails due to low liquidity, we escalate slippage from 200 to 500 to 1,000 basis points
+
+11
+00:00:36,400 --> 00:00:38,000
+before giving up.
+
+1
+00:00:00,000 --> 00:00:02,040
+Price monitoring and exits.
+
+2
+00:00:02,040 --> 00:00:05,880
+Once we're in a position, the bot pulls the price every 8 seconds.
+
+3
+00:00:05,880 --> 00:00:11,520
+Our take profit target is 2x, meaning we sell when the token doubles from our entry price.
+
+4
+00:00:11,520 --> 00:00:15,600
+Stop loss is at 0.82x and 18% loss.
+
+5
+00:00:15,600 --> 00:00:20,240
+Dex screener is the primary price source because it also gives us liquidity data.
+
+6
+00:00:20,240 --> 00:00:23,280
+If Dex screener fails, we fall back to Jupiter quotes.
+
+7
+00:00:23,280 --> 00:00:28,120
+If liquidity drops below $25, the pool is effectively dead and we trigger dead
+
+8
+00:00:28,120 --> 00:00:31,040
+pool handling instead of retrying forever.
+
+1
+00:00:00,000 --> 00:00:03,600
+Light 15, compounding strategy, here's where it gets exciting.
+
+2
+00:00:03,600 --> 00:00:06,880
+Every time the bot wins, it splits the proceeds.
+
+3
+00:00:06,880 --> 00:00:09,760
+60% goes back into the next trade.
+
+4
+00:00:09,760 --> 00:00:12,000
+40% is saved permanently.
+
+5
+00:00:12,000 --> 00:00:13,560
+Start with $2.
+
+6
+00:00:13,560 --> 00:00:15,320
+The token doubles to four.
+
+7
+00:00:15,320 --> 00:00:18,800
+Save $1.60, reinvest $2.40.
+
+8
+00:00:18,800 --> 00:00:21,680
+Next win, $2.40 becomes $4.80.
+
+9
+00:00:21,680 --> 00:00:24,880
+Save $1.92, reinvest $2.88.
+
+10
+00:00:24,880 --> 00:00:27,280
+On a win streak, this compounds rapidly.
+
+11
+00:00:27,280 --> 00:00:29,200
+The bot runs up to 30 cycles
+
+12
+00:00:29,200 --> 00:00:30,880
+even with a modest win rate.
+
+13
+00:00:30,880 --> 00:00:33,600
+The compounding math works in your favor over time.
+
+14
+00:00:33,600 --> 00:00:34,120
+Slides.
+
+1
+00:00:00,000 --> 00:00:04,600
+16. Risk management. Three safety features keep the bot alive.
+
+2
+00:00:04,600 --> 00:00:06,400
+Number one, the play floor.
+
+3
+00:00:06,400 --> 00:00:09,400
+If your trade amount drops below $1 after a loss,
+
+4
+00:00:09,400 --> 00:00:11,360
+it resets to your starting amount.
+
+5
+00:00:11,360 --> 00:00:13,440
+This is the single most important feature.
+
+6
+00:00:13,440 --> 00:00:14,840
+Without it, one early loss
+
+7
+00:00:14,840 --> 00:00:17,120
+permanently cripples every future cycle.
+
+8
+00:00:17,120 --> 00:00:19,400
+Number two, the last pause.
+
+9
+00:00:19,400 --> 00:00:23,400
+After two consecutive losses, the bot waits five minutes.
+
+10
+00:00:23,400 --> 00:00:25,760
+Bad market conditions tend to cluster,
+
+11
+00:00:25,760 --> 00:00:27,880
+so this prevents bleeding.
+
+12
+00:00:27,880 --> 00:00:30,520
+Number three, dead pool detection.
+
+13
+00:00:30,520 --> 00:00:33,960
+If a token's liquidity drops below $25,
+
+14
+00:00:33,960 --> 00:00:35,760
+the bot stops trying to sell
+
+15
+00:00:35,760 --> 00:00:38,160
+and backs off to 10 minute rechecks.
+
+16
+00:00:38,160 --> 00:00:40,160
+No point hammering a dead pool.
+
+1
+00:00:00,000 --> 00:00:06,080
+17. Running 24-7. To run the bot around the clock, deploy it on a VPS.
+
+2
+00:00:06,080 --> 00:00:11,680
+Digital Ocean Hetsner or AWS LightSale all work at $5 to $10 a month.
+
+3
+00:00:11,680 --> 00:00:16,680
+You need one CPU core, one gig of RAM and Ubuntu 22.04.
+
+4
+00:00:16,680 --> 00:00:22,560
+Set up SSH access, install Python, clone your repo, configure your .env
+
+5
+00:00:22,560 --> 00:00:24,840
+and test with Dry Run mode first.
+
+6
+00:00:24,840 --> 00:00:28,360
+Use T-Max or Screen to keep the session alive after you disconnect.
+
+7
+00:00:28,360 --> 00:00:34,080
+For production, create a SystemD service file that auto restarts the bot if it crashes.
+
+8
+00:00:34,080 --> 00:00:40,080
+Monitor via bot.log, journal.json and tradelog.csv.
+
+1
+00:00:00,000 --> 00:00:04,320
+10. Tuning and Going Live. Here's your Go Live checklist.
+
+2
+00:00:04,320 --> 00:00:10,080
+Step 1. Run with Dry Run True and verify the scanner detects and scores tokens correctly.
+
+3
+00:00:10,080 --> 00:00:14,560
+Step 2. Manually review 10 or more scored tokens, are they reasonable?
+
+4
+00:00:14,560 --> 00:00:18,840
+Step 3. Switch to Dry Run False with just $2 USDC.
+
+5
+00:00:18,840 --> 00:00:21,680
+Step 4. Watch 5 to 10 life cycles.
+
+6
+00:00:21,680 --> 00:00:25,720
+Step 5. Evaluate your win rate, average gain and average loss.
+
+7
+00:00:25,720 --> 00:00:29,440
+Step 6. Adjust parameters based on data, not emotions.
+
+8
+00:00:29,520 --> 00:00:33,440
+Step 7. Increase your starting amount after proven profit over 50 plus cycles.
+
+9
+00:00:33,440 --> 00:00:34,440
+Scale slowly.
+
+10
+00:00:34,440 --> 00:00:35,440
+Slide 9.
+
+1
+00:00:00,000 --> 00:00:09,300
+The bot trades across 6 Solana Dexes through Jupiter's aggregation, Radium, Orca, Meteora,
+
+2
+00:00:09,300 --> 00:00:13,020
+Pump.fun, PumpSwap and Fluxbeam.
+
+3
+00:00:13,020 --> 00:00:17,660
+The scanner listens specifically to Pump.fun for new launches.
+
+4
+00:00:17,660 --> 00:00:22,060
+But when it's time to execute the swap, Jupiter routes through whichever decks
+
+5
+00:00:22,060 --> 00:00:25,740
+offers the best price and deepest liquidity.
+
+6
+00:00:25,740 --> 00:00:31,040
+You get the best of both worlds, targeted detection and optimized execution.
+
+1
+00:00:00,000 --> 00:00:05,320
+Slide 20 – Risk Disclaimer Before we continue a critical disclaimer, trading
+
+2
+00:00:05,320 --> 00:00:08,000
+meme coins is extremely high risk.
+
+3
+00:00:08,000 --> 00:00:10,940
+The vast majority of tokens go to zero.
+
+4
+00:00:10,940 --> 00:00:14,460
+This bot is a tool, not a guaranteed money printer.
+
+5
+00:00:14,460 --> 00:00:17,580
+Only trade with money you can afford to lose entirely.
+
+6
+00:00:17,580 --> 00:00:20,640
+Past performance does not guarantee future results.
+
+7
+00:00:20,640 --> 00:00:26,480
+Start with $2, learn the system, understand the risks and scale only after seeing real
+
+8
+00:00:26,480 --> 00:00:29,560
+results over 50 plus cycles.
+
+9
+00:00:29,560 --> 00:00:32,340
+This course teaches you how the technology works.
+
+10
+00:00:32,340 --> 00:00:35,040
+What you do with it is your responsibility.
+
+1
+00:00:00,000 --> 00:00:01,000
+ability.
+
+2
+00:00:01,000 --> 00:00:04,400
+Slide 21, closer, that's the full system.
+
+3
+00:00:04,400 --> 00:00:06,760
+Detect, buy, compound.
+
+4
+00:00:06,760 --> 00:00:11,720
+Repeat, your bot watch is Pump.fun 24-7 so you don't have to.
+
+5
+00:00:11,720 --> 00:00:15,880
+You now have everything you need to build, deploy and run this bot yourself.
+
+6
+00:00:15,880 --> 00:00:22,280
+The source code is included, proven and tested, dry run, validated for over a month on Ubuntu
+
+7
+00:00:22,280 --> 00:00:23,920
+22.04.
+
+8
+00:00:23,920 --> 00:00:29,000
+Take it slow, validate every step and remember the market will always be there tomorrow.
+
+9
+00:00:29,000 --> 00:00:31,720
+Thanks for taking this course, now go build something.
+
+1
+00:00:10,930 --> 00:00:18,650
+Cover welcome in this walkthrough. We're going to set up the Jupiter compounding bot, a tool that automates a compounding trading strategy on
+
+2
+00:00:18,970 --> 00:00:23,770
+Jupiter.ag which runs on the Solana blockchain. By the end of this guide
+
+3
+00:00:23,770 --> 00:00:30,090
+you'll have the bot installed, configured and running. The whole setup takes about five minutes, so let's get started.
+
