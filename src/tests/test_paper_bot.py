@@ -3423,7 +3423,6 @@ class ReportTests(unittest.TestCase):
             fee=0.0125,
             slippage=0.0,
             channels=["@ave"],
-            session_file="bot.session",
             preflight_exit_route=False,
             mode=mode,
         )
@@ -3439,6 +3438,14 @@ class ReportTests(unittest.TestCase):
         self.assertIn("signed locally", text)
         self.assertNotIn("Paper trading only", text)
 
+    def test_startup_does_not_report_the_telegram_session_path(self) -> None:
+        # The report goes to a chat; the Telethon session file is local state
+        # and must not be echoed there.
+        for mode in ("paper", "live"):
+            text = self.startup(mode)
+            self.assertNotIn(".session", text)
+            self.assertNotIn("🔐", text)
+
     def test_resumed_startup_separates_configured_and_recovered_capital(self) -> None:
         text = format_startup(
             rule="scanner_pumpfun_amm",
@@ -3448,7 +3455,6 @@ class ReportTests(unittest.TestCase):
             fee=0.0125,
             slippage=0.0,
             channels=["@ave"],
-            session_file="bot.session",
             preflight_exit_route=False,
             mode="paper",
             recovered_cash_sol=9.979139,
@@ -3478,7 +3484,6 @@ class ReportTests(unittest.TestCase):
             fee=0.0125,
             slippage=0.0,
             channels=["@ave"],
-            session_file="bot.session",
             preflight_exit_route=True,
             mode="paper",
             recovered_cash_sol=None,
@@ -3504,7 +3509,6 @@ class ReportTests(unittest.TestCase):
             fee=0.0125,
             slippage=0.0,
             channels=["@ave"],
-            session_file="bot.session",
             preflight_exit_route=True,
             mode="paper",
             recovery_status="fresh",

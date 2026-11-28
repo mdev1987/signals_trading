@@ -734,7 +734,6 @@ def format_startup(
     fee: float,
     slippage: float,
     channels: list[str],
-    session_file: str,
     preflight_exit_route: bool,
     rule_description: str = "",
     warmup_min: float = 15.0,
@@ -808,7 +807,6 @@ def format_startup(
     lines.extend(
         [
             f"📡 **Channels:** `{', '.join(channels) or '—'}`",
-            f"🔐 **Session:** `{session_file}`",
             f"🗂 **History warm-up:** `{warmup_min:g} min` of firehose before "
             "history rules can pass",
             _divider(),
@@ -1225,7 +1223,6 @@ class TelegramReporter:
         fee: float,
         slippage: float,
         channels: list[str],
-        session_file: str,
         preflight_exit_route: bool,
         rule_description: str = "",
         warmup_min: float = 15.0,
@@ -1251,7 +1248,6 @@ class TelegramReporter:
                 fee=fee,
                 slippage=slippage,
                 channels=channels,
-                session_file=session_file,
                 preflight_exit_route=preflight_exit_route,
                 rule_description=rule_description,
                 warmup_min=warmup_min,

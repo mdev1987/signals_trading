@@ -1708,9 +1708,6 @@ async def run_live(config: LiveConfig) -> dict[str, Any]:
                     fee=config.fee,
                     slippage=config.slippage,
                     channels=config.channels,
-                    session_file=str(
-                        listener.config.session_file if listener is not None else "—"
-                    ),
                     preflight_exit_route=config.preflight_exit_route,
                     rule_description=(
                         f"{RULE_DESCRIPTIONS.get(lane.rule, '')} "
