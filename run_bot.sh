@@ -19,11 +19,20 @@
 # pre-registration (docs/QUOTE_GUARD_VARIANT.md) with its own recovery
 # snapshot; never pool its results with either other lane.
 #
+# `scanner_pumpfun_amm_tp50_quote_guard` is the V2 experiment: tp50 plus the
+# executable-exit guard. A +50 % mark is confirmed by a full-size sell quote
+# before the position closes; the guard probes every 15 s at 0.50x and walks
+# the exit-fraction ladder when a full-size route disappears. It has its own
+# recovery snapshot and is never pooled with tp50 or quote50.
+#
 # To run the frozen lane instead (no take-profit):
 #   RULE=scanner_pumpfun_amm ./run_bot.sh paper
 #
 # To run the executable-exit experiment instead:
 #   RULE=scanner_pumpfun_amm_quote50 ./run_bot.sh paper
+#
+# To run the combined tp50 + quote-guard experiment:
+#   RULE=scanner_pumpfun_amm_tp50_quote_guard ./run_bot.sh paper
 #
 # The AVE, DRBT and SOLTRENDING lanes are research-only and are NOT started by
 # this script. See docs/SCANNER_EVIDENCE.md.
@@ -41,10 +50,11 @@
 #   LIVE_MAX_SLIPPAGE_BPS  — optional ceiling for the quote widening ladder (default 1000)
 #   DAILY_LOSS_SOL         — live-mode daily realized-loss cap in SOL (default 1.0; 0 disables)
 #   RULE                   — scanner_pumpfun_amm_tp50 (default),
-#                            scanner_pumpfun_amm, or scanner_pumpfun_amm_quote50
-#   TP_PCT                 — take-profit fraction; 0.50 for the tp50 lane, empty for frozen
-#   QUOTE_GUARD_RATIO      — quote50 only: exit below this exit-value ratio (default 0.50)
-#   QUOTE_GUARD_INTERVAL_MS— quote50 only: gap between probes (default 15000)
+#                            scanner_pumpfun_amm, scanner_pumpfun_amm_quote50,
+#                            or scanner_pumpfun_amm_tp50_quote_guard
+#   TP_PCT                 — take-profit fraction; 0.50 for the tp50 lanes, empty for frozen
+#   QUOTE_GUARD_RATIO      — quote guard: exit below this exit-value ratio (default 0.50)
+#   QUOTE_GUARD_INTERVAL_MS— quote guard: gap between probes (default 15000)
 #   RESUME=1               — paper only: continue the saved wallet, open positions and
 #                            original run directory after a restart (fail-closed if the
 #                            saved state is missing or from another configuration)
@@ -90,9 +100,19 @@ case "$RULE" in
     GUARD_ARGS=(--quote-guard-ratio "${QUOTE_GUARD_RATIO:-0.50}"
                 --quote-guard-interval-ms "${QUOTE_GUARD_INTERVAL_MS:-15000}")
     ;;
+  scanner_pumpfun_amm_tp50_quote_guard)
+    # Pre-registered V2 (docs/QUOTE_GUARD_VARIANT.md): tp50 plus the
+    # executable-exit guard. TP confirmation and fractional-route recovery are
+    # enabled by the rule itself, so they cannot be forgotten on the command
+    # line. The values below must match the pre-registration.
+    TP_PCT="${TP_PCT:-0.50}"
+    GUARD_ARGS=(--quote-guard-ratio "${QUOTE_GUARD_RATIO:-0.50}"
+                --quote-guard-interval-ms "${QUOTE_GUARD_INTERVAL_MS:-15000}")
+    ;;
   *)
-    echo "ERROR: RULE must be scanner_pumpfun_amm_tp50, scanner_pumpfun_amm"
-    echo "       or scanner_pumpfun_amm_quote50."
+    echo "ERROR: RULE must be scanner_pumpfun_amm_tp50, scanner_pumpfun_amm,"
+    echo "       scanner_pumpfun_amm_quote50, or"
+    echo "       scanner_pumpfun_amm_tp50_quote_guard."
     exit 1
     ;;
 esac
@@ -104,7 +124,7 @@ fi
 # The pre-registered exit variants are paper-only. The LIVE_TRADING_ENABLED
 # opt-in protects the wallet, not the experiment, so live mode is refused
 # explicitly rather than inherited from the default rule.
-if [[ "$MODE" == "live" && ("$RULE" == "scanner_pumpfun_amm_tp50" || "$RULE" == "scanner_pumpfun_amm_quote50") ]]; then
+if [[ "$MODE" == "live" && ("$RULE" == "scanner_pumpfun_amm_tp50" || "$RULE" == "scanner_pumpfun_amm_quote50" || "$RULE" == "scanner_pumpfun_amm_tp50_quote_guard") ]]; then
   echo "ERROR: $RULE is a paper-only pre-registered variant; live mode is refused."
   echo "       Run the frozen lane (RULE=scanner_pumpfun_amm) if live is intended."
   exit 1
@@ -151,6 +171,10 @@ else
 fi
 if [[ ${#GUARD_ARGS[@]} -gt 0 ]]; then
   echo ">>> Quote guard: sell 100% if a full-size quote returns <${QUOTE_GUARD_RATIO:-0.50}x entry cost, probed every ${QUOTE_GUARD_INTERVAL_MS:-15000} ms"
+fi
+if [[ "$RULE" == "scanner_pumpfun_amm_tp50_quote_guard" ]]; then
+  echo ">>> TP confirmation: close only when a full-size quote recovers >=1.00x entry cost"
+  echo ">>> Partial-route recovery: 0.5 / 0.25 / 0.1 / 0.01 of the remaining size"
 fi
 echo ">>> Daily loss cap: ${DAILY_LOSS_SOL} SOL (0 disables)"
 echo ">>> Restart recovery: ${RESUME:-0} (paper state: $STATE_DB)"

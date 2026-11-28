@@ -282,6 +282,18 @@ class Position:
     quote_guard_last_ts_ms: int | None = None
     quote_guard_in_flight: bool = False
     quote_guard_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Fractional-route recovery counters for the combined lane. A full-size
+    # probe can fail while a smaller sale still routes; ``partial_probes``
+    # counts the smaller quotes that did route and started an exit.
+    quote_guard_partial_probes: int = 0
+    # TP confirmation state (combined lane). A +50 % mark is not a fill; the
+    # engine records what the full-size sale quote said before closing.
+    tp_confirm_in_flight: bool = False
+    tp_confirmation_checks: int = 0
+    tp_unconfirmed: int = 0
+    tp_confirmation_ratio: float | None = None
+    tp_last_confirm_ts_ms: int | None = None
+    tp_confirmation_evidence: list[dict[str, Any]] = field(default_factory=list)
     # Reference price used for the entry decision (timer mode) and how stale
     # it was; the deviation is the actual fill vs that reference.
     reference_price_sol: float | None = None
@@ -411,6 +423,14 @@ class ClosedTrade:
     quote_guard_unavailable: int = 0
     quote_guard_min_ratio: float | None = None
     quote_guard_evidence: list[dict[str, Any]] = field(default_factory=list)
+    quote_guard_partial_probes: int = 0
+    # TP confirmation evidence (combined tp50+guard lane). ``tp_unconfirmed``
+    # counts marks that reached the TP threshold but whose full-size sale
+    # quote did not recover the entry cost; those positions stayed open.
+    tp_confirmation_checks: int = 0
+    tp_unconfirmed: int = 0
+    tp_confirmation_ratio: float | None = None
+    tp_confirmation_evidence: list[dict[str, Any]] = field(default_factory=list)
     # Liquidity at signal, fill and exit time (USD). ``signal_liquidity_usd``
     # comes from the scanner card; the other two from the latest Dexscreener
     # mark, or ``None`` when no mark arrived before the fill/exit.

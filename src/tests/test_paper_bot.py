@@ -81,6 +81,10 @@ from paper_bot.signals import (  # noqa: E402
     PAPER_ONLY_RULES,
     SCANNER_QUOTE_GUARD_RULE,
     SCANNER_RULE,
+    SCANNER_TP50_QUOTE_GUARD_INTERVAL_MS,
+    SCANNER_TP50_QUOTE_GUARD_RATIO,
+    SCANNER_TP50_QUOTE_GUARD_RULE,
+    SCANNER_TP50_QUOTE_GUARD_TP_PCT,
     SCANNER_TP50_RULE,
     GateConfig,
     evaluate_gate,
@@ -216,11 +220,16 @@ class ScannerCardTests(unittest.TestCase):
                 allowed(SCANNER_RULE, **features),
                 allowed(SCANNER_QUOTE_GUARD_RULE, **features),
             )
+            self.assertEqual(
+                allowed(SCANNER_RULE, **features),
+                allowed(SCANNER_TP50_QUOTE_GUARD_RULE, **features),
+            )
 
     def test_all_scanner_lanes_share_first_card_only_handling(self) -> None:
         self.assertTrue(is_scanner_rule(SCANNER_RULE))
         self.assertTrue(is_scanner_rule(SCANNER_TP50_RULE))
         self.assertTrue(is_scanner_rule(SCANNER_QUOTE_GUARD_RULE))
+        self.assertTrue(is_scanner_rule(SCANNER_TP50_QUOTE_GUARD_RULE))
         self.assertFalse(is_scanner_rule("baseline"))
 
     def test_dex_match_ignores_case_and_padding_in_both_paths(self) -> None:
@@ -703,6 +712,74 @@ class EngineGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade.exit_status, "near_zero_exit")
         # The PIT reason is untouched; only the outcome classification changed.
         self.assertEqual(trade.exit_reason, "horizon")
+
+    async def test_catastrophic_take_profit_is_classified_near_zero(self) -> None:
+        engine = self.engine()
+        position = Position(
+            signal=self.make_signal(),
+            mint=MINT,
+            entry_ts_ms=self.NOW_MS - 300_000,
+            entry_price_sol=1e-3,
+            size=100.0,
+            entry_value_sol=0.1,
+            entry_fee_sol=0.00125,
+            entry_impact=0.0,
+            horizon_ts_ms=self.NOW_MS + 60_000,
+        )
+        position.sold_size = 100.0
+        position.size = 0.0
+        position.exit_price_acc = 1e-6
+        position.exit_value_acc = 1e-6
+        position.exit_fee_acc = 0.0
+        position.pnl_acc = -0.10125 + 1e-6
+        position.entry_basis_acc = 0.1
+        position.entry_fee_acc = 0.00125
+        # The mark reached +50 %, so the PIT reason is take_profit; the sale
+        # still recovered ~nothing. The outcome must be visible as near-zero.
+        position.exit_reason = "take_profit"
+        position.exit_status = "tp_hit"
+        position.exit_ts_ms = self.NOW_MS
+        engine.positions[MINT] = position
+
+        engine._commit_close(
+            position, FillQuote(price_sol=1e-8, source="jupiter")
+        )
+
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_status, "near_zero_exit")
+        self.assertEqual(trade.exit_reason, "take_profit")
+
+    async def test_normal_take_profit_keeps_its_status(self) -> None:
+        engine = self.engine()
+        position = Position(
+            signal=self.make_signal(),
+            mint=MINT,
+            entry_ts_ms=self.NOW_MS - 300_000,
+            entry_price_sol=1e-3,
+            size=100.0,
+            entry_value_sol=0.1,
+            entry_fee_sol=0.00125,
+            entry_impact=0.0,
+            horizon_ts_ms=self.NOW_MS + 60_000,
+        )
+        position.sold_size = 100.0
+        position.size = 0.0
+        position.exit_price_acc = 1.5e-3
+        position.exit_value_acc = 0.15
+        position.exit_fee_acc = 0.0
+        position.pnl_acc = 0.04875
+        position.entry_basis_acc = 0.1
+        position.entry_fee_acc = 0.00125
+        position.exit_reason = "take_profit"
+        position.exit_status = "tp_hit"
+        position.exit_ts_ms = self.NOW_MS
+        engine.positions[MINT] = position
+
+        engine._commit_close(
+            position, FillQuote(price_sol=1.5e-3, source="jupiter")
+        )
+
+        self.assertEqual(engine.closed[-1].exit_status, "tp_hit")
 
     async def test_synthetic_fallback_is_not_reclassified_near_zero(self) -> None:
         engine = self.engine()
@@ -1811,6 +1888,283 @@ class QuoteGuardExitTests(unittest.IsolatedAsyncioTestCase):
             EngineConfig(quote_guard_interval_ms=0)
 
 
+class CombinedTp50QuoteGuardTests(unittest.IsolatedAsyncioTestCase):
+    """V2: TP and the executable guard in one pre-registered lane.
+
+    A +50 % mark only closes when a full-size sell quote still recovers the
+    entry cost. When the full-size route disappears, the guard probes smaller
+    fractions and lets the ordinary exit ladder sell what it can.
+    """
+
+    NOW_MS = 1_800_000_000_000
+
+    class ScriptedQuotes:
+        def __init__(self, route) -> None:
+            self.route = route
+            self.sizes: list[float] = []
+
+        async def exit_quote(
+            self,
+            mint: str,
+            size_tokens: float,
+            reference_price_sol: float | None,
+            *,
+            decimals: int | None = None,
+            action: str = "exit",
+        ) -> FillQuote:
+            self.sizes.append(size_tokens)
+            price = self.route(size_tokens)
+            return FillQuote(
+                price_sol=price,
+                source="test",
+                out_amount=int(price * size_tokens * 1_000_000_000),
+                price_impact_pct=-0.4,
+                slippage_bps=50,
+                quoted_at_ms=1_800_000_000_000,
+            )
+
+    def engine(
+        self,
+        quotes: "CombinedTp50QuoteGuardTests.ScriptedQuotes",
+        **overrides: object,
+    ) -> PaperEngine:
+        wallet = PaperWallet(WalletConfig(starting_sol=10.0))
+        broker = PaperBroker(BrokerConfig(notional_sol=0.1), wallet=wallet)
+        settings: dict[str, object] = dict(
+            entry_delay_ms=5_000,
+            max_entry_delay_ms=60_000,
+            live=True,
+            horizon_ms=300_000,
+            tp_pct=0.50,
+            quote_guard_ratio=0.50,
+            quote_guard_interval_ms=15_000,
+            tp_require_executable_quote=True,
+            tp_min_executable_ratio=1.0,
+            quote_guard_fraction_probe=True,
+        )
+        settings.update(overrides)
+        return PaperEngine(
+            config=EngineConfig(**settings),  # type: ignore[arg-type]
+            broker=broker,
+            quotes=quotes,
+            history=MarketHistory(),
+            gate=GateConfig(rule=SCANNER_TP50_QUOTE_GUARD_RULE),
+            store=None,
+            clock=lambda: self.NOW_MS,
+        )
+
+    def position(self) -> Position:
+        return Position(
+            signal=Signal(
+                token_address=MINT,
+                signal_ts_ms=self.NOW_MS - 130_000,
+                received_ts_ms=self.NOW_MS - 128_000,
+                channel="@test",
+                message_id=1,
+                network="solana",
+                address_status="confirmed",
+                address_type="mint",
+                message_type="scanner_pool_launch",
+                is_buy_signal=True,
+                is_confirmed_buy_signal=True,
+                features={},
+            ),
+            mint=MINT,
+            entry_ts_ms=self.NOW_MS - 120_000,
+            entry_price_sol=1e-3,
+            size=100.0,
+            entry_value_sol=0.1,
+            entry_fee_sol=0.00125,
+            entry_impact=0.0,
+            horizon_ts_ms=self.NOW_MS + 180_000,
+            tp_level=1.5e-3,
+            quote_guard_ratio=0.50,
+            last_price_sol=1e-3,
+            last_ts_ms=self.NOW_MS - 1_000,
+            decimals=6,
+        )
+
+    async def test_confirmed_tp_closes_only_after_a_full_size_quote(self) -> None:
+        quotes = self.ScriptedQuotes(lambda size: 1.55e-3)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+        engine.broker.wallet.token_balances[MINT] = position.size
+
+        await engine._on_position_price(
+            position, self.NOW_MS, 1.60e-3, await_actions=True
+        )
+
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_reason, "take_profit")
+        self.assertEqual(trade.exit_status, "tp_hit")
+        self.assertEqual(trade.exit_trigger_source, "tp_confirmation")
+        self.assertEqual(trade.exit_trigger_price_sol, 1.60e-3)
+        self.assertEqual(trade.tp_confirmation_checks, 1)
+        self.assertEqual(trade.tp_unconfirmed, 0)
+        self.assertGreater(trade.tp_confirmation_ratio, 1.0)
+        self.assertEqual(trade.tp_confirmation_evidence[0]["status"], "confirmed")
+
+    async def test_tp_mark_that_cannot_recover_entry_cost_stays_open(self) -> None:
+        quotes = self.ScriptedQuotes(lambda size: 1.0e-3)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+
+        await engine._on_position_price(
+            position, self.NOW_MS, 1.60e-3, await_actions=True
+        )
+
+        self.assertFalse(position.exit_requested)
+        self.assertEqual(len(engine.closed), 0)
+        self.assertEqual(position.tp_confirmation_checks, 1)
+        self.assertEqual(position.tp_unconfirmed, 1)
+        self.assertLess(position.tp_confirmation_ratio, 1.0)
+        self.assertEqual(
+            position.tp_confirmation_evidence[0]["status"], "unconfirmed"
+        )
+        # The mark did not become a fill.
+        self.assertEqual(quotes.sizes, [100.0])
+
+    async def test_tp_confirmation_is_rate_limited_to_one_probe_per_interval(
+        self,
+    ) -> None:
+        quotes = self.ScriptedQuotes(lambda size: 1.0e-3)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+
+        await engine._on_position_price(
+            position, self.NOW_MS, 1.60e-3, await_actions=True
+        )
+        await engine._on_position_price(
+            position, self.NOW_MS + 1_000, 1.61e-3, await_actions=True
+        )
+        self.assertEqual(len(quotes.sizes), 1)
+        self.assertEqual(position.tp_unconfirmed, 1)
+
+        # Once the interval elapses a routable quote confirms and closes.
+        quotes.route = lambda size: 1.55e-3
+        engine.broker.wallet.token_balances[MINT] = position.size
+        await engine._on_position_price(
+            position, self.NOW_MS + 15_000, 1.62e-3, await_actions=True
+        )
+        self.assertEqual(position.tp_confirmation_checks, 2)
+        self.assertEqual(engine.closed[-1].exit_status, "tp_hit")
+
+    async def test_unavailable_tp_quote_is_not_a_fill(self) -> None:
+        def route(size: float) -> float:
+            raise QuoteError("quote_no_route", "tp")
+
+        quotes = self.ScriptedQuotes(route)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+
+        await engine._on_position_price(
+            position, self.NOW_MS, 1.60e-3, await_actions=True
+        )
+
+        self.assertFalse(position.exit_requested)
+        self.assertEqual(position.tp_unconfirmed, 1)
+        evidence = position.tp_confirmation_evidence[0]
+        self.assertEqual(evidence["status"], "unavailable")
+        self.assertEqual(evidence["reason"], "quote_no_route")
+        self.assertIsNone(evidence["ratio"])
+        self.assertEqual(len(engine.closed), 0)
+
+    async def test_full_size_route_failure_falls_back_to_a_partial_liquidation(
+        self,
+    ) -> None:
+        def route(size: float) -> float:
+            if size >= 60.0:
+                raise QuoteError("quote_no_route", "size")
+            return 0.0006
+
+        quotes = self.ScriptedQuotes(route)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+        engine.broker.wallet.token_balances[MINT] = position.size
+
+        await engine._check_quote_guard(position, self.NOW_MS)
+
+        trade = engine.closed[-1]
+        self.assertEqual(trade.exit_reason, "quote_guard_partial")
+        self.assertEqual(trade.exit_status, "quote_guard_exit")
+        self.assertEqual(trade.exit_trigger_source, "quote_guard")
+        self.assertEqual(trade.quote_guard_unavailable, 1)
+        self.assertEqual(trade.quote_guard_partial_probes, 1)
+        # The full-size probe is evidence, not a sale; the ladder sold the
+        # position in the fractions that actually routed.
+        self.assertEqual(trade.exit_quote_fractions[0], 0.5)
+        self.assertGreater(trade.size, 0.0)
+        evidence = trade.quote_guard_evidence
+        unavailable = [row for row in evidence if row["status"] == "unavailable"]
+        partial = [row for row in evidence if row["status"] == "partial_route"]
+        self.assertEqual(len(unavailable), 1)
+        self.assertEqual(partial[0]["fraction"], 0.5)
+        self.assertIsNotNone(partial[0]["ratio"])
+
+    async def test_fraction_probe_is_off_for_the_v1_guard(self) -> None:
+        def route(size: float) -> float:
+            raise QuoteError("quote_no_route", "size")
+
+        quotes = self.ScriptedQuotes(route)
+        engine = self.engine(quotes, quote_guard_fraction_probe=False)
+        position = self.position()
+        engine.positions[MINT] = position
+
+        await engine._check_quote_guard(position, self.NOW_MS)
+
+        self.assertFalse(position.exit_requested)
+        self.assertEqual(position.quote_guard_unavailable, 1)
+        self.assertEqual(position.quote_guard_partial_probes, 0)
+        self.assertEqual([row["status"] for row in position.quote_guard_evidence],
+                         ["unavailable"])
+
+    async def test_all_fractions_failing_is_recorded_without_a_sale(self) -> None:
+        def route(size: float) -> float:
+            raise QuoteError("quote_no_route", "size")
+
+        quotes = self.ScriptedQuotes(route)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+
+        await engine._check_quote_guard(position, self.NOW_MS)
+
+        self.assertFalse(position.exit_requested)
+        self.assertEqual(len(engine.closed), 0)
+        self.assertEqual(position.quote_guard_partial_probes, 0)
+        statuses = [row["status"] for row in position.quote_guard_evidence]
+        self.assertEqual(statuses[0], "unavailable")
+        self.assertTrue(all(s == "partial_unavailable" for s in statuses[1:]))
+        self.assertGreater(len(statuses), 1)
+
+    async def test_transient_quote_error_does_not_start_a_partial_exit(self) -> None:
+        def route(size: float) -> float:
+            raise QuoteError("quote_timeout", "venue")
+
+        quotes = self.ScriptedQuotes(route)
+        engine = self.engine(quotes)
+        position = self.position()
+        engine.positions[MINT] = position
+
+        await engine._check_quote_guard(position, self.NOW_MS)
+
+        # A timeout is a venue problem, not proof that the pool is gone. The
+        # guard records it and waits for the next interval.
+        self.assertFalse(position.exit_requested)
+        self.assertEqual(len(engine.closed), 0)
+        self.assertEqual(position.quote_guard_unavailable, 1)
+        self.assertEqual(position.quote_guard_partial_probes, 0)
+        self.assertEqual(
+            [row["status"] for row in position.quote_guard_evidence],
+            ["unavailable"],
+        )
+
+
 class ScannerCardDedupTests(unittest.TestCase):
     """The first card per pool is the only one that may reach the engine."""
 
@@ -1930,9 +2284,69 @@ class LiveGuardTests(unittest.TestCase):
             asyncio.run(run_live(config))
         self.assertIn("paper-only", str(caught.exception))
 
+    def test_live_mode_refuses_the_paper_only_combined_rule(self) -> None:
+        from paper_bot.live import LiveConfig, run_live
+
+        config = LiveConfig(
+            channels=["@test"],
+            config_path=Path("config.ini"),
+            run_dir=Path("output/paper/run"),
+            mode="live",
+            rule=SCANNER_TP50_QUOTE_GUARD_RULE,
+        )
+        with self.assertRaises(ValueError) as caught:
+            asyncio.run(run_live(config))
+        self.assertIn("paper-only", str(caught.exception))
+
+    def test_combined_rule_forces_the_pre_registered_exit_settings(self) -> None:
+        from paper_bot.live import LiveConfig
+
+        config = LiveConfig(
+            channels=["@test"],
+            config_path=Path("config.ini"),
+            run_dir=Path("output/paper/run"),
+            rule=SCANNER_TP50_QUOTE_GUARD_RULE,
+        )
+        self.assertEqual(config.tp_pct, SCANNER_TP50_QUOTE_GUARD_TP_PCT)
+        self.assertEqual(
+            config.quote_guard_ratio, SCANNER_TP50_QUOTE_GUARD_RATIO
+        )
+        self.assertEqual(
+            config.quote_guard_interval_ms,
+            SCANNER_TP50_QUOTE_GUARD_INTERVAL_MS,
+        )
+        self.assertTrue(config.tp_require_executable_quote)
+        self.assertTrue(config.quote_guard_fraction_probe)
+        # Explicit values that match the pre-registration are accepted.
+        matching = LiveConfig(
+            channels=["@test"],
+            config_path=Path("config.ini"),
+            run_dir=Path("output/paper/run"),
+            rule=SCANNER_TP50_QUOTE_GUARD_RULE,
+            tp_pct=0.50,
+            quote_guard_ratio=0.50,
+            quote_guard_interval_ms=15_000,
+        )
+        self.assertEqual(matching.tp_pct, 0.50)
+        # A retune under the same lane name is refused.
+        for overrides in (
+            {"tp_pct": 0.60},
+            {"quote_guard_ratio": 0.70},
+            {"quote_guard_interval_ms": 5_000},
+        ):
+            with self.assertRaises(ValueError):
+                LiveConfig(
+                    channels=["@test"],
+                    config_path=Path("config.ini"),
+                    run_dir=Path("output/paper/run"),
+                    rule=SCANNER_TP50_QUOTE_GUARD_RULE,
+                    **overrides,
+                )
+
     def test_only_the_variants_are_declared_paper_only(self) -> None:
         self.assertIn(SCANNER_TP50_RULE, PAPER_ONLY_RULES)
         self.assertIn(SCANNER_QUOTE_GUARD_RULE, PAPER_ONLY_RULES)
+        self.assertIn(SCANNER_TP50_QUOTE_GUARD_RULE, PAPER_ONLY_RULES)
         self.assertNotIn(SCANNER_RULE, PAPER_ONLY_RULES)
 
     def test_quote_guard_is_part_of_the_recovery_fingerprint(self) -> None:
@@ -1956,6 +2370,24 @@ class LiveGuardTests(unittest.TestCase):
         self.assertNotEqual(
             base, fingerprint(quote_guard_interval_ms=30_000)
         )
+
+    def test_combined_tp_confirmation_is_part_of_the_recovery_fingerprint(self) -> None:
+        from paper_bot.live import LiveConfig, _recovery_fingerprint
+
+        config = LiveConfig(
+            channels=["@test"],
+            config_path=Path("config.ini"),
+            run_dir=Path("output/paper/run"),
+            rule=SCANNER_TP50_QUOTE_GUARD_RULE,
+        )
+        fingerprint = _recovery_fingerprint(
+            config, config.rule, "trade"
+        )
+        self.assertTrue(fingerprint["tp_require_executable_quote"])
+        self.assertEqual(fingerprint["tp_min_executable_ratio"], 1.0)
+        self.assertTrue(fingerprint["quote_guard_fraction_probe"])
+        self.assertEqual(fingerprint["tp_pct"], 0.50)
+        self.assertEqual(fingerprint["quote_guard_ratio"], 0.50)
 
     def test_live_config_fails_closed_without_opt_in(self) -> None:
         config = live_config_from_env(

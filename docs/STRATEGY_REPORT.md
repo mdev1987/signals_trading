@@ -185,8 +185,11 @@ Two levers remain, in order of expected value:
    pools that stop printing while the position is open, which a print-based
    stop cannot see. The separate `scanner_pumpfun_amm_quote50` lane asks what a
    full-size sale would return every 15 s and sells below `0.50×` entry cost
-   ([`QUOTE_GUARD_VARIANT.md`](QUOTE_GUARD_VARIANT.md)). It is paper-only and
-   has its own sample; it is **not** the deployed lane.
+   ([`QUOTE_GUARD_VARIANT.md`](QUOTE_GUARD_VARIANT.md)). The combined
+   `scanner_pumpfun_amm_tp50_quote_guard` variant keeps the +50 % exit but
+   confirms the mark with a full-size quote and adds fraction-based salvage
+   when the full-size route disappears. Both are paper-only with their own
+   samples; neither is the deployed lane.
 3. **More days on a fixed lane.** The frozen lane is at break-even with a ~20 %
    tail; the tp50 lane is a fragile positive in the study. Only a longer forward
    sample can tell whether either survives, and the gates already encode what

@@ -34,6 +34,7 @@ SUPPORTED_RULES = (
     "scanner_pumpfun_amm",
     "scanner_pumpfun_amm_tp50",
     "scanner_pumpfun_amm_quote50",
+    "scanner_pumpfun_amm_tp50_quote_guard",
 )
 
 # Human-readable descriptions used by the startup report and meta.json.
@@ -86,6 +87,12 @@ RULE_DESCRIPTIONS = {
         "the entry cost; otherwise exit at 5 min (pre-registered exit "
         "variant)"
     ),
+    "scanner_pumpfun_amm_tp50_quote_guard": (
+        "same scanner entry as scanner_pumpfun_amm, with +50% take-profit "
+        "confirmed by a full-size executable quote and a 0.50x quote guard "
+        "probed every 15 s; fractional-route recovery on an unavailable "
+        "full-size quote (pre-registered exit variant)"
+    ),
 }
 
 # Scanner-feed strategy (2026-11-22). On the four replay days with scanner
@@ -112,16 +119,35 @@ SCANNER_TP50_RULE = "scanner_pumpfun_amm_tp50"
 # docs/QUOTE_GUARD_VARIANT.md. Its own recovery snapshot keeps the sample
 # separate from both the frozen lane and tp50.
 SCANNER_QUOTE_GUARD_RULE = "scanner_pumpfun_amm_quote50"
+# Pre-registered combined variant (docs/QUOTE_GUARD_VARIANT.md, V2): the tp50
+# exit plus the executable-exit guard, with the TP mark confirmed by a
+# full-size sell quote. A mark is not a price at which the whole position can
+# be sold, so a +50 % print only closes the position when the quote still
+# recovers at least the entry cost. When the full-size route disappears, the
+# guard walks the normal exit-fraction ladder instead of waiting blind. Its own
+# recovery snapshot keeps the sample separate from every other lane.
+SCANNER_TP50_QUOTE_GUARD_RULE = "scanner_pumpfun_amm_tp50_quote_guard"
+# Frozen parameters for that lane. A different value is a new pre-registration,
+# not a retune of this sample.
+SCANNER_TP50_QUOTE_GUARD_TP_PCT = 0.50
+SCANNER_TP50_QUOTE_GUARD_RATIO = 0.50
+SCANNER_TP50_QUOTE_GUARD_INTERVAL_MS = 15_000
+SCANNER_TP_CONFIRM_MIN_RATIO = 1.00
 SCANNER_RULES = (
     SCANNER_RULE,
     SCANNER_TP50_RULE,
     SCANNER_QUOTE_GUARD_RULE,
+    SCANNER_TP50_QUOTE_GUARD_RULE,
 )
 # Rules that may only run in paper mode. Live execution is refused for these
 # even when the operator supplies the LIVE_TRADING_ENABLED opt-in, because the
 # variant is still an experiment.
 PAPER_ONLY_RULES = frozenset(
-    {SCANNER_TP50_RULE, SCANNER_QUOTE_GUARD_RULE}
+    {
+        SCANNER_TP50_RULE,
+        SCANNER_QUOTE_GUARD_RULE,
+        SCANNER_TP50_QUOTE_GUARD_RULE,
+    }
 )
 SCANNER_ALLOWED_DEX = "Pumpfunamm"
 SCANNER_MIN_LIQUIDITY_USD = 20_000.0

@@ -204,6 +204,19 @@ class EngineConfig:
     # not the last trade print: a pool that stops printing is still probed.
     quote_guard_ratio: float | None = None
     quote_guard_interval_ms: int = 15_000
+    # TP confirmation for the combined tp50+guard lane. A mark at the TP
+    # threshold is only a candidate: the engine asks what a full-size sale
+    # would actually return and closes only when the net executable ratio is
+    # at least ``tp_min_executable_ratio``. An unconfirmed mark is recorded
+    # (``tp_unconfirmed``) and the position stays open under the quote guard
+    # and the ordinary five-minute deadline.
+    tp_require_executable_quote: bool = False
+    tp_min_executable_ratio: float = 1.0
+    # When a full-size guard probe has no route, walk the normal exit-fraction
+    # ladder and, if a smaller size routes, start a partial liquidation through
+    # the existing exit machinery. A route failure is still never counted as a
+    # fill.
+    quote_guard_fraction_probe: bool = False
     live: bool = False
     exit_quote_timeout_ms: int = 30_000
     slippage_bps: int = 50
@@ -258,6 +271,8 @@ class EngineConfig:
             raise ValueError("quote_guard_ratio must be in (0, 1)")
         if self.quote_guard_interval_ms <= 0:
             raise ValueError("quote_guard_interval_ms must be positive")
+        if self.tp_min_executable_ratio <= 0:
+            raise ValueError("tp_min_executable_ratio must be positive")
 
 
 def preflight_exit_value_ratio(
@@ -1914,6 +1929,31 @@ class PaperEngine:
         position.last_ts_ms = ts_ms
 
         if position.tp_level is not None and price_sol >= position.tp_level:
+            if self.config.tp_require_executable_quote:
+                # A mark at +50 % is a candidate, not a fill. Ask what the
+                # whole position would actually return before closing.
+                if self._tp_confirmation_due(position, ts_ms):
+                    position.tp_confirm_in_flight = True
+                    position.tp_last_confirm_ts_ms = ts_ms
+                    if await_actions:
+                        await self._confirm_take_profit(
+                            position,
+                            ts_ms,
+                            price_sol,
+                            source=source,
+                            await_actions=True,
+                        )
+                    else:
+                        self._spawn(
+                            self._confirm_take_profit(
+                                position,
+                                ts_ms,
+                                price_sol,
+                                source=source,
+                                await_actions=False,
+                            )
+                        )
+                return
             await self._trigger_exit(
                 position,
                 "take_profit",
@@ -1943,6 +1983,131 @@ class PaperEngine:
         # several events can share that millisecond. ``tick``/``finalize``
         # close after the timestamp batch has been consumed.
 
+    def _tp_confirmation_due(self, position: Position, ts_ms: int) -> bool:
+        """True when a TP mark should be checked against a real sale quote.
+
+        Re-confirming on every print above the target would turn a burst into
+        a burst of Jupiter requests. One check per guard interval is enough to
+        catch a mark that has become executable, and a mark that stays
+        unexecutable is exactly what the quote guard is for.
+        """
+        if position.tp_confirm_in_flight or position.quote_guard_in_flight:
+            return False
+        last = position.tp_last_confirm_ts_ms
+        if last is not None and ts_ms - last < self.config.quote_guard_interval_ms:
+            return False
+        return True
+
+    async def _confirm_take_profit(
+        self,
+        position: Position,
+        ts_ms: int,
+        mark_price_sol: float,
+        *,
+        source: str,
+        await_actions: bool,
+    ) -> None:
+        """Close at TP only when a full-size quote confirms the exit value.
+
+        The mark says a print traded at +50 %; it does not say the whole
+        position could be sold there. A quote that recovers at least
+        ``tp_min_executable_ratio`` of the entry cash cost confirms the TP;
+        anything else is recorded as ``tp_unconfirmed`` and the position stays
+        open under the quote guard and the five-minute deadline. An
+        unavailable route is evidence, never a fill.
+        """
+        try:
+            try:
+                quote = await self.quotes.exit_quote(
+                    position.mint,
+                    position.size,
+                    position.last_price_sol or position.entry_price_sol,
+                    decimals=position.decimals,
+                )
+            except QuoteError as exc:
+                position.tp_unconfirmed += 1
+                position.tp_confirmation_evidence.append(
+                    {
+                        "ts_ms": ts_ms,
+                        "status": "unavailable",
+                        "reason": exc.reason,
+                        "ratio": None,
+                        "mark_price_sol": mark_price_sol,
+                        "mark_source": source,
+                    }
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a probe must not wedge
+                LOGGER.exception(
+                    "TP confirmation failed for %s: %s", position.mint, exc
+                )
+                position.tp_unconfirmed += 1
+                position.tp_confirmation_evidence.append(
+                    {
+                        "ts_ms": ts_ms,
+                        "status": "unavailable",
+                        "reason": f"tp_confirm_error:{type(exc).__name__}",
+                        "ratio": None,
+                        "mark_price_sol": mark_price_sol,
+                        "mark_source": source,
+                    }
+                )
+                return
+
+            entry_cost = position.entry_value_sol + position.entry_fee_sol
+            ratio = preflight_exit_value_ratio(
+                entry_cost_sol=entry_cost,
+                size_tokens=position.size,
+                exit_price_sol=quote.price_sol,
+                fee=self.broker.config.fee,
+                slippage=self.broker.config.slippage,
+            )
+            position.tp_confirmation_checks += 1
+            position.tp_confirmation_ratio = ratio
+            confirmed = (
+                ratio is not None
+                and ratio >= self.config.tp_min_executable_ratio
+            )
+            row = {
+                "ts_ms": ts_ms,
+                "status": "confirmed" if confirmed else (
+                    "unconfirmed" if ratio is not None else "invalid"
+                ),
+                "reason": None,
+                "ratio": ratio,
+                "mark_price_sol": mark_price_sol,
+                "mark_source": source,
+                "price_sol": quote.price_sol,
+                "out_amount": quote.out_amount,
+                "price_impact_pct": quote.price_impact_pct,
+                "slippage_bps": quote.slippage_bps,
+                "quoted_at_ms": quote.quoted_at_ms,
+            }
+            position.tp_confirmation_evidence.append(row)
+            if len(position.tp_confirmation_evidence) > 64:
+                del position.tp_confirmation_evidence[:-64]
+            if not confirmed:
+                position.tp_unconfirmed += 1
+                return
+            if self.positions.get(position.mint) is not position:
+                return
+            await self._trigger_exit(
+                position,
+                "take_profit",
+                "tp_hit",
+                quote.price_sol,
+                ts_ms,
+                await_actions=await_actions,
+                trigger_source="tp_confirmation",
+                trigger_price=mark_price_sol,
+                trigger_ts_ms=ts_ms,
+                reference_kind="trigger_observation",
+            )
+        finally:
+            position.tp_confirm_in_flight = False
+
     def _quote_guard_due(self, position: Position, now_ms: int) -> bool:
         """True when the executable-exit guard should probe this position.
 
@@ -1952,7 +2117,7 @@ class PaperEngine:
         """
         if position.quote_guard_ratio is None or position.exit_requested:
             return False
-        if position.quote_guard_in_flight:
+        if position.quote_guard_in_flight or position.tp_confirm_in_flight:
             return False
         # The horizon close is already due: a probe cannot change the decision
         # and would race the sale it is about to price.
@@ -1977,6 +2142,7 @@ class PaperEngine:
         position.quote_guard_in_flight = True
         position.quote_guard_last_ts_ms = now_ms
         try:
+            entry_cost = position.entry_value_sol + position.entry_fee_sol
             try:
                 quote = await self.quotes.exit_quote(
                     position.mint,
@@ -1994,6 +2160,18 @@ class PaperEngine:
                         "ratio": None,
                     }
                 )
+                self._truncate_guard_evidence(position)
+                if (
+                    self.config.quote_guard_fraction_probe
+                    and is_terminal_exit_error(exc.reason)
+                ):
+                    # Only a genuine route/size failure is evidence that the
+                    # pool can no longer absorb the full position. A timeout
+                    # or 5xx is a venue problem; probing fractions on it would
+                    # manufacture a premature exit.
+                    await self._recover_partial_route(
+                        position, now_ms, entry_cost
+                    )
                 return
             except asyncio.CancelledError:
                 raise
@@ -2010,9 +2188,9 @@ class PaperEngine:
                         "ratio": None,
                     }
                 )
+                self._truncate_guard_evidence(position)
                 return
 
-            entry_cost = position.entry_value_sol + position.entry_fee_sol
             ratio = preflight_exit_value_ratio(
                 entry_cost_sol=entry_cost,
                 size_tokens=position.size,
@@ -2039,8 +2217,7 @@ class PaperEngine:
                     "quoted_at_ms": quote.quoted_at_ms,
                 }
             )
-            if len(position.quote_guard_evidence) > 64:
-                del position.quote_guard_evidence[:-64]
+            self._truncate_guard_evidence(position)
 
             # Fail closed: an unpriceable quote is not proof the position is
             # still sellable, but it is also not a fill, so it cannot trigger
@@ -2063,6 +2240,114 @@ class PaperEngine:
             )
         finally:
             position.quote_guard_in_flight = False
+
+    async def _recover_partial_route(
+        self,
+        position: Position,
+        now_ms: int,
+        entry_cost: float,
+    ) -> bool:
+        """Start a partial liquidation when only a smaller sale still routes.
+
+        A full-size quote failing is the strongest available evidence that the
+        pool is deteriorating. The normal exit ladder may still route a
+        fraction, so probe the configured fractions and, on the first one that
+        prices, hand the position to the ordinary exit machinery. The ladder
+        decides what can actually be sold; this probe never invents a fill.
+        """
+        for fraction in self.config.exit_fractions:
+            fraction = min(max(float(fraction), 0.0), 1.0)
+            if fraction >= 1.0:
+                continue
+            size = position.size * fraction
+            if size <= DUST_SIZE:
+                continue
+            try:
+                quote = await self.quotes.exit_quote(
+                    position.mint,
+                    size,
+                    position.last_price_sol or position.entry_price_sol,
+                    decimals=position.decimals,
+                )
+            except QuoteError as exc:
+                position.quote_guard_evidence.append(
+                    {
+                        "ts_ms": now_ms,
+                        "status": "partial_unavailable",
+                        "reason": exc.reason,
+                        "fraction": fraction,
+                        "ratio": None,
+                    }
+                )
+                self._truncate_guard_evidence(position)
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a probe must not wedge
+                LOGGER.exception(
+                    "partial-route probe failed for %s: %s",
+                    position.mint,
+                    exc,
+                )
+                position.quote_guard_evidence.append(
+                    {
+                        "ts_ms": now_ms,
+                        "status": "partial_unavailable",
+                        "reason": f"guard_error:{type(exc).__name__}",
+                        "fraction": fraction,
+                        "ratio": None,
+                    }
+                )
+                self._truncate_guard_evidence(position)
+                continue
+
+            ratio = preflight_exit_value_ratio(
+                # Compare this fraction with the same fraction of the entry
+                # cash cost; comparing a half-size sale with the full entry
+                # would always look low by construction.
+                entry_cost_sol=entry_cost * fraction,
+                size_tokens=size,
+                exit_price_sol=quote.price_sol,
+                fee=self.broker.config.fee,
+                slippage=self.broker.config.slippage,
+            )
+            position.quote_guard_partial_probes += 1
+            position.quote_guard_evidence.append(
+                {
+                    "ts_ms": now_ms,
+                    "status": "partial_route",
+                    "reason": None,
+                    "fraction": fraction,
+                    "ratio": ratio,
+                    "price_sol": quote.price_sol,
+                    "out_amount": quote.out_amount,
+                    "price_impact_pct": quote.price_impact_pct,
+                    "slippage_bps": quote.slippage_bps,
+                    "quoted_at_ms": quote.quoted_at_ms,
+                }
+            )
+            self._truncate_guard_evidence(position)
+            if self.positions.get(position.mint) is not position:
+                return False
+            await self._trigger_exit(
+                position,
+                "quote_guard_partial",
+                "quote_guard_exit",
+                quote.price_sol,
+                now_ms,
+                await_actions=True,
+                trigger_source="quote_guard",
+                trigger_price=quote.price_sol,
+                trigger_ts_ms=now_ms,
+                reference_kind="trigger_observation",
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _truncate_guard_evidence(position: Position) -> None:
+        if len(position.quote_guard_evidence) > 64:
+            del position.quote_guard_evidence[:-64]
 
     async def _trigger_exit(
         self,
@@ -2349,17 +2634,6 @@ class PaperEngine:
         exit_status = position.exit_status or "horizon_complete"
         if forced and quote.source == "fallback_feed":
             exit_status = "forced_no_price"
-        # A priced sale that recovered almost nothing is not a normal horizon
-        # exit, even though the quote technically routed. Keep the reason as
-        # ``horizon`` (the PIT decision) and classify only the outcome.
-        entry_cost = position.entry_basis_acc + position.entry_fee_acc
-        if (
-            exit_status == "horizon_complete"
-            and quote.source not in {"fallback_feed", "forced", "no_route"}
-            and entry_cost > 0
-            and position.exit_value_acc / entry_cost < NEAR_ZERO_EXIT_RATIO
-        ):
-            exit_status = "near_zero_exit"
         exit_ts = (
             position.exit_ts_ms or position.exit_requested_ts_ms or position.entry_ts_ms
         )
@@ -2368,6 +2642,20 @@ class PaperEngine:
             and position.last_ts_ms <= position.entry_ts_ms
             and position.exit_reason == "horizon"
         )
+        # A priced sale that recovered almost nothing is a catastrophic exit,
+        # whatever triggered it. A TP that was marked +50 % but sold for
+        # ~nothing, or a quote-guard sale into a collapsed book, must not keep
+        # a reassuring ``tp_hit``/``quote_guard_exit`` label. Keep the PIT
+        # reason and reclassify only the outcome. A synthetic/forced mark has
+        # no executable quote, so it is never reclassified.
+        entry_cost = position.entry_basis_acc + position.entry_fee_acc
+        if (
+            not synthetic
+            and exit_status != "no_route"
+            and entry_cost > 0
+            and position.exit_value_acc / entry_cost < NEAR_ZERO_EXIT_RATIO
+        ):
+            exit_status = "near_zero_exit"
         cost_basis = position.entry_basis_acc + position.entry_fee_acc
         total_size = position.sold_size + position.unsold_size
         avg_exit_price = (
@@ -2441,6 +2729,11 @@ class PaperEngine:
             quote_guard_unavailable=position.quote_guard_unavailable,
             quote_guard_min_ratio=position.quote_guard_min_ratio,
             quote_guard_evidence=list(position.quote_guard_evidence),
+            quote_guard_partial_probes=position.quote_guard_partial_probes,
+            tp_confirmation_checks=position.tp_confirmation_checks,
+            tp_unconfirmed=position.tp_unconfirmed,
+            tp_confirmation_ratio=position.tp_confirmation_ratio,
+            tp_confirmation_evidence=list(position.tp_confirmation_evidence),
             rule=self.gate.rule,
             features=dict(position.signal.features),
             exit_fill_count=position.exit_fill_count,

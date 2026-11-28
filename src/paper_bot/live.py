@@ -63,6 +63,11 @@ from .signals import (
     SCANNER_MAX_LIQUIDITY_USD,
     SCANNER_MESSAGE_TYPE,
     SCANNER_MIN_LIQUIDITY_USD,
+    SCANNER_TP50_QUOTE_GUARD_INTERVAL_MS,
+    SCANNER_TP50_QUOTE_GUARD_RATIO,
+    SCANNER_TP50_QUOTE_GUARD_RULE,
+    SCANNER_TP50_QUOTE_GUARD_TP_PCT,
+    SCANNER_TP_CONFIRM_MIN_RATIO,
     SUPPORTED_RULES,
     GateConfig,
     is_scanner_rule,
@@ -107,6 +112,12 @@ class LiveConfig:
     # (frozen and tp50 lanes). See EngineConfig.quote_guard_ratio.
     quote_guard_ratio: float | None = None
     quote_guard_interval_ms: int = 15_000
+    # Combined tp50+guard lane (docs/QUOTE_GUARD_VARIANT.md, V2). The rule
+    # forces these on; they stay off for every existing lane so its behaviour
+    # is unchanged.
+    tp_require_executable_quote: bool = False
+    tp_min_executable_ratio: float = 1.0
+    quote_guard_fraction_probe: bool = False
     fee: float = 0.0125
     slippage: float = 0.0
     notional_sol: float = 0.1
@@ -202,6 +213,39 @@ class LiveConfig:
             raise ValueError(
                 f"Unsupported rule {self.rule!r}; choose from {SUPPORTED_RULES}"
             )
+        if self.rule == SCANNER_TP50_QUOTE_GUARD_RULE:
+            # Pre-registered values (docs/QUOTE_GUARD_VARIANT.md, V2). A
+            # different value would start a different experiment under the same
+            # lane name, so it is refused instead of being silently applied.
+            if self.tp_pct is None:
+                self.tp_pct = SCANNER_TP50_QUOTE_GUARD_TP_PCT
+            elif self.tp_pct != SCANNER_TP50_QUOTE_GUARD_TP_PCT:
+                raise ValueError(
+                    f"{SCANNER_TP50_QUOTE_GUARD_RULE} is pre-registered at "
+                    f"tp_pct={SCANNER_TP50_QUOTE_GUARD_TP_PCT}; register a "
+                    "new variant instead of retuning this lane"
+                )
+            if self.quote_guard_ratio is None:
+                self.quote_guard_ratio = SCANNER_TP50_QUOTE_GUARD_RATIO
+            elif self.quote_guard_ratio != SCANNER_TP50_QUOTE_GUARD_RATIO:
+                raise ValueError(
+                    f"{SCANNER_TP50_QUOTE_GUARD_RULE} is pre-registered at "
+                    f"quote_guard_ratio={SCANNER_TP50_QUOTE_GUARD_RATIO}; "
+                    "register a new variant instead of retuning this lane"
+                )
+            if (
+                self.quote_guard_interval_ms
+                != SCANNER_TP50_QUOTE_GUARD_INTERVAL_MS
+            ):
+                raise ValueError(
+                    f"{SCANNER_TP50_QUOTE_GUARD_RULE} is pre-registered at "
+                    f"quote_guard_interval_ms="
+                    f"{SCANNER_TP50_QUOTE_GUARD_INTERVAL_MS}; register a new "
+                    "variant instead of retuning this lane"
+                )
+            self.tp_require_executable_quote = True
+            self.tp_min_executable_ratio = SCANNER_TP_CONFIRM_MIN_RATIO
+            self.quote_guard_fraction_probe = True
         if self.mode not in ("paper", "live"):
             raise ValueError(f"mode must be 'paper' or 'live', got {self.mode!r}")
         if self.entry_mode not in ("trade", "timer"):
@@ -304,6 +348,8 @@ class LiveConfig:
             raise ValueError("quote_guard_ratio must be in (0, 1)")
         if self.quote_guard_interval_ms <= 0:
             raise ValueError("quote_guard_interval_ms must be positive")
+        if self.tp_min_executable_ratio <= 0:
+            raise ValueError("tp_min_executable_ratio must be positive")
         if self.shutdown_timeout_ms <= 0:
             raise ValueError("shutdown_timeout_ms must be positive")
         if self.tick_interval_s <= 0 or self.dex_interval_s <= 0:
@@ -563,6 +609,9 @@ def _recovery_fingerprint(
         "sl_pct": config.sl_pct,
         "quote_guard_ratio": config.quote_guard_ratio,
         "quote_guard_interval_ms": config.quote_guard_interval_ms,
+        "tp_require_executable_quote": config.tp_require_executable_quote,
+        "tp_min_executable_ratio": config.tp_min_executable_ratio,
+        "quote_guard_fraction_probe": config.quote_guard_fraction_probe,
         "exit_quote_timeout_ms": config.exit_quote_timeout_ms,
         "preflight_exit_route": config.preflight_exit_route,
         "min_preflight_exit_value_ratio": (
@@ -874,6 +923,9 @@ def _lane_meta(
         "sl_pct": config.sl_pct,
         "quote_guard_ratio": config.quote_guard_ratio,
         "quote_guard_interval_ms": config.quote_guard_interval_ms,
+        "tp_require_executable_quote": config.tp_require_executable_quote,
+        "tp_min_executable_ratio": config.tp_min_executable_ratio,
+        "quote_guard_fraction_probe": config.quote_guard_fraction_probe,
         "fee": config.fee,
         "slippage": config.slippage,
         "slippage_bps": config.slippage_bps,
@@ -984,6 +1036,9 @@ def _create_lane(
             sl_pct=config.sl_pct,
             quote_guard_ratio=config.quote_guard_ratio,
             quote_guard_interval_ms=config.quote_guard_interval_ms,
+            tp_require_executable_quote=config.tp_require_executable_quote,
+            tp_min_executable_ratio=config.tp_min_executable_ratio,
+            quote_guard_fraction_probe=config.quote_guard_fraction_probe,
             live=True,
             exit_quote_timeout_ms=config.exit_quote_timeout_ms,
             slippage_bps=config.slippage_bps,

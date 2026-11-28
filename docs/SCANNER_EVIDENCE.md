@@ -325,8 +325,9 @@ exits `2` while coverage is short.
 
 Pre-registered variants use the same gate but are scored on their own sample
 and never pooled: `scanner_pumpfun_amm_tp50`
-([`TP50_VARIANT.md`](TP50_VARIANT.md)) and
-`scanner_pumpfun_amm_quote50` ([`QUOTE_GUARD_VARIANT.md`](QUOTE_GUARD_VARIANT.md)).
+([`TP50_VARIANT.md`](TP50_VARIANT.md)), `scanner_pumpfun_amm_quote50` and its
+combined TP+guard successor `scanner_pumpfun_amm_tp50_quote_guard`
+([`QUOTE_GUARD_VARIANT.md`](QUOTE_GUARD_VARIANT.md)).
 
 The execution report also exposes context the frozen thresholds do not grade:
 `scanner_cards` (scanner cards in `signals.jsonl`), `scanner_cards_allowed`

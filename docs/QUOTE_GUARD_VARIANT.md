@@ -118,3 +118,121 @@ snapshot; the three samples are never merged.
   a paid fee.
 - It does not modify the frozen or tp50 lanes, and it is not deployed by
   default.
+
+---
+
+# V2: `scanner_pumpfun_amm_tp50_quote_guard` (combined TP + guard)
+
+Status: **declared 2026-11-27, paper only, experiment. Not yet run.** This is a
+new pre-registration; it is not a retune of V1 and its sample is never pooled
+with `scanner_pumpfun_amm_tp50`, `scanner_pumpfun_amm_quote50` or the frozen
+lane.
+
+## Why combine them
+
+The tp50 lane closes on the first mark at +50 %. That mark is a trade print,
+not a sale: in the forward sample some positions printed +50 % and then sold
+for almost nothing. The quote50 lane avoids that by measuring a real sale, but
+it throws away the take-profit and can exit early on a temporary liquidity
+dip. V2 keeps both mechanisms and makes each one answer the question it can
+actually answer:
+
+| decision | evidence |
+| --- | --- |
+| take profit | the mark reached +50 % **and** a full-size sale quote still recovers at least the entry cash cost |
+| protective exit | a full-size sale quote returns less than `0.50×` the entry cost |
+| partial salvage | the full-size route is gone but a smaller fraction still routes |
+
+No exit rule can promise a sale after the liquidity is gone. A failed route is
+recorded as evidence, never booked as a fill.
+
+## Pre-registered configuration
+
+| item | value |
+| --- | --- |
+| lane / rule name | `scanner_pumpfun_amm_tp50_quote_guard` |
+| channel / entry | identical to `scanner_pumpfun_amm_tp50`: first card per mint, `dex == Pumpfunamm`, `20,000 <= liquidity_usd < 100,000`, first BUY print at/after card + 5 s, retry to +60 s |
+| size / wallet / concurrency | 0.1 SOL, 10 SOL paper wallet, at most 10 open positions |
+| take profit | mark reaches `+50 %` **and** a full-size sell quote returns `>= 1.00×` the entry cash cost |
+| TP confirmation cadence | at most one confirmation probe per position per 15 s; a rejected mark is recorded and the position stays open |
+| quote guard | every **15 s**, a **full-size** sell quote; sell when the net ratio is **strictly below 0.50** |
+| guard measure | `size × quote_price × (1 − slippage) × (1 − fee)` over `entry_value + entry_fee` (the existing `preflight_exit_value_ratio`) |
+| full-size route unavailable | record `unavailable`; only a **terminal** route/size failure (no route, zero output) probes the fractions (`0.5`, `0.25`, `0.1`, `0.01`) at most once in that check. A timeout/5xx is a venue problem and is retried at the next interval, never treated as a collapse |
+| fraction route available | start the ordinary exit ladder (`quote_guard_partial`); the ladder sells what it can and the remainder is handled by the normal timeout/route policy |
+| fraction measure | the fraction's net output over the **same fraction** of the entry cash cost; comparing a half-size sale with the full entry would be meaningless |
+| unavailable route | never counted as a fill; no synthetic price is invented |
+| fallback | unchanged hard sale at `entry + 5 min` |
+| preflight guard | unchanged `0.90×` exit-value ratio |
+| fees / slippage | unchanged `1.25 %` per side model, 50 bps start, 1000 bps cap |
+| recovery | `output/recovery/scanner_pumpfun_amm_tp50_quote_guard_trade.sqlite3` (separate file) |
+| mode | paper only; live is refused by `run_bot.sh` and `run_live()` |
+
+The parameters are frozen in `src/paper_bot/signals.py`
+(`SCANNER_TP50_QUOTE_GUARD_*`). `LiveConfig` fills them in from the rule name
+and refuses a different value, so a typo cannot silently start a different
+experiment under the same lane name.
+
+## What is recorded
+
+TP confirmation adds `tp_confirmation_checks`, `tp_unconfirmed`,
+`tp_confirmation_ratio` and `tp_confirmation_evidence` to the trade row. Each
+evidence row carries the mark (`mark_price_sol`, `mark_source`), the quote
+price/impact/slippage, and a status of `confirmed`, `unconfirmed`, `invalid` or
+`unavailable`. A confirmed TP keeps `exit_reason == "take_profit"` and
+`exit_trigger_source == "tp_confirmation"`.
+
+The guard rows keep the V1 fields and add:
+
+| field | meaning |
+| --- | --- |
+| `status` | `ok`, `unavailable`, `invalid`, `partial_route`, `partial_unavailable` |
+| `fraction` | the fraction probed in the recovery path |
+| `ratio` | net output over the proportional entry cost |
+
+The trade also carries `quote_guard_partial_probes`. `exit_quote_fractions`
+shows what the ladder actually sold, so a partial liquidation is visible
+without inferring it from the evidence list.
+
+Outcome classification is also corrected for research reports: any
+non-synthetic priced close whose realized exit value is below 1 % of the entry
+cost is recorded as `near_zero_exit`, whatever triggered it (`take_profit`,
+`quote_guard`, `horizon`). The PIT `exit_reason` is unchanged, so a catastrophic
+TP is no longer counted as a clean `tp_hit`. This changes labels only; PnL is
+untouched.
+
+## Evaluation
+
+Compare V2 with the **same-period tp50 sample**, not the replay, and report:
+
+- net realized PnL and catastrophic (`return <= -90 %`) rate / total loss;
+- guard exits and their realized PnL, split into full-size and partial;
+- `tp_unconfirmed` marks and what the same positions did by the five-minute
+  mark (the opportunity cost of not closing at the mark);
+- TP mark vs realized return for confirmed TPs;
+- `unavailable` probes and the partial-liquidation rate;
+- premature exits: guard-fired positions that would have recovered above
+  `0.50×` by the deadline.
+
+Acceptance is the existing tp50 gate: at least 300 closed trades over five UTC
+days, positive realized PnL, median `return_pct >= +10 %`, catastrophic exits
+strictly below 16 %, write-offs strictly below 16 %, and
+`run_integrity == VALID`. A drop in the win rate is not a failure if the
+catastrophic tail falls by more; a higher win rate with the same tail is not a
+pass.
+
+The `0.70×` / 5 s candidate is a **separate** pre-registration. It must not be
+run by changing this lane's constants mid-sample.
+
+## Deploy / switch back
+
+```bash
+# first start of the experiment
+env PYTHONPATH=src RULE=scanner_pumpfun_amm_tp50_quote_guard RESUME=0 ./run_bot.sh paper
+
+# later restarts (paper only)
+env PYTHONPATH=src RULE=scanner_pumpfun_amm_tp50_quote_guard RESUME=1 ./run_bot.sh paper
+```
+
+`run_bot.sh` sets the tp50 and guard arguments for this rule and refuses
+`MODE=live`. Switching `RULE` back to `scanner_pumpfun_amm_tp50` resumes the
+untouched baseline snapshot; the two samples are never merged.
