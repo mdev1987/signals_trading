@@ -17,6 +17,15 @@ Transfers in the pool-creation transaction are excluded. On the Pump AMM
 launches in this cohort the launcher seeds the whole supply into the pool at
 creation; counting that transfer would label every mint as a 100 % dump.
 
+The denominator is the creation deposit: the mint→vault transfer inside the
+transaction the enhanced API tags ``CREATE_POOL``. That is the supply when the
+pool opened, which is what the sold share must be measured against. Neither the
+mint's supply today (launchers burn unsold tokens, so it can be far smaller) nor
+the largest transfer in the window (only the creation deposit when the creation
+is inside the window) is safe. A mint with no ``CREATE_POOL`` transaction in the
+window is dropped and counted: its pool predates the observation, so its supply
+is unknown.
+
 Pre-registration (frozen before the holdout is read):
 
 * cohort: one row per mint, the earliest closed trade in a ``scanner_*`` lane;
@@ -71,7 +80,6 @@ FEATURE_SECONDS = 15
 FEATURE_THRESHOLD = 0.03
 CATASTROPHIC_RETURN = -0.90
 HOLDOUT_DAYS = 2
-MIN_SUPPLY_PROXY = 1e8
 SCANNER_PREFIX = "scanner_"
 
 
@@ -95,6 +103,7 @@ class MintFlow:
     transactions: int
     pages: int
     truncated: bool
+    supply_source: str = "create_pool"
 
     def share(self, seconds: int = FEATURE_SECONDS) -> float:
         sold = {5: self.sold_5s, 15: self.sold_15s, 30: self.sold_30s, 60: self.sold_60s}
@@ -129,6 +138,7 @@ class FetchStats:
     requests: int = 0
     cache_hits: int = 0
     failures: int = 0
+    no_creation: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -146,24 +156,35 @@ def _token_transfers(tx: dict[str, Any], mint: str) -> Iterable[dict[str, Any]]:
 
 
 def identify_pool(transactions: list[dict[str, Any]], mint: str) -> tuple[float, str, str] | None:
-    """Return ``(supply_proxy, vault, create_signature)``.
+    """Return ``(supply, vault, create_signature)`` from the pool creation.
 
-    The pool is seeded by the single largest base-token transfer in the window,
-    which on Pump AMM is the creation deposit of the whole supply. The
-    transaction carrying it is the creation transaction; every transfer inside
-    it is excluded from the sell/buy accounting.
+    The enhanced-transactions API tags the creation transaction
+    ``CREATE_POOL``, and its mint→vault transfer is the whole initial supply
+    (1 000 000 000 on most Pump AMM launches, sometimes less). That transfer is
+    the only correct denominator: the mint's supply *today* can be far smaller
+    because launchers burn unsold tokens, and the largest transfer in the window
+    is only the creation deposit if the creation is inside the window.
+
+    If no ``CREATE_POOL`` transaction is in the window, the pool predates the
+    observation and the supply is unknown; the caller drops the mint rather than
+    divide by a buy.
     """
-    best: tuple[float, str, str] | None = None
     for tx in transactions:
+        kind = str(tx.get("type") or "").upper()
+        if "CREATE_POOL" not in kind:
+            continue
         signature = str(tx.get("signature") or "")
+        best: tuple[float, str] | None = None
         for transfer in _token_transfers(tx, mint):
             amount = float(transfer.get("tokenAmount") or 0.0)
             recipient = str(transfer.get("toUserAccount") or "")
             if amount <= 0 or not recipient:
                 continue
             if best is None or amount > best[0]:
-                best = (amount, recipient, signature)
-    return best
+                best = (amount, recipient)
+        if best is not None:
+            return best[0], best[1], signature
+    return None
 
 
 def flow_from_transactions(
@@ -335,6 +356,24 @@ def load_cache(cache_dir: Path) -> dict[str, MintFlow]:
     return flows
 
 
+def no_creation_path(cache_dir: Path) -> Path:
+    return cache_dir / "no_creation.txt"
+
+
+def load_no_creation(cache_dir: Path) -> set[str]:
+    """Mints already found to have no creation transaction in the window."""
+    path = no_creation_path(cache_dir)
+    if not path.exists():
+        return set()
+    return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
+def append_no_creation(cache_dir: Path, mint: str) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with no_creation_path(cache_dir).open("a", encoding="utf-8") as handle:
+        handle.write(mint + "\n")
+
+
 def append_cache(cache_dir: Path, flow: MintFlow) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     with cache_path(cache_dir).open("a", encoding="utf-8") as handle:
@@ -383,9 +422,11 @@ def collect_flows(
 ) -> tuple[dict[str, MintFlow], FetchStats]:
     """Resolve a flow for every trade, using and growing the on-disk cache."""
     cached = load_cache(cache_dir)
+    skipped = load_no_creation(cache_dir)
     stats = client.stats if client else FetchStats()
+    stats.no_creation = len(skipped)
     resolved = dict(cached)
-    todo = [row for row in trades if row["mint"] not in resolved]
+    todo = [row for row in trades if row["mint"] not in resolved and row["mint"] not in skipped]
     if max_mints is not None:
         todo = todo[:max_mints]
     if client is None:
@@ -410,7 +451,10 @@ def collect_flows(
                 stats.errors.append(f"{mint}: {exc}")
             continue
         if flow is None:
-            stats.failures += 1
+            # No CREATE_POOL in the window: the pool predates observation, so
+            # the supply is unknown and the row cannot be measured.
+            stats.no_creation += 1
+            append_no_creation(cache_dir, mint)
             continue
         append_cache(cache_dir, flow)
         resolved[mint] = flow
@@ -426,7 +470,7 @@ def build_rows(
         if not trade["_rule"].startswith(SCANNER_PREFIX):
             continue
         flow = flows.get(trade["mint"])
-        if flow is None or flow.supply_proxy < MIN_SUPPLY_PROXY:
+        if flow is None or flow.supply_proxy <= 0:
             continue
         rows.append(
             TradeRow(
@@ -558,6 +602,10 @@ def evaluate(
         "coverage": {
             "days": sorted({row.day for row in rows}),
             "mints": len({row.mint for row in rows}),
+            "supply_sources": {
+                source: sum(1 for row in rows if row.flow.supply_source == source)
+                for source in sorted({row.flow.supply_source for row in rows})
+            },
         },
     }
     if train:
@@ -704,6 +752,7 @@ def main(argv: list[str] | None = None) -> int:
         "requests": stats.requests,
         "cache_hits": stats.cache_hits,
         "failures": stats.failures,
+        "no_creation": stats.no_creation,
         "errors": stats.errors,
     }
     if args.json:
@@ -712,7 +761,7 @@ def main(argv: list[str] | None = None) -> int:
     print(format_report(result))
     print(
         f"fetch: requests={stats.requests} cache_hits={stats.cache_hits} "
-        f"failures={stats.failures}"
+        f"failures={stats.failures} no_creation={stats.no_creation}"
     )
     return 0
 

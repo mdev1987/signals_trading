@@ -33,18 +33,34 @@ Per mint:
 
 | step | rule |
 | --- | --- |
-| pool vault | recipient of the **largest single base-token transfer** in the window |
-| supply proxy | that transfer's amount (Pump AMM seeds 1 000 000 000) |
-| creation transaction | the transaction carrying that transfer; **all its transfers are excluded** |
+| creation transaction | the transaction the enhanced API tags **`CREATE_POOL`** |
+| supply | the mint→vault transfer **inside that transaction** (the initial supply) |
+| pool vault | the recipient of that transfer |
 | sell | base-token transfer **into** the vault after the creation transaction |
 | buy | base-token transfer **out of** the vault |
 | pre-entry distribution | sells at `t <= entry`; kept in `sold_pre`, **never** in the feature |
-| feature | `sold_share_15s = sold(0 < t <= 15 s) / supply_proxy` |
+| feature | `sold_share_15s = sold(0 < t <= 15 s) / supply` |
 
-The creation transfer must be excluded because on these AMM launches the
-launcher seeds the whole supply into the pool; counting it labels every mint as
-a 100 % dump. The same reasoning applies to pre-entry selling: it is real, but
-no exit rule can act on it, so it is recorded separately.
+The creation transfer is the only safe denominator. It is also excluded from the
+sell/buy accounting because on these AMM launches the launcher seeds the whole
+supply into the pool; counting it labels every mint as a 100 % dump. Pre-entry
+selling is real but no exit rule can act on it, so it is recorded in
+`sold_pre` and never enters the feature.
+
+**Denominator correction (2026-11-28, still before any holdout was read).** Two
+earlier denominators were tried on partial data and rejected:
+
+1. *largest transfer in the window* — correct when the creation is inside the
+   window, but for an already-migrated token the largest transfer is a buy, and
+   dividing by it overstates the share. It also hid the distinction: it cannot
+   tell a launch with a 600 000-token supply from a migrated token with a
+   60 M-token buy.
+2. *`getTokenSupply`* — wrong in the other direction: it returns supply
+   **today**, and launchers burn unsold tokens after a rug (`700 000 → 65.7`).
+   One row showed 92 % sold that way.
+
+Both partial caches were deleted before the definitive collection. The frozen
+rows below did not change.
 
 ## Frozen parameters
 
@@ -67,10 +83,10 @@ hypothesis on a new sample.
 
 ## Limitations, stated up front
 
-- **Supply proxy.** A mint whose creation deposit is outside the window, or is
-  split across transactions, gets a wrong denominator. Rows with
-  `supply_proxy < 1e8` are dropped; coverage is reported. This biases the
-  cohort toward launches whose seed transfer is visible in the window.
+- **Coverage.** A mint whose `CREATE_POOL` transaction is not inside
+  `[entry - 240 s, entry + 70 s]` is dropped and counted (`no_creation`), not
+  divided by a guess. This is the main coverage loss and it is visible in the
+  fetch line; a resumed run does not re-fetch those mints.
 - **Three-page cap.** Very busy mints are truncated at 300 transactions; the
   flag is stored per row.
 - **No counterfactual price yet.** This study measures *prediction* (does early
@@ -86,8 +102,63 @@ hypothesis on a new sample.
 
 ## Results
 
-Pending the collection run; this section is filled from
-`src/early_flow_study.py` output without changing any frozen row above.
+Definitive collection, 2026-11-28. 2220 Helius requests, 0 failures, cache in
+`output/early_flow/`. **1484 of 1533 mints measured; 43 dropped and counted
+(`no_creation`)** because `CREATE_POOL` is not inside the window, which is
+consistent with the scanner entering only already-migrated tokens for those.
+Cohort: primary `scanner_*` n=1402, quote-guard n=82 (reported separately).
+7 UTC days; 1193 training + 209 holdout (split by day, a mint is in one side).
+
+### Frozen output (verbatim)
+
+```
+cohort rows=1484 (primary=1402 guard=82) days=7 mints=1484
+feature: sold share at 15s, threshold 3.0% of supply
+train rows=1193 cat=20.2% AUC=0.504 permutation p=0.866
+holdout rows=209 days=2026-11-27,2026-11-28
+  all   n= 209 cat= 17.2% mean=  +4.0% median= +23.1% pnl=+0.844 SOL
+  fired n=  52 cat= 11.5% mean= +14.9% median= +28.0% pnl=+0.784 SOL
+  kept  n= 157 cat= 19.1% mean=  +0.4% median= +21.8% pnl=+0.060 SOL
+guard rows=82
+  all   n=   82 cat= 28.0% mean= -11.5% median= +16.2% pnl=-0.957 SOL
+  fired n=   38 cat= 31.6% mean= -14.6% median= +16.2% pnl=-0.560 SOL
+  kept  n=   44 cat= 25.0% mean=  -8.9% median= +16.8% pnl=-0.397 SOL
+candidate: holdout lowers the catastrophic rate without lowering mean return
+```
+
+### Reading the verdict honestly
+
+The automated `decision()` returns **candidate**, which is **not** a ship
+decision. Four checks against the frozen output:
+
+1. **No training separation.** Pooled training AUC **0.504**, permutation
+   p = 0.866. Per-day training AUCs are 0.41–0.54. The 3 % threshold was not
+   confirmed on the data before the holdout.
+2. **Holdout not statistically distinguishable.** Fired 11.5 % vs kept 19.1 %
+   catastrophic (−7.6 pp), Fisher two-sided **p = 0.29**. Wilson-95 on the
+   fired rate is 5.4–23.0 %, on kept 13.7–26.0 %. The frozen rule requires
+   only ≥ 3 pp plus no lower mean return, not significance; it is met, but the
+   sample does not reject "no difference."
+3. **The holdout is effectively one day.** Both days are holdout, but
+   2026-11-27 has 201 rows and all 52 fired; 2026-11-28 has only 8 rows and no
+   fired rows. Within 11-27 the direction holds (fired 11.5 % vs 18.8 %), but
+   there is no cross-day replication of the fired effect.
+4. **Prediction, not PnL.** This measures whether early distribution *predicts*
+   the outcome, not whether exiting at +15 s makes money. That is the
+   pre-registered next step, not yet run. Fired PnL (+0.784 SOL) is the
+   outcome PnL of fired rows, not the counterfactual PnL of acting on the
+   signal; the mean-return comparison uses full-horizon return.
+
+### Verdict
+
+- The pre-registered frozen rule outputs `candidate`.
+- **Nothing is shipped.** No running lane, gate or cost model changed.
+- Because training has no separation and holdout p = 0.29, this is a **weak,
+  unreplicated candidate**, consistent with the earlier in-sample read of
+  `sold_share_15s` AUC ~0.63 on 39 trades not surviving a powered test.
+- The line is **not closed** (the frozen rule would close it on `close`, and
+  it did not), but proceeding requires the pre-registered next step, not a
+  threshold revision.
 
 ## Next step if the holdout is a candidate
 

@@ -47,14 +47,29 @@ def transfer(source: str, destination: str, amount: float, mint: str = MINT) -> 
     }
 
 
-def tx(signature: str, timestamp: int, transfers: list[dict]) -> dict:
-    return {"signature": signature, "timestamp": timestamp, "tokenTransfers": transfers}
+def tx(
+    signature: str,
+    timestamp: int,
+    transfers: list[dict],
+    kind: str = "SWAP",
+) -> dict:
+    return {
+        "signature": signature,
+        "timestamp": timestamp,
+        "type": kind,
+        "tokenTransfers": transfers,
+    }
 
 
 def transactions() -> list[dict]:
     return [
         # Creation: the launcher seeds the whole supply into the pool vault.
-        tx(CREATE_SIG, ENTRY_S - 3, [transfer("Launcher", VAULT, 1_000_000_000.0)]),
+        tx(
+            CREATE_SIG,
+            ENTRY_S - 3,
+            [transfer("Launcher", VAULT, 1_000_000_000.0)],
+            kind="CREATE_POOL",
+        ),
         # A buy removes tokens from the vault.
         tx("buy", ENTRY_S - 1, [transfer(VAULT, BUYER, 50_000_000.0)]),
         # Two sellers, one inside the 15 s feature window and one after it.
@@ -64,13 +79,21 @@ def transactions() -> list[dict]:
 
 
 class PoolIdentificationTests(unittest.TestCase):
-    def test_largest_transfer_is_the_creation_deposit(self) -> None:
+    def test_create_pool_carries_the_creation_deposit(self) -> None:
         pool = identify_pool(transactions(), MINT)
         assert pool is not None
         supply, vault, signature = pool
         self.assertEqual(supply, 1_000_000_000.0)
         self.assertEqual(vault, VAULT)
         self.assertEqual(signature, CREATE_SIG)
+
+    def test_largest_transfer_without_create_pool_is_not_used(self) -> None:
+        # A migrated token: the window has big buys but no creation.
+        rows = [
+            tx("buy-1", ENTRY_S - 10, [transfer(VAULT, BUYER, 50_000_000.0)]),
+            tx("buy-2", ENTRY_S - 5, [transfer(VAULT, SELLER, 80_000_000.0)]),
+        ]
+        self.assertIsNone(identify_pool(rows, MINT))
 
     def test_no_transfers_is_none(self) -> None:
         self.assertIsNone(identify_pool([], MINT))
@@ -108,7 +131,12 @@ class FlowTests(unittest.TestCase):
 
     def test_pre_entry_sales_are_kept_out_of_the_feature(self) -> None:
         rows = [
-            tx(CREATE_SIG, ENTRY_S - 30, [transfer("Launcher", VAULT, 1_000_000_000.0)]),
+            tx(
+                CREATE_SIG,
+                ENTRY_S - 30,
+                [transfer("Launcher", VAULT, 1_000_000_000.0)],
+                kind="CREATE_POOL",
+            ),
             tx("dump-before", ENTRY_S - 10, [transfer("Sniper", VAULT, 400_000_000.0)]),
             tx("sell-after", ENTRY_S + 3, [transfer(BUYER, VAULT, 10_000_000.0)]),
         ]
@@ -119,6 +147,23 @@ class FlowTests(unittest.TestCase):
         self.assertAlmostEqual(flow.sold_pre, 400_000_000.0)
         self.assertAlmostEqual(flow.sold_15s, 10_000_000.0)
         self.assertAlmostEqual(flow.share(15), 0.01)
+
+
+class SupplyTests(unittest.TestCase):
+    def test_creation_deposit_is_the_denominator(self) -> None:
+        flow = flow_from_transactions(
+            transactions(), MINT, window_start_s=ENTRY_S - 240, entry_s=ENTRY_S
+        )
+        assert flow is not None
+        self.assertEqual(flow.supply_source, "create_pool")
+        self.assertAlmostEqual(flow.supply_proxy, 1_000_000_000.0)
+        self.assertAlmostEqual(flow.share(15), 0.02)
+
+    def test_a_migrated_mint_has_no_flow(self) -> None:
+        rows = [tx("buy", ENTRY_S - 5, [transfer(VAULT, BUYER, 80_000_000.0)])]
+        self.assertIsNone(
+            flow_from_transactions(rows, MINT, window_start_s=ENTRY_S - 240, entry_s=ENTRY_S)
+        )
 
 
 class CacheTests(unittest.TestCase):
